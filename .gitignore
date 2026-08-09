@@ -5,6 +5,8 @@ bin/
 *.pdb
 *.ilk
 *.map
+# clang-cl 编译 hv/svm_trampoline.S 时生成的中间汇编
+YuanGuardHV/svm_trampoline.asm
 
 # Debug logs and dumps
 *.log
