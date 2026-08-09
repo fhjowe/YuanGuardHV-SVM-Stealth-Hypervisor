@@ -7,6 +7,8 @@
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）
 - [x] 重新构建并签名，记录 sys 哈希
+- [x] 删除 Win11 VM 并清理 VMware 清单（文件暂存 `_win11_trash`，待手动删除）
+- [x] 禁用宿主机 WiFi 适配器 `WLAN`
 - [ ] 启动 VM + KD 连接验证
 - [ ] `min_drv.sys` 加载链验证（sc create/start/stop/delete）
 - [ ] VM 内 CPUID SVM bit + CLGI 实测
