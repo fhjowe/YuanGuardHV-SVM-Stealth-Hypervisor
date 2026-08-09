@@ -1,0 +1,21 @@
+# Build outputs
+bin/
+*.obj
+*.sys
+*.pdb
+*.ilk
+*.map
+
+# Debug logs and dumps
+*.log
+kd_*.log
+*.dmp
+*.gzd
+
+# IDE / OS noise
+.vs/
+.idea/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
