@@ -109,6 +109,14 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 无任何新的 Windows/VMware dump（均停在 7/26-7/30），属于硬卡死/掉电式重启，无法离线分析。
 - 处置决策：**在拔除/禁用该 USB WiFi 设备或移除 VM USB 控制器前，不再启动任何 VMware VM**；VM+KD 验证任务标记为阻塞。
 
+### 8.2 第三次事件（16:28:50 意外关机，USB 已排除）
+
+- 16:28:48 启动 Win10 VM，16:28:50 主机意外关机（VM 启动后约 2 秒），16:31:30 重启。
+- 本次已禁用 USB WiFi 设备（`CM_PROB_DISABLED`）且 VMX 已去掉 USB 控制器，VMware 日志**未再枚举 TP-Link USB 设备**，但主机仍崩溃；USB WiFi 不再是直接触发源。
+- 新发现：`hrdevmon` 是 **火绒安全（Huorong Internet Security）的内核驱动**（`D:\firefirefire\Huorong`），与 `sysdiag` 均为启动/系统级驱动并处于运行状态；VMware `hcmon` 每次启动都报警 `unrecognized USB driver (\Driver\hrdevmon)`。
+- 结论：触发源收敛到 VMware 虚拟化启动路径（`vmx86`/`vhv.enable` 嵌套虚拟化）与火绒内核驱动的潜在冲突；硬件（WHEA）无错误记录，且无新 dump，仍无法离线确认。
+- 处置决策：**在解决火绒驱动与 VMware 冲突（或关闭 `vhv.enable`、升级 VMware）前，不再启动任何 VMware VM**。
+
 ## 9. VM 环境现状（2026-08-09）
 
 | VM | 路径 | 状态 |
