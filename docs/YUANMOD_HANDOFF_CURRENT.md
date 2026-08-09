@@ -18,7 +18,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | Phase 2d 物理机验证 | 未完成 |
 | Phase 3+ 隐形/保护/Java 层 | 未开始 |
 | git 版本控制 | 本次初始化完成 |
-| 构建基线 | 失败，见第 5 节 |
+| 构建基线 | 成功，见第 5 节 |
 
 注意：`hv/` 代码在 2026-07-31 之后已更新（`svm_core.c` 中原来的 `#if 0` stub 已不存在，`main.c` 改为直接 `svm_core_init()` + inline NPT，新增 `test_step1..6.c` 等），7/30 的 `TECHNICAL_REVIEW.md` 结论需要逐项复核后再采用。
 
@@ -56,8 +56,8 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - [x] 2026-08-09 只读勘查仓库与环境（工具链 / VM / KD / 代码状态）
 - [x] 2026-08-09 用户确认初始化方案（docs 记录 + git + 构建基线 + 任务清单）
 - [x] `git init` + `.gitignore` + 首次提交
-- [ ] `build.bat` 构建基线：失败，见第 5 节
-- [ ] 修复 build.bat（待用户确认）
+- [x] 修复 build.bat（用户确认后完成）
+- [x] `build.bat` 构建基线：成功，见第 5 节
 - [ ] VM 加载链验证（min_drv）
 - [ ] VM 内 CPUID/CLGI SVM 暴露实测
 - [ ] 重新核查 TECHNICAL_REVIEW P0 是否仍适用
@@ -67,7 +67,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 
 | 日期 | 结果 | sys SHA256 | 备注 |
 |---|---|---|---|
-| 2026-08-09 | FAIL | 无 | `build.bat` 在 `for (main svm_core ...)` 块解析时报 `\Windows was unexpected at this time.`；根因是 `%INCLUDES%` 展开后含 `C:\Program Files (x86)\...` 的括号，批处理把括号当作块语法。修复方向：块内改用延迟展开 `!INCLUDES!` 等变量。 |
+| 2026-08-09 | SUCCESS | `9dfade1556d88feee9b08eb5950005100155639d933cf6b3e76a700cbb99fcca` | 修复 build.bat：for 块改为 `call :compile` 子程序，INCLUDES/LIBPATH 路径加引号。编译仅 WDK 头文件 intrinsic 警告（无害）。 |
 
 ## 6. 决策记录
 
@@ -76,6 +76,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | 正式接管，先固化基线再动业务代码 | 铁律 1/2/3 | 后续改动先出方案、经确认，并记入本文件 |
 | 2026-08-09 | 仓库初始化 git + .gitignore + 首次提交 | 后续可回滚、可审计 | 基线快照为 `docs` 建立后首次提交 |
 | 2026-08-09 | build.bat 失败只记录不擅自修改 | 铁律 1 要求代码改动先确认 | 修复方案待用户确认后执行 |
+| 2026-08-09 | 用户确认后修复 build.bat 并重跑基线 | 脚本路径含括号/空格导致无法编译 | 构建成功，sys 已签名，哈希见第 5 节 |
 
 ## 7. 变更日志
 
@@ -85,3 +86,4 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | `docs/YUANMOD_HANDOFF_CURRENT.md` | 创建本记录 | - |
 | 2026-08-09 | `docs/TASKS.md` | 创建任务清单 | - |
 | 2026-08-09 | 仓库 | git init + 首次提交 | git log |
+| 2026-08-09 | `YuanGuardHV/build.bat` | for 块改 `call :compile` 子程序；INCLUDES/LIBPATH 路径加引号 | 构建成功并签名 |

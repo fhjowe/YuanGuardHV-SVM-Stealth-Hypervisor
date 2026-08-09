@@ -39,11 +39,11 @@ exit /b 1
 
 set "WDK_VER=10.0.19041.0"
 
-set "INCLUDES=/I%WDK_ROOT%\Include\%WDK_VER%\km"
-set "INCLUDES=%INCLUDES% /I%WDK_ROOT%\Include\%WDK_VER%\shared"
-set "INCLUDES=%INCLUDES% /I%WDK_ROOT%\Include\%WDK_VER%\um"
-set "INCLUDES=%INCLUDES% /I%HV_DIR%\common"
-set "INCLUDES=%INCLUDES% /I%HV_DIR%\pool"
+set "INCLUDES=/I"%WDK_ROOT%\Include\%WDK_VER%\km""
+set "INCLUDES=%INCLUDES% /I"%WDK_ROOT%\Include\%WDK_VER%\shared""
+set "INCLUDES=%INCLUDES% /I"%WDK_ROOT%\Include\%WDK_VER%\um""
+set "INCLUDES=%INCLUDES% /I"%HV_DIR%\common""
+set "INCLUDES=%INCLUDES% /I"%HV_DIR%\pool""
 
 set "CFLAGS=/nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-"
 set "CFLAGS=%CFLAGS% -Wno-microsoft -Wno-unknown-pragmas -Wno-ignored-attributes -Wno-visibility -Wno-pragma-pack"
@@ -51,16 +51,12 @@ set "CFLAGS=%CFLAGS% /D_KERNEL_MODE /D_AMD64_ /DNTDDI_VERSION=0x0A000005"
 
 set "LINKS=/nologo /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /MACHINE:X64"
 set "LINKS=%LINKS% /OPT:NOREF,NOICF"
-set "LINKS=%LINKS% /LIBPATH:%WDK_ROOT%\Lib\%WDK_VER%\km\x64"
+set "LINKS=%LINKS% /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VER%\km\x64""
 
 echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
-for %%f in (main svm_core npt_core vmexit vmmcall) do (
-    echo   %%f.c
-    "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\%%f.obj" "%HV_DIR%\%%f.c"
-    if errorlevel 1 goto :error
-)
+for %%f in (main svm_core npt_core vmexit vmmcall) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
@@ -81,6 +77,12 @@ echo [YuanGuardHV] Build SUCCESS: %BIN_DIR%\yuanguard_hv.sys
 echo   signing...
 "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe" sign /fd SHA256 /a /f "%PROJECT_DIR%yuanguard_test.cer" "%BIN_DIR%\yuanguard_hv.sys"
 certutil -hashfile "%BIN_DIR%\yuanguard_hv.sys" SHA256
+exit /b 0
+
+:compile
+echo   %1.c
+"%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\%1.obj" "%HV_DIR%\%1.c"
+if errorlevel 1 exit /b 1
 exit /b 0
 
 :error

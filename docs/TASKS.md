@@ -5,8 +5,8 @@
 
 ## 0. 调试路径（先打通验证通道）
 
-- [ ] 修复 `build.bat`（`%INCLUDES%` 括号解析问题，待用户确认）
-- [ ] 重新构建并签名，记录 sys 哈希
+- [x] 修复 `build.bat`（for 块改子程序、路径加引号）
+- [x] 重新构建并签名，记录 sys 哈希
 - [ ] 启动 VM + KD 连接验证
 - [ ] `min_drv.sys` 加载链验证（sc create/start/stop/delete）
 - [ ] VM 内 CPUID SVM bit + CLGI 实测
