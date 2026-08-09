@@ -99,6 +99,15 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 线索：VMware 日志显示接管了 TP-Link `AIC8800DC` USB WiFi；重启后 `hcmon` 报警 `unrecognized USB driver (\Driver\hrevmon)`；项目历史 7/30 曾因 `usbwifi.sys` 蓝屏。
 - 结论：最大嫌疑是 VMware USB 直通与宿主机 WiFi 驱动（`usbwifi.sys` 类）互相干扰。处置：禁用 `WLAN` WiFi 适配器，后续调试不让 VMware 接管 USB 设备；若再发生，优先收集当日 dump。
 
+### 8.1 第二次事件（16:14:04 意外关机，已复现）
+
+- 16:12:48 启动 Win10 VM，16:14:04 主机意外关机，16:16:44 重启；两次均为 VM 启动后约 2-3 分钟。
+- VMware 日志在崩溃前出现 `serial0: Unable to read from the "\\.\pipe\yuanhv_debug" named pipe: Insufficient system resources exist to complete the requested service.`（系统资源耗尽）。
+- 两次会话 VMware 均枚举到 `TP-Link AIC8800DC`（VID_2357 PID_0147，即 `MERCURY Wireless N Adapter`）；该设备当前处于 PnP `Error` 状态，`hcmon` 反复报警 `unrecognized USB driver (\Driver\hrevmon)`。
+- 第一次崩溃时 KD 尚未成功连接管道（KD 打印 usage 后立即退出），可排除 KD 客户端是触发源；共同触发源为 **VM 启动 + USB WiFi 设备枚举**。
+- 无任何新的 Windows/VMware dump（均停在 7/26-7/30），属于硬卡死/掉电式重启，无法离线分析。
+- 处置决策：**在拔除/禁用该 USB WiFi 设备或移除 VM USB 控制器前，不再启动任何 VMware VM**；VM+KD 验证任务标记为阻塞。
+
 ## 9. VM 环境现状（2026-08-09）
 
 | VM | 路径 | 状态 |
