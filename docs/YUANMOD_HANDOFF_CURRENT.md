@@ -91,6 +91,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
+| 2026-08-09 | USB WiFi 设备 `USB\VID_2357&PID_0147\20220127` | 按用户要求用 `pnputil /disable-device` 禁用 | 问题码 `CM_PROB_DISABLED` |
 
 ## 8. 2026-08-09 主机无响应/蓝屏调查
 
