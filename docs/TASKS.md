@@ -9,7 +9,7 @@
 - [x] 重新构建并签名，记录 sys 哈希
 - [x] 删除 Win11 VM 并清理 VMware 清单（文件暂存 `_win11_trash`，待手动删除）
 - [x] 禁用宿主机 WiFi 适配器 `WLAN`
-- [ ] 启动 VM + KD 连接验证（阻塞：宿主启动 VM 后数秒至 3 分钟内无响应/重启；USB WiFi 已禁用、VM USB 控制器已移除，当前最大嫌疑为火绒 `hrdevmon`/`sysdiag` 与 VMware `hcmon`/`vmx86` 冲突，或 `vhv.enable` 嵌套虚拟化）
+- [ ] 启动 VM + KD 连接验证（火绒已移除、USB WiFi 已禁用、VM USB 控制器已移除，重试中；若仍崩溃则关闭 `vhv.enable` 或转裸机/KVM）
 - [ ] `min_drv.sys` 加载链验证（sc create/start/stop/delete）
 - [ ] VM 内 CPUID SVM bit + CLGI 实测
   - SVM 暴露：尝试 VM 内 VMRUN 冒烟
