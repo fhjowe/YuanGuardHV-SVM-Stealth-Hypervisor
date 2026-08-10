@@ -126,6 +126,17 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 网络资料：Broadcom 社区有同版本（17.6.4 build 24832109）持续 BSOD/稳定性报告；17.6.x 的 mksSandbox/渲染崩溃报告较多，社区普遍反馈回退 17.5.2 或升级修复版可解决。
 - 下一步候选：A) 升级/重装 VMware（最新版或 17.5.2）；B) 单次受控测试关闭 `vhv.enable`；C) 放弃 VMware，转裸机/KVM 验证。均需用户确认后再执行。
 
+### 8.4 第五次事件 + 全面诊断（2026-08-10 09:48 意外关机，`vhv.enable=FALSE` 仍复现）
+
+- 受控测试：Win10 VM `vhv.enable=FALSE`、USB 控制器已移除、火绒已卸载、USB WiFi 已禁用，VM 启动后仍硬卡死（09:48:50 意外关机，09:50:27 重启）。
+- VMware 日志显示已加载 `hv-svm.vmm`/SVM 能力（`cpuid.svm=1`、`svm_npt=1` 等），随后在 Tools/HGFS 阶段中断，本次无串口管道错误、无 USB 枚举。
+- 全面诊断（只读）：
+  - OS：Windows 10 Pro for Workstations 22H2，build 19045.7291；VBS/HVCI 均 disabled（事件 153，HypervisorPresent=False），排除 Hyper-V 干扰。
+  - 无任何新 dump（Windows Minidump/MEMORY.DMP/LiveKernelReports/WER/CrashDumps/VMware 均无），无 WHEA、无资源耗尽事件、无磁盘/池错误。
+  - 内存：2×8GB Crucial DDR4-3200（匹配套条），配置 3200MHz；当前可用 11.6GB；pagefile 17GB 在 D 盘。
+  - VMware：17.6.4 build-24832109；`vmx86.sys` 17.6.0.0、`hcmon.sys` 8.11.14.0。
+- 触发矩阵：USB WiFi 禁用 ✓、VM USB 控制器移除 ✓、火绒卸载 ✓、`vhv.enable=FALSE` ✓，均无法阻止崩溃 → 结论：**VMware Workstation 17.6.4 在这台 AMD 主机上启动任何 VM 即触发宿主硬卡死**，属 VMware/宿主兼容性或硬件问题，非项目配置可绕过。
+
 ## 9. VM 环境现状（2026-08-09）
 
 | VM | 路径 | 状态 |

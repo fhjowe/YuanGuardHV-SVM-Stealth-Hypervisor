@@ -9,7 +9,7 @@
 - [x] 重新构建并签名，记录 sys 哈希
 - [x] 删除 Win11 VM 并清理 VMware 清单（文件暂存 `_win11_trash`，待手动删除）
 - [x] 禁用宿主机 WiFi 适配器 `WLAN`
-- [ ] 启动 VM + KD 连接验证（阻塞升级为“VMware 17.6.4 本身在 AMD 宿主触发硬卡死”：火绒/USB/VM USB 均排除，仍复现 4 次；待选：升级/回退 VMware、关闭 `vhv.enable` 单测、或转裸机/KVM）
+- [ ] 启动 VM + KD 连接验证（阻塞升级为“VMware 17.6.4 本身在 AMD 宿主触发硬卡死”：火绒/USB/VM USB/`vhv.enable` 均排除，仍复现 5 次；待选：重装/回退 VMware、硬件诊断、或转裸机/KVM）
 - [ ] `min_drv.sys` 加载链验证（sc create/start/stop/delete）
 - [ ] VM 内 CPUID SVM bit + CLGI 实测
   - SVM 暴露：尝试 VM 内 VMRUN 冒烟
@@ -38,3 +38,4 @@
 - [ ] 仓库卫生清理（`hv/common/*.bak`、`reference_*` 迁移、历史日志归档）
 - [ ] 宿主稳定性处理：拔除/禁用 USB WiFi 设备或重装其驱动，确认 VMware 可稳定运行
 - [ ] 处理火绒安全驱动冲突：程序化禁用被火绒自我保护拦截（`Access denied`/`1052`），需用户在托盘“退出火绒”或关闭自我保护后重试；备选：关闭 `vhv.enable` / 升级 VMware
+- [ ] 宿主稳定性根因处理：重装/回退 VMware（17.5.2）、Windows 内存诊断、BIOS/AMD 芯片组更新
