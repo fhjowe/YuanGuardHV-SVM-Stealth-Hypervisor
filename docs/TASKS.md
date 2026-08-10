@@ -41,3 +41,4 @@
 - [ ] 宿主稳定性根因处理：重装/回退 VMware（17.5.2）、Windows 内存诊断、BIOS/AMD 芯片组更新
 - [x] 本地完全重装 VMware 17.6.4（默认路径，跳过 Networking）——安装成功但无法解决 VM 启动崩溃
 - [ ] 后续调试通道：换机/KVM，或裸机验证（testsigning、min_drv 加载链、崩溃转储分析）
+- [ ] 验证串口管道假设：`Windows 10` VM 稳定运行中（`vhv.enable=TRUE`/USB 开/无调试管道），对照旧 VM 差异（`yuanhv_debug` 管道），决定下一步是否重建调试 VM

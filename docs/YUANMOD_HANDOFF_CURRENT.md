@@ -96,6 +96,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | USB WiFi 设备 `USB\VID_2357&PID_0147\20220127` | 按用户要求用 `pnputil /disable-device` 禁用 | 问题码 `CM_PROB_DISABLED` |
 | 2026-08-10 | 火绒 `HipsDaemon`/`hrdevmon`/`sysdiag` | 尝试程序化禁用失败：`sc config` 与直接 `reg add Start=4` 均 `Access denied (5)`，`sc stop` 驱动返回 `1052`，进程无法终止 | 确认是火绒自我保护拦截；用户仅退出托盘，需在设置中关闭自我保护后再退出 |
 | 2026-08-10 | 火绒安全 | 用户确认已关闭/卸载；复核：`HipsDaemon` 服务、`hrdevmon`、`sysdiag` 驱动与进程均不存在 | 冲突源移除，可重试 VMware |
+| 2026-08-10 | 旧调试 VM `Windows 10 x64` | 按用户要求移除：34 文件（约 20.7GB）移入 `D:\win10_trash_backup\Windows 10 x64`，VMware 清单已清理（备份 `inventory.vmls.bak-20260810-remove-win10x64`） | 原路径已空，仅剩“Windows 10”VM |
 
 ## 8. 2026-08-09 主机无响应/蓝屏调查
 
@@ -151,5 +152,12 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 
 | VM | 路径 | 状态 |
 |---|---|---|
-| Windows 10 x64（保留） | `C:\Users\Administrator\Documents\Virtual Machines\Windows 10 x64\Windows 10 x64.vmx` | 文件完好，串口管道 `yuanhv_debug`，后续调试目标 |
+| Windows 10（保留，运行中） | `C:\Users\Administrator\Documents\Virtual Machines\Windows 10\Windows 10.vmx` | `vhv.enable=TRUE`、USB 开启、光驱挂 SeekOS ISO、串口 `COM1`；主机当前稳定 |
 | Windows 11 x64（已移除） | `D:\vmware\Windows 11 x64.vmx` | 38 个文件已移入 `D:\vmware\_win11_trash`（约 27.8GB，待手动删除）；VMware 清单已清理 |
+| Windows 10 x64（已移除） | `C:\Users\Administrator\Documents\Virtual Machines\Windows 10 x64\` | 34 文件移入 `D:\win10_trash_backup\Windows 10 x64`（约 20.7GB，待手动删除）；VMware 清单已清理 |
+
+### 9.1 重要新线索（2026-08-10）
+
+- 发现第二个 Win10 VM（`Windows 10`，位于 `C:\Users\Administrator\Documents\Virtual Machines\Windows 10\`），该 VM `vhv.enable=TRUE`、USB 开启、串口为 `COM1`，**正在运行且主机未崩**。
+- 之前 6/6 崩溃的 VM（`Windows 10 x64`）与它的主要差异之一是**串口命名管道 `yuanhv_debug`（server）**，以及调试期相关的配置。
+- 假设待验证：崩溃触发点可能不是 VMware 虚拟化本身，而是该 VM 的 `yuanhv_debug` 命名管道串口；后续可在稳定主机上做对照测试（新建 VM 仅保留管道 vs 无管道）。
