@@ -119,6 +119,13 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 结论：触发源收敛到 VMware 虚拟化启动路径（`vmx86`/`vhv.enable` 嵌套虚拟化）与火绒内核驱动的潜在冲突；硬件（WHEA）无错误记录，且无新 dump，仍无法离线确认。
 - 处置决策：**在解决火绒驱动与 VMware 冲突（或关闭 `vhv.enable`、升级 VMware）前，不再启动任何 VMware VM**。
 
+### 8.3 第四次事件（2026-08-10 09:38 意外关机，火绒已排除）
+
+- 火绒已完全卸载、USB WiFi 已禁用、VM USB 控制器已移除后仍复现：VM 启动后数秒至 3 分钟内主机硬卡死/意外重启，仍无 dump、无 WHEA。
+- 结论：触发源锁定为 **VMware Workstation 17.6.4 (build 24832109) 在这台 AMD Ryzen 5 5500 主机上的虚拟化启动路径**（`vmx86`/`vhv.enable`）。
+- 网络资料：Broadcom 社区有同版本（17.6.4 build 24832109）持续 BSOD/稳定性报告；17.6.x 的 mksSandbox/渲染崩溃报告较多，社区普遍反馈回退 17.5.2 或升级修复版可解决。
+- 下一步候选：A) 升级/重装 VMware（最新版或 17.5.2）；B) 单次受控测试关闭 `vhv.enable`；C) 放弃 VMware，转裸机/KVM 验证。均需用户确认后再执行。
+
 ## 9. VM 环境现状（2026-08-09）
 
 | VM | 路径 | 状态 |
