@@ -50,6 +50,8 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - VMware `vhv.enable=TRUE` 的项目记录是：L1 Guest 中执行 `clgi` 触发 `#UD`，即 VMware 不把 AMD SVM 指令暴露给 Guest。需在 VM 内用 CPUID/CLGI 实测再确认；若属实，VMRUN 冒烟只能走裸机或 KVM 嵌套。
 - 宿主 `bcdedit` 在当前非管理员 shell 不可用；testsigning / nointegritychecks 状态需在裸机或 VM 内确认。
 - 宿主 `C:\Windows\Minidump` 有 7/30 的 4 个 dump，其中 `usbwifi.sys` 蓝屏与项目无关。
+- 宿主系统为“不忘初心”修改版 Windows 10 Pro for Workstations 22H2（19045.7291），非官方镜像；历史上 7/26-7/30 已有多次意外关机与 VMware 崩溃记录，需纳入稳定性根因考虑。
+- VMware 17.5.2 官方下载需 Broadcom 账号登录；旧 `download3.vmware.com` 直链已下线，Broadcom token 链接 403。本地仅有 17.6.4 官方安装包（`C:\Users\Administrator\Downloads\VMware-workstation-full-17.6.4-24832109.exe`）。
 
 ## 4. 初始化动作
 
