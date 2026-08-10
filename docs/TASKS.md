@@ -37,4 +37,4 @@
 - [ ] `tests/`、`mod/`、`vm/` 目录补齐
 - [ ] 仓库卫生清理（`hv/common/*.bak`、`reference_*` 迁移、历史日志归档）
 - [ ] 宿主稳定性处理：拔除/禁用 USB WiFi 设备或重装其驱动，确认 VMware 可稳定运行
-- [ ] 处理火绒安全驱动冲突：临时退出火绒或禁用 `hrdevmon`/`sysdiag`（需用户确认），或升级 VMware / 关闭 `vhv.enable`
+- [ ] 处理火绒安全驱动冲突：程序化禁用被火绒自我保护拦截（`Access denied`/`1052`），需用户在托盘“退出火绒”或关闭自我保护后重试；备选：关闭 `vhv.enable` / 升级 VMware
