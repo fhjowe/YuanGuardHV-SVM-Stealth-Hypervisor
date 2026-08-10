@@ -139,6 +139,14 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - VMware：17.6.4 build-24832109；`vmx86.sys` 17.6.0.0、`hcmon.sys` 8.11.14.0。
 - 触发矩阵：USB WiFi 禁用 ✓、VM USB 控制器移除 ✓、火绒卸载 ✓、`vhv.enable=FALSE` ✓，均无法阻止崩溃 → 结论：**VMware Workstation 17.6.4 在这台 AMD 主机上启动任何 VM 即触发宿主硬卡死**，属 VMware/宿主兼容性或硬件问题，非项目配置可绕过。
 
+### 8.5 第六次事件 + 本地重装结论（2026-08-10 10:31 意外关机，重装后仍复现）
+
+- 执行了本地完全重装：卸载旧 17.6.4（`D:\vmware`），修复残留 CLSID 路径（`vmnetbridge.dll` 旧路径 → 新安装目录），并跳过 Networking 组件（MSI 功能名 `Networking`）完成静默安装到默认路径。安装成功（`vmware.exe`/`vmrun.exe` 就位，服务正常）。
+- 重装后单次重试：VM 10:31:28 启动，10:31:33 主机意外关机（约 5 秒），10:33:32 重启。**第 6 次复现，6/6 全部崩溃。**
+- 最终结论：**这台主机无论 VMware 安装状态/网络组件/USB/火绒/`vhv.enable` 如何，启动任何 VMware VM 都会硬卡死**；根因在宿主系统（“不忘初心”修改版内核/虚拟化兼容）或硬件（内存/CPU/主板/电源），无法在项目侧绕过。
+- 处置：停止所有 VMware VM 尝试。VM+KD 验证路径在本机永久标记为不可用；后续只能走硬件诊断、换机/KVM 或裸机验证。
+- 环境遗留：`D:\win11_trash_backup`（Win11 VM 38 文件约 27.8GB）待用户手动删除；VMware 17.6.4 已安装于默认路径且未装 Networking（若后续要网络功能需在稳定环境修复安装）。
+
 ## 9. VM 环境现状（2026-08-09）
 
 | VM | 路径 | 状态 |
