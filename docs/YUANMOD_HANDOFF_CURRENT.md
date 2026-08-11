@@ -89,6 +89,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | Task 5 review 修复：stub 换可执行 NonPagedPool、入口改 16B 绝对跳转、函数页先 split 再置只读并纳入 NPF 写策略 | 评审发现 4 项问题，按反馈最小修复 | 仅改 `protect.c`；构建成功，v28 SHA256 `AC05BC52...3447EF` |
 | 2026-08-11 | 用户确认下一步第 1 项：内核控制设备 + IOCTL 配置通道（v32） | 常驻基架已有 VMMCALL 协议但无用户态传输通道 | 新增设备对象/IOCTL/测试工具；跨核加锁、进程生命周期、hook 加固、CPL/CR3 认证不在本次范围 |
 | 2026-08-11 | 用户确认第 2 项：常驻模式接入真实受保护页与真实 hook，stub 在 resident guest 中跑 allow/deny | 常驻基架仍为空转，hook stub 未在 guest 中执行 | 新增一次性 hook guest 测试 + CPU0 workload 常驻；仅 CPU0 访问受保护页避免跨核竞态（加锁仍留第 3 项） |
+| 2026-08-11 | 用户确认第 3 项：NPT 共享状态加锁（g_protect/g_protect_hooks 跨 VCPU 保护）v34 | `npt_split_2mb_to_4kb` 用 `MmAllocateContiguousMemory` 只能 PASSIVE，自旋锁不可用 | `protect.c` 用 `FAST_MUTEX` 串行化共享状态与 NPT 权限修改；NPF/#DB 改走 on_npf_write/rearm 定点重锁；GET_STATE/HEARTBEAT 改快照 API |
 
 ## 7. 变更日志
 
@@ -102,6 +103,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | `YuanGuardHV/svm_trampoline.asm` | 移除 clang 生成的中间汇编并加入 .gitignore | git 状态干净 |
 | 2026-08-11 | `YuanGuardHV/hv/{common/control_ioctl.h,common/control_device.h,control_device.c}`、`hv/main.c`、`build.bat`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task A：IOCTL 控制设备配置通道 v32 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-11 | `YuanGuardHV/hv/{svm_trampoline.S,main.c,vmmcall.c}` | Phase 3 下一步 Task B：常驻模式接入真实受保护页与真实 hook v33 | 构建 SUCCESS + VM 验证通过 |
+| 2026-08-11 | `YuanGuardHV/hv/{protect.c,vmexit.c,vmmcall.c,control_device.c,main.c,common/svm_vcpu.h,common/protect.h}`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task C：NPT 共享状态加锁 v34 | 构建 SUCCESS + VM 验证通过（含并发 selftest） |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -481,3 +483,18 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v33 SHA256 `17E5F0BED100C9862476F7C45F85823B25BF6B7F1C190D36ADA336692BF3FE14`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v33.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v33.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告，`main.c`/`vmmcall.c`/`svm_trampoline.S` 无新增告警。
 - 验证（2026-08-11，VM 双核）：`sc start yuanguard` → RUNNING；KD 日志 `hook resident test: allow rdx=0x0`、`hook resident test: deny rdx=0xc0000022`、`hook resident test: PASS`；`protect start: 2 pages armed`（workload 页 + hook 函数页）；`persistent protect mode active: 2 cores`；CPU0 workload 心跳滚动至 871 万次以上，日志 `heartbeat protect exits=... core=0 page=0xffffa4004f45c000 hook=0xfffff8049e832e00 last=0x0`，并出现 workload 页 NPF 放行 `protect: ring0 write allowed gpa=0xbf791000`；卸载时 `protect hook 0 removed`，服务回 `STOPPED`，无蓝屏。
 - 结论：常驻模式已接入真实受保护页与驱动内 dummy hook；hook stub 在 resident guest 中 allow/deny 两路径均验证通过，NPF 写保护放行→#DB 重锁在常驻 workload 中持续工作。
+
+### 9.29 Phase 3 下一步 Task C：NPT 共享状态加锁（2026-08-11）
+
+- 用户确认方案：
+  - `protect.c` 新增 `FAST_MUTEX g_protect_lock`（`ExInitializeFastMutex`），串行保护 `g_protect`、`g_protect_hooks` 及与其绑定的 NPT 权限修改（split/perm/arm/disarm）。原因是 `npt_split_2mb_to_4kb` 内部用 `MmAllocateContiguousMemory`（只能 PASSIVE_LEVEL），不能用在 DISPATCH_LEVEL 的自旋锁；现有所有访问点（resident exit handler、IOCTL、测试）均在 PASSIVE_LEVEL。
+  - protect.c 重构为“取锁 → 内部 `_locked` 实现 → 放锁”；`set_target` 的 `PsLookupProcessByProcessId` 放锁外，进程引用替换与 CR3 提交在锁内。
+  - 新增 `yghv_protect_on_npf_write(vcpu, gpa)`（锁内 find+is_target+disarm，返回 ALLOW/DENY/NONE，记录 `vcpu->rearm_gpa`）、`yghv_protect_rearm(vcpu)`（只重锁 `rearm_gpa` 页，`active==FALSE` 跳过，替代“重锁全部未武装页”）、`yghv_protect_get_state()` / `yghv_protect_get_heartbeat()` 快照 API。
+  - `vmexit.c` NPF 写决策走 `yghv_protect_on_npf_write`，#DB 重锁走 `yghv_protect_rearm`；`vmmcall.c`/`control_device.c` GET_STATE 与 HEARTBEAT 改快照 API；`svm_vcpu.h` 新增 `rearm_gpa`；`main.c` DriverEntry 早段调 `yghv_protect_init()`。
+  - 行为变化：disarm 失败时 NPF 走 DENY（注入 #PF）而不是原“不推进 RIP 直接重执行”的潜在死循环；测试中直接写 `g_protect.cr3` 的临时 hack 仍只在单线程测试期发生。
+- 范围：只做共享状态串行化与 rearm 定点化；hook 加固、进程生命周期、控制面认证不在本次范围。
+- 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v34 SHA256 `904676893913CED8A99145528A4F2D576DC931475CF691F8429E2EF84634FC84`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v34.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v34.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告，`protect.c`/`vmexit.c`/`vmmcall.c`/`control_device.c`/`main.c`/`svm_vcpu.h` 无新增告警。
+- 验证（2026-08-11，VM 双核）：`sc start yuanguard` → RUNNING；`hook resident test: allow rdx=0x0`、`deny rdx=0xc0000022`、`PASS`；`protect start: 2 pages armed`；CPU0 workload 心跳滚动 20 万+（`page=0xffffa400536f0000 hook=0xfffff8049e842ce0 last=0x0`）且 `protect: ring0 write allowed` 持续出现；并发运行 `yghv_ctl.ps1 selftest` 时 `set-target/add-page/start` 全部成功，加锁后状态一致（`active=1 pid=4956 page_count=3`，含基架 2 内部页 + 新增 1 页）；切换目标到 PowerShell 后 workload 安全变空转（`page=0x0 hook=0x0`，`last=0xc0000022` 为切换瞬间旧 rsi 调用的正确 DENY 结果）；卸载回 `STOPPED`，无蓝屏。
+- 发现并修复：selftest 原先断言 `page_count==1`，与常驻基架默认 2 个内部页（workload 页 + hook 函数页）冲突导致 `state mismatch after start`；已把 selftest 改为“基线页数 + 1”比较（读取起始 page_count 作为 baseline），并增加 add-page 注册校验。仅改 `tools/yghv_ctl.ps1`，驱动代码无问题；待重跑 selftest 确认 PASS。
+- 验证补完（2026-08-11）：重载 v34 后 `sc start yuanguard` → RUNNING；`yghv_ctl.ps1 selftest` → `baseline page_count=2`、`set-target/add-page/start OK`、`user write/read OK`、`selftest: PASS`；卸载回 `STOPPED`，无蓝屏。结合上一轮日志，allow/deny PASS、workload 20 万+ 心跳、IOCTL 与常驻 VCPU 并发访问共享状态加锁生效。
+- 结论：第 3 项完成。`FAST_MUTEX` 串行化 `g_protect`/`g_protect_hooks` 与 NPT 权限修改，NPF/#DB 改走 `on_npf_write`/`rearm` 定点重锁（`active==FALSE` 跳过重锁），GET_STATE/HEARTBEAT 走快照 API；残余项为目标进程生命周期（第 4 项）与 hook 加固（第 5 项）。
