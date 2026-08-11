@@ -601,6 +601,11 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - Step 6：12 核多线程 VMRUN 心跳 PASS。
   - Step 7：hook stub 在 guest 中执行（HOOK_QUERY allow，rdx=0）PASS。
   - 结论：单点机制裸机全部正常，冻结点收敛到“常驻 workload 组合（CPU0 持续写受保护页 + 调 hook + 全核常驻 + rendezvous 线程）”。
+- 常驻限核测试（2026-08-11）：
+  - Step 8：全核常驻 + CPU0 workload（写保护 + hook）→ 冻结重启。
+  - Step 8a：全核常驻纯心跳 + `ZwYieldExecution`（每 32768 次退出）→ 冻结重启。
+  - Step 8b：仅 CPU0/1 常驻纯心跳 + yield → 冻结重启。
+  - 最终结论：**该宿主（Ryzen 5 5500，>16GB RAM）对“非停止常驻 VMRUN”即使 2 核也会硬冻结**；所有有界/单次 VMRUN（Step1-7、Step6 十二核 10000 次心跳）均正常。判定为平台/硬件兼容问题（与本机 VMware 虚拟化路径硬卡死史一致），非驱动逻辑问题。裸机常驻测试停止；换机/KVM/VM 继续验证。
 - v41 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；SHA256 `349C32A95528B87F8449F3759F4ECF22B1F149A596C245EF59F34E32DFD25D7A`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v41.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v41.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
 - v41 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD `cpuid stealth test: leaf1_ecx=0x7ef83203 hyper=0x0/0x0/0x0/0x0 svm_ecx=0xc003f9 svm_leaf_eax=0x0` → `PASS`（leaf1 bit31 已清）；boundary/rendezvous 仍 PASS；卸载回 `STOPPED`，无蓝屏。
 - 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v40 SHA256 `5578A00FDC271A77084973CA668EC5B93698E413C84DE56A48D99CEDABC03F91`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v40.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v40.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
