@@ -90,6 +90,8 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | 用户确认下一步第 1 项：内核控制设备 + IOCTL 配置通道（v32） | 常驻基架已有 VMMCALL 协议但无用户态传输通道 | 新增设备对象/IOCTL/测试工具；跨核加锁、进程生命周期、hook 加固、CPL/CR3 认证不在本次范围 |
 | 2026-08-11 | 用户确认第 2 项：常驻模式接入真实受保护页与真实 hook，stub 在 resident guest 中跑 allow/deny | 常驻基架仍为空转，hook stub 未在 guest 中执行 | 新增一次性 hook guest 测试 + CPU0 workload 常驻；仅 CPU0 访问受保护页避免跨核竞态（加锁仍留第 3 项） |
 | 2026-08-11 | 用户确认第 3 项：NPT 共享状态加锁（g_protect/g_protect_hooks 跨 VCPU 保护）v34 | `npt_split_2mb_to_4kb` 用 `MmAllocateContiguousMemory` 只能 PASSIVE，自旋锁不可用 | `protect.c` 用 `FAST_MUTEX` 串行化共享状态与 NPT 权限修改；NPF/#DB 改走 on_npf_write/rearm 定点重锁；GET_STATE/HEARTBEAT 改快照 API |
+| 2026-08-11 | 用户确认第 4 项：目标进程生命周期（EPROCESS 校验、退出自动 disarm、PID 复用防护）v35 | 当前 set_target 无退出监控，目标退出后页仍武装、CR3 可能被复用 | `PsSetCreateProcessNotifyRoutineEx` 退出回调按 EPROCESS 身份清除；`g_persistent_mode` 让 auto-disarm 不退出 resident；新增 exit-test 工具验证 |
+| 2026-08-11 | 用户确认第 4 项改用 v36 轮询方案 | VM 的 ntoskrnl 对测试签名驱动调用 `PsSetCreateProcessNotifyRoutine`/`Ex` 都返回 0xC000007A 且残留回调，两次 0xCE | 删除进程通知注册；HEARTBEAT 每 10000 次退出用 `PsGetProcessExitTime`（MmGetSystemRoutineAddress 动态解析）轮询目标退出，命中则自动 disarm |
 
 ## 7. 变更日志
 
@@ -104,6 +106,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | `YuanGuardHV/hv/{common/control_ioctl.h,common/control_device.h,control_device.c}`、`hv/main.c`、`build.bat`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task A：IOCTL 控制设备配置通道 v32 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-11 | `YuanGuardHV/hv/{svm_trampoline.S,main.c,vmmcall.c}` | Phase 3 下一步 Task B：常驻模式接入真实受保护页与真实 hook v33 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-11 | `YuanGuardHV/hv/{protect.c,vmexit.c,vmmcall.c,control_device.c,main.c,common/svm_vcpu.h,common/protect.h}`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task C：NPT 共享状态加锁 v34 | 构建 SUCCESS + VM 验证通过（含并发 selftest） |
+| 2026-08-11 | `YuanGuardHV/hv/{protect.c,main.c,vmmcall.c,common/protect.h}`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task D：目标进程生命周期（v35-v37，最终为 KeWaitForSingleObject 轮询判活） | 构建 SUCCESS + VM 验证通过（selftest + exit-test） |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -498,3 +501,22 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 发现并修复：selftest 原先断言 `page_count==1`，与常驻基架默认 2 个内部页（workload 页 + hook 函数页）冲突导致 `state mismatch after start`；已把 selftest 改为“基线页数 + 1”比较（读取起始 page_count 作为 baseline），并增加 add-page 注册校验。仅改 `tools/yghv_ctl.ps1`，驱动代码无问题；待重跑 selftest 确认 PASS。
 - 验证补完（2026-08-11）：重载 v34 后 `sc start yuanguard` → RUNNING；`yghv_ctl.ps1 selftest` → `baseline page_count=2`、`set-target/add-page/start OK`、`user write/read OK`、`selftest: PASS`；卸载回 `STOPPED`，无蓝屏。结合上一轮日志，allow/deny PASS、workload 20 万+ 心跳、IOCTL 与常驻 VCPU 并发访问共享状态加锁生效。
 - 结论：第 3 项完成。`FAST_MUTEX` 串行化 `g_protect`/`g_protect_hooks` 与 NPT 权限修改，NPF/#DB 改走 `on_npf_write`/`rearm` 定点重锁（`active==FALSE` 跳过重锁），GET_STATE/HEARTBEAT 走快照 API；残余项为目标进程生命周期（第 4 项）与 hook 加固（第 5 项）。
+
+### 9.30 Phase 3 下一步 Task D：目标进程生命周期（2026-08-11）
+
+- 用户确认方案：
+  - `protect.c` 用 `PsSetCreateProcessNotifyRoutineEx` 注册退出回调（Ex 版回调带 `EPROCESS`，按对象身份比较）；新增 `yghv_protect_on_target_exit(process)`：锁内比较 `g_protect.process == process`，命中则 `stop_locked` disarm、卸载已装 hooks、清空 `pages/target`、释放 EPROCESS 引用，日志 `protect target exited: auto disarm`；新增 register/unregister 接口。
+  - `set_target` 增加 EPROCESS 基础校验：`pid != 0`、`PsGetProcessId(proc) == pid`、`cr3 != 0`（已有）；PID 复用防护 = 持有原 EPROCESS 引用 + 退出回调按对象身份清除，复用 PID 的新进程不会被当成旧目标。
+  - 常驻保活与保护状态解耦：新增 `g_persistent_mode`，HEARTBEAT 在 `active || persistent` 时保持 resident 循环；目标退出自动 disarm 后 resident 不退出，可重新 set-target/start。
+  - `main.c` persistent 启动前注册回调（并入现有失败回滚路径），`DriverUnload` 开头注销；`vmmcall.c` 心跳判断改 `active || persistent`；`yghv_ctl.ps1` 新增 `exit-test` 命令（起短暂子进程 → set-target → 等退出 → 轮询 GET_STATE 自动清空）。
+- 范围：不含 hook 加固（第 5 项）与控制面认证（第 6 项）。
+- 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；修正版 v35 SHA256 `F91A9A3469D3F009ACBC36D5DEE8ACC60CDB34D9FAFB221BF7185279C413045E`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v35.sys`，旧占用文件已改名 `.locked`），已复制 `D:\aaaaaavm\yuanguard_hv_v35.sys` 与 `D:\aaaaaavm\yghv_ctl.ps1`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告，`protect.c`/`main.c`/`vmmcall.c` 无新增告警。
+- 运行修复（2026-08-11）：VM 首次加载 v35 时 `sc start` 报 127（0xC000007A），KD 定位 `yghv_protect_register_lifecycle()` 返回 `STATUS_PROCEDURE_NOT_FOUND`；根因为 `PsSetCreateProcessNotifyRoutineEx` 要求调用模块带 `IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY`，当前测试签名驱动不满足。修复：改用 `PsSetCreateProcessNotifyRoutine`（无 FORCE_INTEGRITY 限制），回调按 PID 比较；由于驱动持有目标 EPROCESS 引用，PID 在引用释放前不会被复用，身份判定仍安全。仅改 `protect.c`/`protect.h`，构建后重测。
+- 蓝屏 0xCE 根因（2026-08-11）：第一版 v35（Ex API）的 `PsSetCreateProcessNotifyRoutineEx` 虽返回 `0xC000007A`，仍在进程通知链表残留指向已卸载驱动的回调；`sc.exe` 退出时 `nt!PspCallProcessNotifyRoutines` 跳到 `<Unloaded_yuanguard_hv.sys>+0x7400` → 页故障 → `DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS (0xCE)`。KD `!analyze -v` 栈确认。处置：`vmrun stop hard` + `vmrun start gui` + 重启 `kd_ctl.ps1` + `g` 放行，VM 已恢复；修复版 legacy 回调不存在该半注册状态。
+- 二次验证失败（2026-08-11）：换 legacy `PsSetCreateProcessNotifyRoutine` 后 VM 仍报 `0xC000007A` 并再次 0xCE（同一 `+0x7400` 回调地址）。KD 确认该 build 的 legacy/Ex 共用 `PspCreateProcessNotifyRoutine` 表且测试签名驱动下注册/反注册都失败，回调残留。KD 同时确认 `PsGetProcessExitTime` 导出存在、`_KPROCESS` 无 `State` 字段。
+- v36 方案（用户确认）：彻底删除进程通知注册（register/unregister/回调）；`protect.c` 用 `MmGetSystemRoutineAddress` 动态解析 `PsGetProcessExitTime`（缺失则禁用轮询并记日志）；`vmmcall.c` HEARTBEAT 每 10000 次退出调用 `yghv_protect_check_target_exited()`，退出时间非零则走现有 `yghv_protect_on_target_exit(pid)` 自动 disarm。保留 `set_target` 校验、`g_persistent_mode`、`exit-test`。
+- 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v36 SHA256 `22D4AD058B626A963E559438A6D76289F3B78AB430DAD4BB4454E97E692EAE06`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v36.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v36.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告，`protect.c`/`main.c`/`vmmcall.c` 无新增告警。
+- v36 验证（2026-08-11）：`sc start` RUNNING、`selftest PASS`、卸载干净、无蓝屏；但 `exit-test` 未自动清空（`active=0 pid=916 page_count=2`）。KD 日志无 “lifecycle 禁用” 告警，说明 `PsGetProcessExitTime` 解析成功却对已退出子进程返回 0，判活未生效。
+- v37 修复（用户确认）：判活原语改用 `KeWaitForSingleObject(g_protect.process, Executive, KernelMode, FALSE, 零超时)`，进程对象退出后变为 Signaled，返回 `STATUS_SUCCESS` 即判定退出；无新增内核导出依赖，轮询节奏不变。构建 SUCCESS，v37 SHA256 `2EA38EA2FF1833DF27C4D887D675D6F357CC71A168DF2E9724527E8EB66E8B47`，已复制 `D:\aaaaaavm\yuanguard_hv_v37.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告。
+- 验证（2026-08-11，VM 双核）：`sc start yuanguard` → RUNNING；`selftest: PASS`；`exit-test: PASS (active=0 pid=0 page_count=0)`（child pid=1692 退出后轮询自动 disarm）；KD 日志 `protect target: pid=1692 ...` → `protect target exited: auto disarm, pid cleared` → 心跳继续（`page=0x0 hook=0x0`）；`unload_driver.ps1` 干净卸载回 `STOPPED`，无蓝屏。
+- 结论：第 4 项完成。目标进程生命周期采用“持 EPROCESS 引用 + HEARTBEAT 轮询 KeWaitForSingleObject 判活 + 退出自动 disarm/清空目标与页表”，PID 复用防护靠引用期间 PID 不复用 + 退出即清空。残余项为 hook 加固（第 5 项）与控制面认证（第 6 项）。
