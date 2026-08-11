@@ -1,0 +1,43 @@
+#ifndef YGHV_CONTROL_IOCTL_H
+#define YGHV_CONTROL_IOCTL_H
+
+#include <ntddk.h>
+
+#define YGHV_IOCTL_DEVICE_TYPE 0x5947
+#define YGHV_METHOD_BUFFERED   0
+#define YGHV_FILE_ANY_ACCESS   0
+
+#define YGHV_CTL_CODE(DeviceType, Function, Method, Access) \
+    (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
+
+#define IOCTL_YGHV_SET_TARGET \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x800, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_ADD_PAGE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x801, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_REMOVE_PAGE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x802, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_START_PROTECT \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x803, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_STOP_PROTECT \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x804, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_GET_STATE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x805, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
+#define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
+#define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
+
+typedef struct {
+    ULONG pid;
+} yghv_ioctl_set_target_t;
+
+typedef struct {
+    ULONG_PTR target_va;
+} yghv_ioctl_va_t;
+
+typedef struct {
+    ULONG active;
+    ULONG pid;
+    ULONG page_count;
+} yghv_ioctl_state_t;
+
+#endif

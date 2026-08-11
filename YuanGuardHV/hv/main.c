@@ -4,6 +4,7 @@
 #include "svm_vcpu.h"
 #include "npt.h"
 #include "control_plane.h"
+#include "control_device.h"
 #include "protect.h"
 #include "debug.h"
 
@@ -467,10 +468,10 @@ static void yghv_init_auth_cookie(void) {
 }
 
 void DriverUnload(struct _DRIVER_OBJECT *d) {
-    (void)d;
     g_npt_test_active = 0;
     svm_core_stop_all_residents();
     svm_core_wait_all_stopped(g_vcpu_count);
+    yghv_control_device_cleanup(d);
     KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_protect_cleanup();
     if (g_guest_code_page)
@@ -771,12 +772,15 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
             return (NTSTATUS)sv;
         }
     }
-    sv = svm_core_start_persistent_residents(online);
+    sv = yghv_control_device_init(d);
+    if (!sv)
+        sv = svm_core_start_persistent_residents(online);
     if (sv) {
-        LOG_ERROR("persistent residents start failed 0x%x", sv);
+        LOG_ERROR("persistent residents/control device start failed 0x%x", sv);
         svm_core_wait_remote_ready(online);
         svm_core_stop_all_residents();
         svm_core_wait_all_stopped(online);
+        yghv_control_device_cleanup(d);
         yghv_protect_cleanup();
         npt_cleanup(&g_npt);
         svm_core_cleanup();

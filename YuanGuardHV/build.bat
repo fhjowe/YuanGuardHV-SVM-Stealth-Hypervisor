@@ -56,7 +56,7 @@ set "LINKS=%LINKS% /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VER%\km\x64""
 echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
-for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect) do call :compile %%f || goto :error
+for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
@@ -71,6 +71,7 @@ echo   Linking (MSVC)...
     "%BIN_DIR%\vmmcall.obj" ^
     "%BIN_DIR%\multi_core.obj" ^
     "%BIN_DIR%\protect.obj" ^
+    "%BIN_DIR%\control_device.obj" ^
     "%BIN_DIR%\svm_trampoline.obj" ^
     ntoskrnl.lib
 if errorlevel 1 goto :error
