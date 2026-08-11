@@ -96,16 +96,21 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         vcpu->regs.rax = (uint64_t)yghv_protect_start();
         return 0;
 
-    case YGHV_CMD_STOP_PROTECT:
+    case YGHV_CMD_STOP_PROTECT: {
         if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
-        yghv_protect_stop();
-        vcpu->regs.rax = YGHV_STATUS_OK;
+        NTSTATUS st = yghv_protect_stop();
+        vcpu->regs.rax = (uint64_t)st;
         return 0;
+    }
 
     case YGHV_CMD_GET_STATE:
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
         vcpu->regs.rax = g_protect.active ? 1 : 0;
         vcpu->regs.rbx = g_protect.page_count;
         vcpu->regs.rcx = g_protect.pid;
