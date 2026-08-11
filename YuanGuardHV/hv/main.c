@@ -357,7 +357,7 @@ static NTSTATUS yghv_hook_test(void) {
     uint64_t entry_before, entry_after;
     int ok = 1;
 
-    term = yghv_protect_find_func_pattern(L"NtTerminateProcess", NULL, 0);
+    term = yghv_protect_find_func_pattern(L"ZwTerminateProcess", NULL, 0);
     if (!term) {
         LOG_ERROR("protect hook test: locate FAILED");
         return STATUS_NOT_FOUND;
