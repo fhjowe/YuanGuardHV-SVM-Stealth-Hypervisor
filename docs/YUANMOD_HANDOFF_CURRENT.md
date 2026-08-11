@@ -88,6 +88,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | 用户确认后修复 build.bat 并重跑基线 | 脚本路径含括号/空格导致无法编译 | 构建成功，sys 已签名，哈希见第 5 节 |
 | 2026-08-11 | Task 5 review 修复：stub 换可执行 NonPagedPool、入口改 16B 绝对跳转、函数页先 split 再置只读并纳入 NPF 写策略 | 评审发现 4 项问题，按反馈最小修复 | 仅改 `protect.c`；构建成功，v28 SHA256 `AC05BC52...3447EF` |
 | 2026-08-11 | 用户确认下一步第 1 项：内核控制设备 + IOCTL 配置通道（v32） | 常驻基架已有 VMMCALL 协议但无用户态传输通道 | 新增设备对象/IOCTL/测试工具；跨核加锁、进程生命周期、hook 加固、CPL/CR3 认证不在本次范围 |
+| 2026-08-11 | 用户确认第 2 项：常驻模式接入真实受保护页与真实 hook，stub 在 resident guest 中跑 allow/deny | 常驻基架仍为空转，hook stub 未在 guest 中执行 | 新增一次性 hook guest 测试 + CPU0 workload 常驻；仅 CPU0 访问受保护页避免跨核竞态（加锁仍留第 3 项） |
 
 ## 7. 变更日志
 
@@ -100,6 +101,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | `YuanGuardHV/build.bat` | for 块改 `call :compile` 子程序；INCLUDES/LIBPATH 路径加引号 | 构建成功并签名 |
 | 2026-08-09 | `YuanGuardHV/svm_trampoline.asm` | 移除 clang 生成的中间汇编并加入 .gitignore | git 状态干净 |
 | 2026-08-11 | `YuanGuardHV/hv/{common/control_ioctl.h,common/control_device.h,control_device.c}`、`hv/main.c`、`build.bat`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task A：IOCTL 控制设备配置通道 v32 | 构建 SUCCESS + VM 验证通过 |
+| 2026-08-11 | `YuanGuardHV/hv/{svm_trampoline.S,main.c,vmmcall.c}` | Phase 3 下一步 Task B：常驻模式接入真实受保护页与真实 hook v33 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -467,3 +469,15 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 宿主侧脚本冒烟：`yghv_ctl.ps1 state` 正确返回 `CreateFile \\.\YuanGuardHV failed, Win32 error 0x00000002`（驱动未加载时的预期路径）；期间修复客户端把 `INVALID_HANDLE_VALUE(-1)` 当成功句柄的检查，已改为同时比对 `IntPtr.Zero` 与 `IntPtr(-1)`。
 - 验证（2026-08-11，VM 双核）：`sc start yuanguard` → RUNNING；`yghv_ctl.ps1 selftest` → `pid=3456 buf_va=0x112142575C8`、`set-target/add-page/start OK`、`state active=1 page_count=1`、`user write/read OK`、`selftest: PASS`；KD 日志确认 `persistent protect mode active: 2 cores`、`protect target: pid=3456 cr3=0x186dfe000`、`protect add_page: va=0x112142575c8 gpa=0x1417fb000`、`protect start: 1 pages armed`、常驻心跳滚动至 20 万+；`unload_driver.ps1` 干净卸载回 `STOPPED`，无蓝屏。
 - 结论：IOCTL 配置通道（外部 SET_TARGET/ADD_PAGE/START/GET_STATE/STOP/REMOVE）在常驻模式下可用，真实用户页 NPT arm/disarm 生效；真实写入被 resident guest NPF 拦截的 allow/deny 路径仍属下一步（第 2 项）。
+
+### 9.28 Phase 3 下一步 Task B：常驻模式接入真实受保护页与真实 hook（2026-08-11）
+
+- 用户确认方案，实现：
+  - `YuanGuardHV/hv/svm_trampoline.S` 新增 `svm_trampoline_test_hook_guest`（`call rsi` → `mov rdx,rax` 捕获 stub 返回 → STOP_INTERNAL）与 `svm_trampoline_test_resident_guest`（`rdi!=0` 时写受保护页、`rsi!=0` 时调用已 hook 的 dummy 并把结果存 rdx、然后 HEARTBEAT 循环）。
+  - `YuanGuardHV/hv/main.c` 新增 `yghv_hook_resident_test()`：System 目标 + dummy hook，CPU0 resident guest 跑 allow（guest CR3=目标 CR3，期望 `rdx==0`）与 deny（guest CR3 保持有效，临时把 `g_protect.cr3` 偏移 0x1000 造成不匹配，期望 `rdx==0xC0000022`），跑完恢复并卸载 hook。
+  - 常驻接入用 `YGHV_RESIDENT_WORKLOAD_TEST 1` 宏包住：持久化前配置 System 目标 + 驱动内 4KB 测试页 + dummy hook，再 `yghv_protect_start()`；CPU0 用 workload guest 常驻，其余核保持心跳；`vmmcall.c` HEARTBEAT 分支按 `g_protect` 刷新 `rdi/rsi`（仅当 guest CR3==目标时给 workload 值，否则给 0，保证外来目标下安全空转），每 10000 次退出日志 workload 状态与最后结果。
+  - 清理：新增测试页在 DriverUnload 与相关失败路径释放；hook/页仍由 `yghv_protect_cleanup()` 统一清理。
+- 范围：仅 CPU0 访问受保护页，避免两核同时 disarm/rearm 同一页的跨核竞态；跨核加锁（第 3 项）与真实系统函数 hook（继续用驱动内 dummy）不在本次范围。
+- 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v33 SHA256 `17E5F0BED100C9862476F7C45F85823B25BF6B7F1C190D36ADA336692BF3FE14`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v33.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v33.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告，`main.c`/`vmmcall.c`/`svm_trampoline.S` 无新增告警。
+- 验证（2026-08-11，VM 双核）：`sc start yuanguard` → RUNNING；KD 日志 `hook resident test: allow rdx=0x0`、`hook resident test: deny rdx=0xc0000022`、`hook resident test: PASS`；`protect start: 2 pages armed`（workload 页 + hook 函数页）；`persistent protect mode active: 2 cores`；CPU0 workload 心跳滚动至 871 万次以上，日志 `heartbeat protect exits=... core=0 page=0xffffa4004f45c000 hook=0xfffff8049e832e00 last=0x0`，并出现 workload 页 NPF 放行 `protect: ring0 write allowed gpa=0xbf791000`；卸载时 `protect hook 0 removed`，服务回 `STOPPED`，无蓝屏。
+- 结论：常驻模式已接入真实受保护页与驱动内 dummy hook；hook stub 在 resident guest 中 allow/deny 两路径均验证通过，NPF 写保护放行→#DB 重锁在常驻 workload 中持续工作。
