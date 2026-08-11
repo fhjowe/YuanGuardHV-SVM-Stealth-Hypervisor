@@ -66,16 +66,7 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
 
     case SVM_EXIT_EXCEPTION_DB:
         if (vcpu->rearm_pending) {
-            uint32_t i;
-            for (i = 0; i < g_protect.page_count; i++) {
-                if (g_protect.pages[i].armed)
-                    continue;
-                int st = yghv_protect_arm_page(&g_protect.pages[i]);
-                if (st)
-                    LOG_ERROR("protect: re-arm failed gpa=0x%llx st=0x%x",
-                        g_protect.pages[i].gpa, st);
-            }
-            vcpu->rearm_pending = 0;
+            yghv_protect_rearm(vcpu);
             vcpu->vmcb->state.rflags &= ~0x100ULL;
             return 0;
         }
@@ -89,26 +80,21 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         static uint64_t npf_logged = 0;
         uint64_t info1 = vcpu->vmcb->control.exitinfo1;
         uint64_t pf_ec = 0;
+        yghv_npf_result_t npf_result = YGHV_NPF_NONE;
 
-        yghv_protect_page_t *pp = yghv_protect_find_page(vcpu->vmcb->control.exitinfo2);
-        if (pp && (info1 & NPF_INFO1_WRITE)) {
+        if (info1 & NPF_INFO1_WRITE)
+            npf_result = yghv_protect_on_npf_write(vcpu,
+                vcpu->vmcb->control.exitinfo2);
+
+        if (npf_result == YGHV_NPF_ALLOW) {
             static uint64_t ring0_logged = 0;
-            if (yghv_protect_is_target_cr3(vcpu->vmcb->state.cr3) ||
-                vcpu->vmcb->state.cpl == 0) {
-                int st;
-                /* target process or ring0: allow one write, re-arm after #DB */
-                st = yghv_protect_disarm_page(pp);
-                if (st) {
-                    LOG_ERROR("protect: disarm failed gpa=0x%llx st=0x%x",
-                        pp->gpa, st);
-                    return 0;
-                }
-                vcpu->rearm_pending = 1;
-                vcpu->vmcb->state.rflags |= 0x100ULL;  /* TF */
-                if (vcpu->vmcb->state.cpl == 0 && ring0_logged++ < 32)
-                    LOG_ERROR("protect: ring0 write allowed gpa=0x%llx", pp->gpa);
-                return 0;
-            }
+            vcpu->vmcb->state.rflags |= 0x100ULL;  /* TF */
+            if (vcpu->vmcb->state.cpl == 0 && ring0_logged++ < 32)
+                LOG_ERROR("protect: ring0 write allowed gpa=0x%llx",
+                    vcpu->vmcb->control.exitinfo2);
+            return 0;
+        }
+        if (npf_result == YGHV_NPF_DENY) {
             /* foreign user-mode write: inject #PF with accurate error code */
             if (info1 & NPF_INFO1_PRESENT) pf_ec |= (1ULL << 0);
             if (info1 & NPF_INFO1_WRITE)   pf_ec |= (1ULL << 1);
@@ -119,7 +105,7 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
                 SVM_EVENTINJ_VALID | SVM_EVENTINJ_TYPE_EXC |
                 SVM_EVENTINJ_ERROR_VALID | 0x0E | (pf_ec << 32);
             LOG_ERROR("protect: foreign write denied gpa=0x%llx cr3=0x%llx",
-                pp->gpa, vcpu->vmcb->state.cr3);
+                vcpu->vmcb->control.exitinfo2, vcpu->vmcb->state.cr3);
             return 0;
         }
 

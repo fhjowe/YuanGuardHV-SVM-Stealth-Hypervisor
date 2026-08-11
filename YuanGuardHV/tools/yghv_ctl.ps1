@@ -148,6 +148,9 @@ try {
                 $addr = $gc.AddrOfPinnedObject().ToInt64()
                 $pidVal = [YghvCtlNative]::GetCurrentProcessId()
                 Write-Host ("selftest: pid={0} buf_va=0x{1:X}" -f $pidVal, $addr)
+                $base = Read-YghvState
+                $baseCount = $base.pageCount
+                Write-Host ("selftest: baseline page_count={0}" -f $baseCount)
 
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x800)) `
                     -InBytes ([BitConverter]::GetBytes([uint32]$pidVal)) | Out-Null
@@ -156,12 +159,17 @@ try {
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x801)) `
                     -InBytes ([BitConverter]::GetBytes([uint64]$addr)) | Out-Null
                 Write-Host 'selftest: add-page OK'
+                $st = Read-YghvState
+                if ($st.pageCount -ne ($baseCount + 1)) {
+                    throw ("selftest: add-page did not register (baseline={0} page_count={1})" -f
+                        $baseCount, $st.pageCount)
+                }
 
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x803)) | Out-Null
                 Write-Host 'selftest: start OK'
 
                 $st = Read-YghvState
-                if ($st.active -ne 1 -or $st.pageCount -ne 1 -or $st.pid -ne $pidVal) {
+                if ($st.active -ne 1 -or $st.pageCount -ne ($baseCount + 1) -or $st.pid -ne $pidVal) {
                     throw ("selftest: state mismatch after start (active={0} pid={1} page_count={2})" -f
                         $st.active, $st.pid, $st.pageCount)
                 }
@@ -179,7 +187,7 @@ try {
                     -InBytes ([BitConverter]::GetBytes([uint64]$addr)) | Out-Null
 
                 $st = Read-YghvState
-                if ($st.active -ne 0 -or $st.pageCount -ne 0) {
+                if ($st.active -ne 0 -or $st.pageCount -ne $baseCount) {
                     throw ("selftest: state mismatch after stop (active={0} page_count={1})" -f
                         $st.active, $st.pageCount)
                 }

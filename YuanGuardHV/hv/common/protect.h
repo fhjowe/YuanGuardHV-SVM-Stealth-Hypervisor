@@ -2,6 +2,7 @@
 #define YGHV_PROTECT_H
 #include <ntddk.h>
 #include "npt.h"
+#include "svm_vcpu.h"
 
 #define YGHV_PROTECT_MAX_PAGES 64
 #define YGHV_PROTECT_MAX_HOOKS 4
@@ -38,6 +39,12 @@ typedef struct {
     uint8_t  hook_id;
 } yghv_protect_hook_t;
 
+typedef enum {
+    YGHV_NPF_NONE = 0,
+    YGHV_NPF_ALLOW,
+    YGHV_NPF_DENY,
+} yghv_npf_result_t;
+
 NTSTATUS yghv_protect_init(void);
 void yghv_protect_cleanup(void);
 NTSTATUS yghv_protect_set_target(uint32_t pid);
@@ -54,6 +61,10 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va);
 NTSTATUS yghv_protect_remove_hook(uint8_t hook_id);
 uint64_t yghv_protect_on_hook_query(uint8_t hook_id, uint64_t accessor_cr3);
 uint64_t yghv_protect_find_func_pattern(PCWSTR name_hint, uint8_t *pat, SIZE_T pat_len);
+yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa);
+void yghv_protect_rearm(svm_vcpu_t *vcpu);
+void yghv_protect_get_state(ULONG *active, ULONG *pid, ULONG *page_count);
+void yghv_protect_get_heartbeat(uint64_t *page_va, uint64_t *hook_va);
 
 extern yghv_protect_state_t g_protect;
 extern yghv_protect_hook_t g_protect_hooks[YGHV_PROTECT_MAX_HOOKS];

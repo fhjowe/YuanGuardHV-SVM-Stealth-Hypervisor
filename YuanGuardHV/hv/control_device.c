@@ -73,13 +73,15 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         break;
     case IOCTL_YGHV_GET_STATE: {
         yghv_ioctl_state_t *out = (yghv_ioctl_state_t *)buf;
+        ULONG active, pid, page_count;
         if (out_len < sizeof(*out)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
-        out->active = g_protect.active ? 1 : 0;
-        out->pid = g_protect.pid;
-        out->page_count = g_protect.page_count;
+        yghv_protect_get_state(&active, &pid, &page_count);
+        out->active = active;
+        out->pid = pid;
+        out->page_count = page_count;
         info = sizeof(*out);
         break;
     }

@@ -19,12 +19,14 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
     switch (cmd) {
 
     case YGHV_CMD_HEARTBEAT: {
-        if (g_protect.active) {
+        ULONG active;
+        uint64_t page_va = 0, hook_va = 0;
+        yghv_protect_get_state(&active, NULL, NULL);
+        if (active) {
             if (yghv_protect_is_target_cr3(vcpu->vmcb->state.cr3)) {
-                vcpu->regs.rdi = g_protect.page_count
-                    ? g_protect.pages[0].target_va : 0;
-                vcpu->regs.rsi = g_protect_hooks[0].installed
-                    ? g_protect_hooks[0].func_va : 0;
+                yghv_protect_get_heartbeat(&page_va, &hook_va);
+                vcpu->regs.rdi = page_va;
+                vcpu->regs.rsi = hook_va;
             } else {
                 vcpu->regs.rdi = 0;
                 vcpu->regs.rsi = 0;
@@ -125,9 +127,13 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
-        vcpu->regs.rax = g_protect.active ? 1 : 0;
-        vcpu->regs.rbx = g_protect.page_count;
-        vcpu->regs.rcx = g_protect.pid;
+        {
+            ULONG active, pid, page_count;
+            yghv_protect_get_state(&active, &pid, &page_count);
+            vcpu->regs.rax = active ? 1 : 0;
+            vcpu->regs.rbx = page_count;
+            vcpu->regs.rcx = pid;
+        }
         return 0;
 
     case YGHV_CMD_HOOK_QUERY:

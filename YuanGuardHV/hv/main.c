@@ -571,6 +571,13 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_init_auth_cookie();
     yghv_trace_init();
+    sv = yghv_protect_init();
+    if (sv) {
+        LOG_ERROR("yghv_protect_init failed 0x%x", sv);
+        yghv_trace_close();
+        KeRevertToUserAffinityThread();
+        return sv;
+    }
     yghv_trace("entry");
     LOG_ERROR("driver entry pre");
 
