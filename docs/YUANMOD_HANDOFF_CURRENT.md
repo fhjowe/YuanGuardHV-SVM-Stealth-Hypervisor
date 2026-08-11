@@ -422,3 +422,4 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - DriverEntry 的 protect-test 失败路径先释放 `npt_test_buf` 并置 NULL，再调用 `yghv_protect_cleanup()`，随后才 `npt_cleanup()`，避免 NPT 测试缓冲与保护状态泄漏。
 - 验证：`cmd /c build.bat`（`D:\yuanguard\YuanGuardHV`）→ `Build SUCCESS`，签名成功；sys SHA256 `2CAF175A4E78C1F11493D9F4572E45314EA7874FF722DB3C0BB0A915F2170E06`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v27.sys`）；仅预存 WDK intrinsic 警告与 `YGHV_DEBUG_LOG` 重定义警告，`main.c` 无新增警告。
 - 提交：`git commit -m "fix: Task4 保护测试失败回滚与返回值检查"`（仅 main.c；docs/报告不提交）。
+- 2026-08-11 Phase 3 Task 5：终止保护补丁 stub + HOOK_QUERY 决策完成（protect.c 实现 stub 生成/安装/卸载/查询决策/函数定位，vmmcall.c 接入 HOOK_QUERY；CR0.WP 改用 clang-cl 内联汇编包装；构建 SUCCESS，SHA256 `B7F30324D044DD2D84742D6E2406FD9CCE85F27A9B2ACA68A7440A65CBB6D8CA`，已复制 `D:\aaaaaavm\yuanguard_hv_v28.sys`；提交 `665b23a`，仅代码文件，docs/报告不提交）。
