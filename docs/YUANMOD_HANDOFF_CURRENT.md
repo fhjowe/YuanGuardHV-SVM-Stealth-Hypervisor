@@ -592,6 +592,15 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - v49：NPT 改为 `MmGetPhysicalMemoryRanges()` 全内存映射 + 测试缓冲上限 64GB；全量加载再次硬冻结（18:39:55 强制重启，无 dump/WHEA），确认裸机 VMRUN 路径会冻结宿主。
   - v50：新增 `YGHV_BAREMETAL_NO_RESIDENT` 冒烟开关（跳过所有 resident/VMRUN，仅 r1 NPT API + hook 边界 + hook install/remove + 控制设备）；裸机加载 RUNNING，r1 `trans=test_pa` 全 PASS，宿主侧 `state`/`selftest` PASS，卸载回 STOPPED，无冻结。SHA256 `177B7D8C1CCCF62C68573B68041FF4FFB3F058C0C8D3AF8CB6E14D1DF568F5C7`。
   - 结论：裸机上非 VMRUN 路径已冒烟通过；VMRUN 首次进入即冻结宿主，需内核调试器或换机定位，R1 私有页/自剔除/默认 NX 与 MSR/IO 隐身继续阻塞。
+- 逐步逼近 v51（2026-08-11，每步构建+裸机加载，均用户确认）：
+  - Step 1：最小 VMRUN（NPT 关、无拦截，STOP_INTERNAL）PASS。
+  - Step 2：+NPT 全内存映射 PASS。
+  - Step 3：+CPUID 拦截 + stealth 矩阵 PASS。
+  - Step 4：+NPF（权限清零页 guest 读）PASS。
+  - Step 5：+写保护 allow/#DB 重锁 PASS。
+  - Step 6：12 核多线程 VMRUN 心跳 PASS。
+  - Step 7：hook stub 在 guest 中执行（HOOK_QUERY allow，rdx=0）PASS。
+  - 结论：单点机制裸机全部正常，冻结点收敛到“常驻 workload 组合（CPU0 持续写受保护页 + 调 hook + 全核常驻 + rendezvous 线程）”。
 - v41 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；SHA256 `349C32A95528B87F8449F3759F4ECF22B1F149A596C245EF59F34E32DFD25D7A`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v41.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v41.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
 - v41 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD `cpuid stealth test: leaf1_ecx=0x7ef83203 hyper=0x0/0x0/0x0/0x0 svm_ecx=0xc003f9 svm_leaf_eax=0x0` → `PASS`（leaf1 bit31 已清）；boundary/rendezvous 仍 PASS；卸载回 `STOPPED`，无蓝屏。
 - 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v40 SHA256 `5578A00FDC271A77084973CA668EC5B93698E413C84DE56A48D99CEDABC03F91`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v40.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v40.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。

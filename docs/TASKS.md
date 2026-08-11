@@ -76,4 +76,4 @@
 - [x] Phase 3 最终修复（v31，TLB 刷新 + rearm 全页重锁 + 二次写测试 VM 验证通过）
 - [x] Phase 3 一版合并回 main（快进到 `bf67ebc`，分支已删）
 - [ ] 下一阶段：真实目标进程接入（IOCTL 配置通道 v32 已实现并 VM 验证通过；Java 层未开始）
-- [ ] 下一阶段：常驻模式接入真实受保护页/真实 hook + NPT 共享状态加锁 + 目标进程生命周期 + hook 加固 + 控制面 CPL/CR3 + 隐形基础 CPUID + 仓库整理（v33-v42 已实现并 VM 验证通过）；裸机非 VMRUN 冒烟通过（v50），VMRUN 冻结需 KD/换机；剩余 R1、MSR/IO 隐身、整机级隐形、Java 层、真实系统 hook
+- [ ] 下一阶段：常驻模式接入真实受保护页/真实 hook + NPT 共享状态加锁 + 目标进程生命周期 + hook 加固 + 控制面 CPL/CR3 + 隐形基础 CPUID + 仓库整理（v33-v42 已实现并 VM 验证通过）；裸机逐步逼近 v51 Step1-7 全 PASS，冻结点收敛到常驻 workload 组合；剩余 R1、MSR/IO 隐身、整机级隐形、Java 层、真实系统 hook

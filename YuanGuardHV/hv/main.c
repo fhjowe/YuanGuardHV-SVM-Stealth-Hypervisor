@@ -14,6 +14,9 @@
 #ifndef YGHV_BAREMETAL_NO_RESIDENT
 #define YGHV_BAREMETAL_NO_RESIDENT 0
 #endif
+#ifndef YGHV_BAREMETAL_STEP
+#define YGHV_BAREMETAL_STEP 0
+#endif
 
 npt_mgr_t g_npt;
 uint64_t g_npt_test_pa;
@@ -37,6 +40,8 @@ extern const uint8_t svm_trampoline_test_prot_write_resume[];
 extern const uint8_t svm_trampoline_test_prot_write_end[];
 extern const uint8_t svm_trampoline_test_hook_guest[];
 extern const uint8_t svm_trampoline_test_hook_guest_end[];
+extern const uint8_t svm_trampoline_test_min_guest[];
+extern const uint8_t svm_trampoline_test_min_guest_end[];
 extern const uint8_t svm_trampoline_test_cpuid_guest[];
 extern const uint8_t svm_trampoline_test_cpuid_guest_end[];
 extern const uint8_t svm_trampoline_test_resident_guest[];
@@ -617,6 +622,145 @@ static NTSTATUS yghv_cpuid_stealth_test(void) {
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+static NTSTATUS yghv_baremetal_step_test(int step) {
+    svm_vcpu_t *v = svm_core_get_vcpu(0);
+    void *npf_page = NULL;
+    void *prot_page = NULL;
+    uint64_t npf_pa = 0;
+    NTSTATUS st;
+
+    if (!v)
+        return STATUS_NOT_FOUND;
+    if (step > 7)
+        return STATUS_NOT_IMPLEMENTED;
+    yghv_trace_u64("bm step", (uint64_t)step);
+    yghv_trace("bm start");
+
+    if (step == 6) {
+        ULONG i;
+        for (i = 0; i < g_vcpu_count; i++) {
+            svm_vcpu_t *cv = g_vcpus[i];
+            if (!cv) continue;
+            cv->regs.rcx = g_vmmcall_auth_cookie;
+            cv->vmcb->state.rip = (uint64_t)svm_trampoline_test_guest;
+            cv->vmcb->state.rax = 0;
+            cv->vmcb->control.general2_intercepts =
+                INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+        }
+        st = svm_core_start_remote_residents(g_vcpu_count);
+        if (st)
+            return st;
+        svm_core_wait_remote_ready(g_vcpu_count);
+        yghv_trace("bm multi vmrun");
+        svm_core_enter_resident_current(0);
+        svm_core_wait_all_stopped(g_vcpu_count);
+        yghv_trace("bm multi done");
+        return STATUS_SUCCESS;
+    }
+
+    v->regs.rcx = g_vmmcall_auth_cookie;
+    v->regs.rax = 0;
+    v->resident_index = 0;
+    v->vmcb->control.general1_intercepts = 0;
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    v->vmcb->control.exception_intercepts = 0;
+    if (step >= 2) {
+        v->vmcb->control.np_enable = SVM_NP_ENABLE;
+        v->vmcb->control.ncr3 = g_npt.pml4_pa;
+    } else {
+        v->vmcb->control.np_enable = 0;
+        v->vmcb->control.ncr3 = 0;
+    }
+    if (step == 4 || step == 5 || step == 7)
+        v->vmcb->control.general1_intercepts = 0;
+    else if (step >= 3)
+        v->vmcb->control.general1_intercepts = INTERCEPT_CPUID;
+    if (step == 5)
+        v->vmcb->control.exception_intercepts = (1ULL << 1);
+
+    if (step == 4) {
+        npf_page = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
+        if (!npf_page) {
+            LOG_ERROR("bm step 4: alloc failed");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(npf_page, HV_PAGE_SIZE);
+        npf_pa = MmGetPhysicalAddress(npf_page).QuadPart;
+        st = npt_split_2mb_to_4kb(&g_npt, npf_pa);
+        if (!st)
+            st = npt_set_page_perm(&g_npt, npf_pa, 0);
+        if (st) {
+            LOG_ERROR("bm step 4: setup failed 0x%x", st);
+            ExFreePoolWithTag(npf_page, YGHV_TAG);
+            return st;
+        }
+        g_npt_test_pa = npf_pa;
+        g_npt_test_active = 1;
+        v->regs.rdi = (uint64_t)npf_page;
+        v->vmcb->state.rip = (uint64_t)svm_trampoline_test_npt_guest;
+        yghv_trace_u64("bm npf pa", npf_pa);
+    } else if (step == 7) {
+        uint64_t dummy = (uint64_t)yghv_hook_test_dummy;
+        st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+        if (!st)
+            st = yghv_protect_install_hook(0, dummy);
+        if (st) {
+            LOG_ERROR("bm step 7: hook setup failed 0x%x", st);
+            return st;
+        }
+        v->regs.rsi = dummy;
+        v->vmcb->state.rip = (uint64_t)svm_trampoline_test_hook_guest;
+        yghv_trace_u64("bm hook va", dummy);
+    } else if (step == 5) {
+        prot_page = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
+        if (!prot_page) {
+            LOG_ERROR("bm step 5: alloc failed");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(prot_page, HV_PAGE_SIZE);
+        st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+        if (!st)
+            st = yghv_protect_add_page((uint64_t)prot_page);
+        if (!st)
+            st = yghv_protect_start();
+        if (st) {
+            LOG_ERROR("bm step 5: setup failed 0x%x", st);
+            ExFreePoolWithTag(prot_page, YGHV_TAG);
+            return st;
+        }
+        v->regs.rdi = (uint64_t)prot_page;
+        v->vmcb->state.rip = (uint64_t)svm_trampoline_test_prot_write;
+        yghv_trace_u64("bm prot va", (uint64_t)prot_page);
+    } else if (step == 1 || step == 2) {
+        v->vmcb->state.rip = (uint64_t)svm_trampoline_test_min_guest;
+    } else if (step >= 3) {
+        v->vmcb->state.rip = (uint64_t)svm_trampoline_test_cpuid_guest;
+    }
+    v->vmcb->state.rax = 0;
+
+    yghv_trace("bm vmrun");
+    svm_core_enter_resident_current(0);
+    if (step == 4) {
+        g_npt_test_active = 0;
+        npt_set_page_perm(&g_npt, npf_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+        ExFreePoolWithTag(npf_page, YGHV_TAG);
+    }
+    if (step == 5) {
+        yghv_protect_stop();
+        yghv_protect_remove_page((uint64_t)prot_page);
+        ExFreePoolWithTag(prot_page, YGHV_TAG);
+    }
+    if (step == 7) {
+        yghv_trace_u64("bm hook rdx", v->regs.rdx);
+        yghv_protect_remove_hook(0);
+    }
+    yghv_trace("bm exit");
+    yghv_trace_u64("bm rax", v->regs.rax);
+    st = STATUS_SUCCESS;
+    return st;
+}
+
 static VOID yghv_hook_rendezvous_thread(PVOID context) {
     void *page;
     uint64_t target_va;
@@ -871,6 +1015,16 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     LOG_ERROR("bare-metal smoke: non-resident tests PASS, control device ready");
     KeRevertToUserAffinityThread();
     return STATUS_SUCCESS;
+#endif
+
+#if YGHV_BAREMETAL_STEP >= 1
+    {
+        NTSTATUS st2 = yghv_baremetal_step_test(YGHV_BAREMETAL_STEP);
+        yghv_trace("bm done");
+        yghv_trace_close();
+        KeRevertToUserAffinityThread();
+        return st2;
+    }
 #endif
 
 #if !YGHV_R1_SKIP_NPT_TEST

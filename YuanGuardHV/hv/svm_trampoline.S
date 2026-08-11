@@ -62,6 +62,14 @@ svm_trampoline_test_hook_guest:
     vmmcall
 svm_trampoline_test_hook_guest_end:
 
+# --- Minimal bare-metal bring-up guest: STOP_INTERNAL only ---
+    .globl svm_trampoline_test_min_guest
+    .globl svm_trampoline_test_min_guest_end
+svm_trampoline_test_min_guest:
+    mov     rax, 2                  # YGHV_CMD_STOP_INTERNAL
+    vmmcall
+svm_trampoline_test_min_guest_end:
+
 # --- Resident CPUID stealth guest ---
     .globl svm_trampoline_test_cpuid_guest
     .globl svm_trampoline_test_cpuid_guest_end
