@@ -280,10 +280,10 @@ svm_trampoline_os_enter:
     mov     qword ptr [rax + 0x78 + 0x50], rbp
     pop     rbx
     mov     qword ptr [rax + 0x78 + 0x58], rbx
-    pop     rdx
-    mov     qword ptr [rax + 0x78 + 0x60], rdx
     pop     rcx
     mov     qword ptr [rax + 0x78 + 0x68], rcx
+    pop     rdx
+    mov     qword ptr [rax + 0x78 + 0x60], rdx
     pop     rax
     mov     qword ptr [rcx + 0x78 + 0x70], rax  # regs.rax; rcx = vcpu
 
@@ -371,6 +371,10 @@ os_enter_exit:
     jmp     os_enter_resume
 
 svm_os_guest_host_done:
+    # Windows kernel APIs must run on the current thread's real stack;
+    # restore it before jumping to the C cleanup path.
+    mov     rax, qword ptr [rsp + 8]            # vcpu
+    mov     rsp, qword ptr [rax + 0x40]         # vcpu->host_rsp (thread stack)
     lea     rax, [rip + yghv_os_guest_host_done]
     jmp     rax
 

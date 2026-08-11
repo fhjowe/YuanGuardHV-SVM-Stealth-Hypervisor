@@ -643,6 +643,7 @@ static __declspec(noinline) void yghv_os_guest_main(void) {
 }
 
 __declspec(noinline) __declspec(noreturn) void yghv_os_guest_host_done(void) {
+    yghv_trace("os guest host done");
     g_os_guest_test_active = 0;
     KeSetEvent(&g_os_guest_done_event, IO_NO_INCREMENT, FALSE);
     PsTerminateSystemThread(STATUS_SUCCESS);

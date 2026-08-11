@@ -725,3 +725,22 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   归档 `D:\aaaaaavm\yuanguard_hv_v61_step12.sys`（复制后）。
 - 状态：已编译通过，**未在实机加载**；加载有硬冻结风险（VMRUN 不退或 guest 上下文错），
   需用户确认后执行；判据见计划文档。
+
+### 9.45 OS-as-Guest Phase A：实机两次崩溃与根因修复（2026-08-11）
+
+- 用户确认加载 step12（v61，F154215B）。首次实机蓝屏 **0x7E / 0xC0000005**，
+  dump 定位 `yuanguard_hv+0x98c7`（`mov [rcx+0xE8],rax`）写入非法地址，调用方
+  `yuanguard_hv+0x24b3`（`yghv_os_guest_thread` → `svm_trampoline_os_enter`）。
+- 根因（反汇编实锤）：`svm_trampoline_os_enter` 入栈顺序为
+  `rax,rdx,rcx,rbx,...`，但我 pop 顺序写成了 `...,rbx,rdx,rcx,rax`，
+  **rdx/rcx 顺序颠倒** → `rcx` 拿到调用者 rdx 的垃圾值 → `mov [rcx+0xE8],rax`
+  越界写 → 0x7E。
+- 第二次（修复 host_done 栈恢复后，v61 修正版 E8C97F0D）：实机硬冻结无 dump；
+  同一 pop 顺序 bug 仍在（rcx 被破坏后 VMRUN 进入坏上下文 → 冻结）。
+- 修复：
+  - `svm_trampoline.S`：pop 顺序改为 `rcx → rdx → rax`（对应 push 逆序），
+    `movq %rcx,0xe0(%rax)` / `movq %rax,0xe8(%rcx)` 已用 objdump 确认；
+  - 保留“进入 C 收尾前恢复线程栈”（`vcpu->host_rsp`），避免内核 API 跑在专用 host 栈。
+- 构建：step12 v62 SHA256 `3975A99FDCA654136C826F9B9B938229721FC9864688CCEC065658164D8AB833`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v62_step12.sys`。
+- 状态：根因已修，未再加载；下次加载仍有进一步风险（首次真实 OS 进 guest）。
