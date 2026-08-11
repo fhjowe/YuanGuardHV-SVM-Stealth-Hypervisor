@@ -59,6 +59,7 @@ YuanGuardHV 是 AMD-V SVM/NPT 隐形 Hypervisor，目标是替代原 YuanGuard �
 
 - `yghv_protect_target_t`：目标 `PID`、`EPROCESS*`、目标 `CR3`、启用标志（内存/终止/句柄）。
 - 受保护页表：`{GPA, 目标进程 VA, 标志}`。
+- `ADD_PAGE` 时按目标 CR3 遍历 guest 页表，把目标进程 VA 翻译为 GPA；目标 VA 当前无映射则命令失败。
 - 决策接口：`is_target_cr3()`、`on_npf_write()`、`on_exec_trap()`、`arm()/disarm()`。
 
 ### 4.2 `control_plane.h` / `vmmcall.c`
@@ -68,7 +69,7 @@ YuanGuardHV 是 AMD-V SVM/NPT 隐形 Hypervisor，目标是替代原 YuanGuard �
 | 命令 | 作用 |
 |---|---|
 | `SET_TARGET` | 设置目标 PID，解析 EPROCESS/CR3 |
-| `ADD_PAGE` | 添加受保护页（目标 VA → GPA） |
+| `ADD_PAGE` | 添加受保护页（目标 VA → 按目标 CR3 遍历 guest 页表翻译为 GPA） |
 | `REMOVE_PAGE` | 移除受保护页并恢复权限 |
 | `START_PROTECT` | 进入常驻保护 |
 | `STOP_PROTECT` | 停止保护，恢复全部页 |
