@@ -87,6 +87,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | build.bat 失败只记录不擅自修改 | 铁律 1 要求代码改动先确认 | 修复方案待用户确认后执行 |
 | 2026-08-09 | 用户确认后修复 build.bat 并重跑基线 | 脚本路径含括号/空格导致无法编译 | 构建成功，sys 已签名，哈希见第 5 节 |
 | 2026-08-11 | Task 5 review 修复：stub 换可执行 NonPagedPool、入口改 16B 绝对跳转、函数页先 split 再置只读并纳入 NPF 写策略 | 评审发现 4 项问题，按反馈最小修复 | 仅改 `protect.c`；构建成功，v28 SHA256 `AC05BC52...3447EF` |
+| 2026-08-11 | 用户确认下一步第 1 项：内核控制设备 + IOCTL 配置通道（v32） | 常驻基架已有 VMMCALL 协议但无用户态传输通道 | 新增设备对象/IOCTL/测试工具；跨核加锁、进程生命周期、hook 加固、CPL/CR3 认证不在本次范围 |
 
 ## 7. 变更日志
 
@@ -98,6 +99,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | 仓库 | git init + 首次提交 | git log |
 | 2026-08-09 | `YuanGuardHV/build.bat` | for 块改 `call :compile` 子程序；INCLUDES/LIBPATH 路径加引号 | 构建成功并签名 |
 | 2026-08-09 | `YuanGuardHV/svm_trampoline.asm` | 移除 clang 生成的中间汇编并加入 .gitignore | git 状态干净 |
+| 2026-08-11 | `YuanGuardHV/hv/{common/control_ioctl.h,common/control_device.h,control_device.c}`、`hv/main.c`、`build.bat`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task A：IOCTL 控制设备配置通道 v32 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -449,3 +451,19 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 2026-08-11 Phase 3 Task 8 启动/停止竞态修复：仅改 `YuanGuardHV/hv/svm_core.c`，在 `svm_core_enter_resident_current()` 的 VCPU 空检查后若 `resident_state == SVM_RESIDENT_STOPPING` 则置 `SVM_RESIDENT_STOPPED` 并直接返回，不再进入 VMRUN 循环，避免 `svm_core_wait_all_stopped()` 在卸载时挂起；验证：`cmd /c build.bat` → `Build SUCCESS`，签名成功，新 v30 SHA256 `150FDBA1F2094B79EFC9A0ABCE332921ACD3D0C268C2F00C085036F8E2E126EF`，已复制 `D:\aaaaaavm\yuanguard_hv_v30.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告。
 - 2026-08-11 Phase 3 Task 8 复审修复：resident 状态原子化 + IPI 重准备 + 失败路径先等 ready（`svm_core.c` 的 `svm_core_stop_all_residents()` 用 `InterlockedExchange` 对所有已分配 VCPU 置 STOPPING，`svm_core_enter_resident_current()` 与 `multi_core.c` 的 resident 线程用 CAS 完成 OFF→ACTIVE，CAS 见 STOPPING 即置 STOPPED 退出；`main.c` 常驻重准备改 `KeIpiGenericCall(svm_core_ipi_prepare_vcpu, 0)` 每核保存自己的 MSR_VM_HSAVE/EFER，失败路径先 `svm_core_wait_remote_ready(online)` 再 stop/join）；验证：`cmd /c build.bat` → `Build SUCCESS`，签名成功，新 v30 SHA256 `F4096564DC2E6F7CEDAED5D688D10805FB9CA97D451C5C2D4ECE9851CFDA867C`，已复制 `D:\aaaaaavm\yuanguard_hv_v30.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告。
 - 2026-08-11 Phase 3 最终修复 v31 VM 验证通过：`protect test: real write PASS` → 第二次写再次 NPF → `protect test: real write #2 PASS`（TLB 刷新生效）；hook 0/1 PASS；`persistent protect mode active: 2 cores`，常驻心跳 621 万次以上；`unload_driver.ps1` 干净卸载回 `STOPPED`；无蓝屏。v31 SHA256 `2905F527236C544F3BAD25478ED9E43BB87B9FC5E9CE4968E22D70EFD09DE64A`（提交 `c5fee91`，含 TLB 刷新 + rearm 全页重锁 + 二次写测试）。
+
+### 9.27 Phase 3 下一步 Task A：IOCTL 控制设备配置通道（2026-08-11）
+
+- 用户确认方案：新增内核控制设备 `\Device\YuanGuardHV`（符号链接 `\\.\YuanGuardHV`）+ METHOD_BUFFERED IOCTL，映射现有 protect API：SET_TARGET/ADD_PAGE/REMOVE_PAGE/START_PROTECT/STOP_PROTECT/GET_STATE；新增 PowerShell 客户端 `YuanGuardHV\tools\yghv_ctl.ps1` 做外部下发与 selftest。
+- 范围限定：本次只做配置通道；跨核加锁（下一步第 3 项）、目标进程生命周期（第 4 项）、hook 加固（第 5 项）、控制面 CPL/CR3 认证（第 6 项）不在本次范围，IOCTL 当前为 `FILE_ANY_ACCESS`，安全项留待后续。
+- 实现：
+  - 新增 `YuanGuardHV/hv/common/control_ioctl.h`：设备类型 `0x5947`，IOCTL 0x800-0x805，固定输入/输出结构体。
+  - 新增 `YuanGuardHV/hv/common/control_device.h`：设备 init/cleanup 声明。
+  - 新增 `YuanGuardHV/hv/control_device.c`：`IoCreateDevice` + `IoCreateSymbolicLink` + IRP_MJ_CREATE/CLOSE/DEVICE_CONTROL 分发，buffered IO，未知命令返回 `STATUS_INVALID_DEVICE_REQUEST`。
+  - `YuanGuardHV/hv/main.c`：常驻准备完成后、启动 persistent residents 前创建设备；persistent 启动失败路径与 DriverUnload 删除设备。
+  - `YuanGuardHV/build.bat`：`control_device` 加入编译循环与链接列表。
+- 新增 `YuanGuardHV/tools/yghv_ctl.ps1`：`state / set-target / add-page / remove-page / start / stop / selftest`；selftest 用当前进程 PID + 固定 4KB pinned 缓冲区走完整链路。
+- 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v32 SHA256 `C73AD89346055559A0C7BCA9C3B9766E90616E57383DE6A93768AC780540D8D9`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v32.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v32.sys` 与 `D:\aaaaaavm\yghv_ctl.ps1`。仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告，`control_device.c`/`main.c` 无新增警告。构建中修复：`control_ioctl.h` 显式 `#include <winioctl.h>` 被 clang-cl 解析到 10.0.26100 um 头导致 `DWORD` 未定义，改为自包含 `YGHV_CTL_CODE` 宏。
+- 宿主侧脚本冒烟：`yghv_ctl.ps1 state` 正确返回 `CreateFile \\.\YuanGuardHV failed, Win32 error 0x00000002`（驱动未加载时的预期路径）；期间修复客户端把 `INVALID_HANDLE_VALUE(-1)` 当成功句柄的检查，已改为同时比对 `IntPtr.Zero` 与 `IntPtr(-1)`。
+- 验证（2026-08-11，VM 双核）：`sc start yuanguard` → RUNNING；`yghv_ctl.ps1 selftest` → `pid=3456 buf_va=0x112142575C8`、`set-target/add-page/start OK`、`state active=1 page_count=1`、`user write/read OK`、`selftest: PASS`；KD 日志确认 `persistent protect mode active: 2 cores`、`protect target: pid=3456 cr3=0x186dfe000`、`protect add_page: va=0x112142575c8 gpa=0x1417fb000`、`protect start: 1 pages armed`、常驻心跳滚动至 20 万+；`unload_driver.ps1` 干净卸载回 `STOPPED`，无蓝屏。
+- 结论：IOCTL 配置通道（外部 SET_TARGET/ADD_PAGE/START/GET_STATE/STOP/REMOVE）在常驻模式下可用，真实用户页 NPT arm/disarm 生效；真实写入被 resident guest NPF 拦截的 allow/deny 路径仍属下一步（第 2 项）。
