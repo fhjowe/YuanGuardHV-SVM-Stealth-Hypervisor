@@ -122,6 +122,7 @@ typedef struct {
     uint64_t resident_msr_exits;
     uint64_t resident_cr_exits;
     uint64_t resident_interrupt_exits;
+    uint64_t rearm_gpa;
 } svm_vcpu_t;
 
 extern svm_vcpu_t *g_vcpus[SVM_MAX_CORES];

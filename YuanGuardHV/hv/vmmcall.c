@@ -19,9 +19,13 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
     switch (cmd) {
 
     case YGHV_CMD_HEARTBEAT: {
-        if ((vcpu->resident_exits % YGHV_HEARTBEAT_LOG_INTERVAL) == 0)
-            LOG_ERROR("heartbeat exits=%llu core=%u",
-                vcpu->resident_exits, vcpu->resident_index);
+        if (g_protect.active) {
+            if ((vcpu->resident_exits % 10000ULL) == 0)
+                LOG_ERROR("heartbeat protect exits=%llu core=%u",
+                    vcpu->resident_exits, vcpu->resident_index);
+            vcpu->regs.rax = YGHV_STATUS_OK;
+            return 0;
+        }
         if (vcpu->resident_exits >= YGHV_HEARTBEAT_TEST_LIMIT) {
             LOG_ERROR("heartbeat limit reached, stopping resident loop");
             svm_core_stop_all_residents();
