@@ -707,3 +707,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - `yghv_ctl.ps1 selftest` 断言改为适配 v55 语义：`set_target` 会清空旧页表 → set-target 后 page_count=0、add-page 后=1、stop+remove 后=0。
 - 实机验证（Ryzen 5 5500，重启后内存充足，无 VM）：v60 默认版 SHA256 `35261AC747C8F7006DD67C19FCAE34C062296233CBEF064B5577FA314A7E0BC9`，归档 `D:\aaaaaavm\yuanguard_hv_v60.sys`；`sc start` RUNNING → `selftest: PASS` → `exit-test: PASS` → 60 秒常驻观察正常 → `sc stop` 干净回 STOPPED。
 - 结论：**实机冻结由 v58 诊断刷盘引起，已清除；v60 与 v54/v55 稳定性一致**。VM 多核心跳冻结仍未解决（用户决定暂停 VM，走实机路线）；下一步回到 OS-as-guest Phase A（实机有界试点）。
+
+### 9.44 OS-as-Guest Phase A：单核无缝有界试点（2026-08-11，待实机加载）
+
+- 用户确认进入整机（OS-as-guest）里程碑，按“直接实机测试”路线推进。
+- 设计文档：`docs/superpowers/plans/2026-08-11-os-as-guest.md`。
+- 实现（step 12，单核 core1 有界 OS guest）：
+  - `svm_trampoline.S` 新增 `svm_trampoline_os_enter`：保存当前线程上下文为 guest，
+    切专用 host 栈，trampoline 内自持 VMRUN/VMEXIT 循环；停止后跳转 C 收尾。
+  - `main.c` 新增 `yghv_os_guest_main`（guest 内执行 5000 次 CPUID/RDTSC + 共享计数，
+    结束置 stop 旗标并触发一次 CPUID）、`yghv_os_guest_host_done`（host 收尾）、
+    `yghv_os_guest_thread`（core1 线程 + OS guest VMCB profile：只开
+    CPUID/SHUTDOWN/VMMCALL，guest IF=0）、step 12 编排（60s 超时等待）。
+  - `vmexit.c`：`svm_dispatch_exit` 顶部检查 `g_os_guest_stop`，guest 请求停止即停。
+  - `svm_vcpu.h`：声明 `svm_trampoline_os_enter`/`svm_prepare_vcpu`。
+- 构建：step12 SHA256 `F154215B0D74837E27A42BCCB7664C306E9192D45B49F85B94A5B242BC18BE02`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v61_step12.sys`（复制后）。
+- 状态：已编译通过，**未在实机加载**；加载有硬冻结风险（VMRUN 不退或 guest 上下文错），
+  需用户确认后执行；判据见计划文档。

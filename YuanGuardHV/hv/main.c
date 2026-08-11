@@ -28,6 +28,10 @@ HANDLE g_hook_rendezvous_thread = NULL;
 uint64_t g_guest_hb_va = 0;
 uint64_t g_guest_npt_va = 0;
 HANDLE g_trace_file = NULL;
+volatile LONG g_os_guest_test_active = 0;
+volatile LONG g_os_guest_stop = 0;
+volatile LONG g_os_guest_counter = 0;
+static KEVENT g_os_guest_done_event;
 
 extern const uint8_t svm_trampoline_test_guest[];
 extern const uint8_t svm_trampoline_test_guest_resume[];
@@ -622,6 +626,57 @@ static NTSTATUS yghv_cpuid_stealth_test(void) {
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+static __declspec(noinline) void yghv_os_guest_main(void) {
+    int cpu_info[4];
+    volatile ULONG i;
+
+    for (i = 0; i < 5000; i++) {
+        __cpuidex(cpu_info, 1, 0);
+        (void)__rdtsc();
+        InterlockedIncrement(&g_os_guest_counter);
+    }
+    InterlockedExchange(&g_os_guest_stop, 1);
+    __cpuidex(cpu_info, 0, 0);
+    for (;;) {
+        __asm__ volatile("pause");
+    }
+}
+
+__declspec(noinline) __declspec(noreturn) void yghv_os_guest_host_done(void) {
+    g_os_guest_test_active = 0;
+    KeSetEvent(&g_os_guest_done_event, IO_NO_INCREMENT, FALSE);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static VOID yghv_os_guest_thread(PVOID ctx) {
+    svm_vcpu_t *v;
+    uint32_t core = 1;
+    (void)ctx;
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    v = svm_core_get_vcpu(core);
+    if (!v || g_vcpu_count <= core) {
+        KeSetEvent(&g_os_guest_done_event, IO_NO_INCREMENT, FALSE);
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
+    }
+
+    svm_prepare_vcpu(v, (uint64_t)yghv_os_guest_main);
+    v->vmcb->state.rsp = 0;
+    v->vmcb->control.general1_intercepts =
+        INTERCEPT_CPUID | INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    v->vmcb->control.exception_intercepts = 0;
+    v->vmcb->control.tlb_control = 0;
+    v->vmcb->control.vmcb_clean_bits = 0;
+    svm_core_set_npt(core, g_npt.pml4_pa);
+    yghv_trace("os guest thread enter");
+    svm_trampoline_os_enter(v);
+    /* Trampoline exits via yghv_os_guest_host_done; this is a fallback. */
+    KeSetEvent(&g_os_guest_done_event, IO_NO_INCREMENT, FALSE);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 static NTSTATUS yghv_baremetal_step_test(int step) {
     svm_vcpu_t *v = svm_core_get_vcpu(0);
     void *npf_page = NULL;
@@ -631,7 +686,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 11)
+    if (step > 12)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -819,6 +874,33 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         }
         yghv_trace("bm bounded hb 2core intr done");
         return STATUS_SUCCESS;
+    }
+
+    if (step == 12) {
+        HANDLE thread;
+        NTSTATUS st12;
+        LARGE_INTEGER timeout;
+
+        yghv_trace("bm os guest start");
+        KeInitializeEvent(&g_os_guest_done_event, NotificationEvent, FALSE);
+        g_os_guest_test_active = 1;
+        g_os_guest_stop = 0;
+        g_os_guest_counter = 0;
+        st12 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_thread, NULL);
+        if (!NT_SUCCESS(st12)) {
+            LOG_ERROR("bm step 12: thread create failed 0x%x", st12);
+            return st12;
+        }
+        timeout.QuadPart = -60LL * 10000000LL;
+        st12 = KeWaitForSingleObject(&g_os_guest_done_event, Executive,
+                                     KernelMode, FALSE, &timeout);
+        ZwClose(thread);
+        yghv_trace_u64("os guest counter", g_os_guest_counter);
+        yghv_trace("bm os guest done");
+        if (st12 == STATUS_TIMEOUT)
+            return st12;
+        return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
     }
 
     v->regs.rcx = g_vmmcall_auth_cookie;

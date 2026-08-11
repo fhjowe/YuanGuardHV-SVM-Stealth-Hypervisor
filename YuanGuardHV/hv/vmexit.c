@@ -17,6 +17,8 @@ extern int vmmcall_dispatch(svm_vcpu_t *vcpu);
 extern npt_mgr_t g_npt;
 extern uint64_t g_npt_test_pa;
 extern volatile int g_npt_test_active;
+extern volatile LONG g_os_guest_test_active;
+extern volatile LONG g_os_guest_stop;
 
 static void svm_advance_rip(svm_vcpu_t *vcpu) {
     vcpu->vmcb->state.rip = vcpu->vmcb->control.next_rip;
@@ -36,6 +38,8 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     uint64_t exitcode = vcpu->vmcb->control.exitcode;
 
     vcpu->resident_exits++;
+    if (g_os_guest_test_active && g_os_guest_stop)
+        return 1;
 
     switch (exitcode) {
 

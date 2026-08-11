@@ -188,6 +188,7 @@ typedef struct {
 
 /* Assembly trampoline entry points */
 uint64_t svm_vmrun_trampoline(svm_vcpu_t *vcpu);
+uint64_t svm_trampoline_os_enter(svm_vcpu_t *vcpu);
 int  svm_vmrun_context_proof(svm_vcpu_t *vcpu);
 void svm_vmrun_trampoline_poisoned(svm_vcpu_t *vcpu);
 int  svm_resident_enter(svm_vcpu_t *vcpu);
@@ -199,6 +200,7 @@ extern const uint8_t svm_trampoline_test_guest_resume[];
 extern const uint8_t svm_trampoline_test_guest_end[];
 
 /* SVM core API */
+void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip);
 int  svm_core_init(void);
 int  svm_core_cleanup(void);
 int  svm_alloc_vcpu(uint32_t core_id, svm_vcpu_t **out);

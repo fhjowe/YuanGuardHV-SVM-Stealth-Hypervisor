@@ -218,6 +218,162 @@ svm_vmrun_trampoline:
     pop     rbx
     ret
 
+# ============================================================
+# uint64_t svm_trampoline_os_enter(svm_vcpu_t *vcpu)
+#   Seamless OS-as-guest entry: capture the current thread context
+#   as the guest, switch to the dedicated host stack, then run the
+#   resident loop inside this trampoline.  On final stop the
+#   trampoline returns to yghv_os_guest_host_done via a planted
+#   return address.
+# ============================================================
+    .globl svm_trampoline_os_enter
+svm_trampoline_os_enter:
+    push    rax
+    push    rdx
+    push    rcx
+    push    rbx
+    push    rbp
+    push    rsi
+    push    rdi
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+
+    mov     rax, rcx                   # vcpu
+    mov     rdx, rsp
+    add     rdx, 120                   # original thread rsp
+    mov     qword ptr [rax + 0x40], rdx # vcpu->host_rsp = guest stack base
+
+    # guest RFLAGS: preserve current, but clear IF for the bounded test
+    pushfq
+    pop     rdx
+    and     rdx, 0xFFFFFFFFFFFFFDFF
+    mov     r11, qword ptr [rax]       # vcpu->vmcb
+    mov     qword ptr [r11 + 0x570], rdx
+
+    pop     r15
+    mov     qword ptr [rax + 0x78 + 0x00], r15
+    pop     r14
+    mov     qword ptr [rax + 0x78 + 0x08], r14
+    pop     r13
+    mov     qword ptr [rax + 0x78 + 0x10], r13
+    pop     r12
+    mov     qword ptr [rax + 0x78 + 0x18], r12
+    pop     r11
+    mov     qword ptr [rax + 0x78 + 0x20], r11
+    pop     r10
+    mov     qword ptr [rax + 0x78 + 0x28], r10
+    pop     r9
+    mov     qword ptr [rax + 0x78 + 0x30], r9
+    pop     r8
+    mov     qword ptr [rax + 0x78 + 0x38], r8
+    pop     rdi
+    mov     qword ptr [rax + 0x78 + 0x40], rdi
+    pop     rsi
+    mov     qword ptr [rax + 0x78 + 0x48], rsi
+    pop     rbp
+    mov     qword ptr [rax + 0x78 + 0x50], rbp
+    pop     rbx
+    mov     qword ptr [rax + 0x78 + 0x58], rbx
+    pop     rdx
+    mov     qword ptr [rax + 0x78 + 0x60], rdx
+    pop     rcx
+    mov     qword ptr [rax + 0x78 + 0x68], rcx
+    pop     rax
+    mov     qword ptr [rcx + 0x78 + 0x70], rax  # regs.rax; rcx = vcpu
+
+    mov     r11, qword ptr [rcx]
+    mov     qword ptr [r11 + 0x5F8], rax        # VMCB state.rax
+    mov     rdx, qword ptr [rcx + 0x40]
+    mov     qword ptr [r11 + 0x5D8], rdx        # VMCB state.rsp
+
+    mov     rsp, qword ptr [rcx + 0x38]         # host_stack_top
+    push    rbx
+    push    rbp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    push    rdi
+    push    rsi
+    push    rcx
+    lea     rax, [rip + svm_os_guest_host_done]
+    push    rax
+
+os_enter_resume:
+    mov     rax, qword ptr [rsp + 8]            # vcpu
+    mov     rax, qword ptr [rax + 0x28]         # hsave_pa
+    mov     ecx, 0xC0010117
+    mov     edx, eax
+    shr     rdx, 32
+    wrmsr
+
+    mov     rax, qword ptr [rsp + 8]            # vcpu
+    mov     r15, qword ptr [rax + 0x78 + 0x00]
+    mov     r14, qword ptr [rax + 0x78 + 0x08]
+    mov     r13, qword ptr [rax + 0x78 + 0x10]
+    mov     r12, qword ptr [rax + 0x78 + 0x18]
+    mov     r11, qword ptr [rax + 0x78 + 0x20]
+    mov     r10, qword ptr [rax + 0x78 + 0x28]
+    mov     r9,  qword ptr [rax + 0x78 + 0x30]
+    mov     r8,  qword ptr [rax + 0x78 + 0x38]
+    mov     rdi, qword ptr [rax + 0x78 + 0x40]
+    mov     rsi, qword ptr [rax + 0x78 + 0x48]
+    mov     rbp, qword ptr [rax + 0x78 + 0x50]
+    mov     rbx, qword ptr [rax + 0x78 + 0x58]
+    mov     rdx, qword ptr [rax + 0x78 + 0x60]
+    mov     rcx, qword ptr [rax + 0x78 + 0x68]
+    mov     rax, qword ptr [rax + 0x08]         # vmcb_pa
+
+    .byte   0x0F, 0x01, 0xDA                    # VMLOAD
+    clgi
+    .byte   0x0F, 0x01, 0xD8                    # VMRUN
+
+os_enter_exit:
+    push    rdi
+    push    rsi
+    mov     rdi, qword ptr [rsp + 0x18]         # vcpu
+    mov     rax, qword ptr [rdi + 0x08]
+    .byte   0x0F, 0x01, 0xDB                    # VMSAVE guest
+    mov     rax, qword ptr [rdi + 0x18]
+    .byte   0x0F, 0x01, 0xDA                    # VMLOAD host
+
+    mov     rsi, qword ptr [rdi]
+    mov     rsi, qword ptr [rsi + 0x5F8]
+    mov     qword ptr [rdi + 0x78 + 0x70], rsi
+    mov     qword ptr [rdi + 0x78 + 0x68], rcx
+    mov     qword ptr [rdi + 0x78 + 0x60], rdx
+    mov     qword ptr [rdi + 0x78 + 0x58], rbx
+    mov     qword ptr [rdi + 0x78 + 0x50], rbp
+    mov     qword ptr [rdi + 0x78 + 0x38], r8
+    mov     qword ptr [rdi + 0x78 + 0x30], r9
+    mov     qword ptr [rdi + 0x78 + 0x28], r10
+    mov     qword ptr [rdi + 0x78 + 0x20], r11
+    mov     qword ptr [rdi + 0x78 + 0x18], r12
+    mov     qword ptr [rdi + 0x78 + 0x10], r13
+    mov     qword ptr [rdi + 0x78 + 0x08], r14
+    mov     qword ptr [rdi + 0x78 + 0x00], r15
+    pop     rsi
+    mov     qword ptr [rdi + 0x78 + 0x48], rsi
+    pop     rsi
+    mov     qword ptr [rdi + 0x78 + 0x40], rsi
+    stgi
+
+    mov     ecx, edi                           # rcx = vcpu
+    call    svm_dispatch_exit
+    test    eax, eax
+    jnz     svm_os_guest_host_done
+    jmp     os_enter_resume
+
+svm_os_guest_host_done:
+    lea     rax, [rip + yghv_os_guest_host_done]
+    jmp     rax
+
 # --- Context proof trampoline (stub) ---
     .globl svm_vmrun_context_proof
 svm_vmrun_context_proof:
