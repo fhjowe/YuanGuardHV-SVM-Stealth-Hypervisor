@@ -34,6 +34,8 @@ extern const uint8_t svm_trampoline_test_prot_write_resume[];
 extern const uint8_t svm_trampoline_test_prot_write_end[];
 extern const uint8_t svm_trampoline_test_hook_guest[];
 extern const uint8_t svm_trampoline_test_hook_guest_end[];
+extern const uint8_t svm_trampoline_test_cpuid_guest[];
+extern const uint8_t svm_trampoline_test_cpuid_guest_end[];
 extern const uint8_t svm_trampoline_test_resident_guest[];
 extern const uint8_t svm_trampoline_test_resident_guest_end[];
 
@@ -560,6 +562,37 @@ static NTSTATUS yghv_hook_boundary_test(void) {
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+static NTSTATUS yghv_cpuid_stealth_test(void) {
+    svm_vcpu_t *v;
+    int ok = 1;
+
+    v = svm_core_get_vcpu(0);
+    v->regs.rcx = g_vmmcall_auth_cookie;
+    v->regs.rax = 0;
+    v->vmcb->state.rip = (uint64_t)svm_trampoline_test_cpuid_guest;
+    v->vmcb->state.rax = 0;
+    v->vmcb->control.general1_intercepts = INTERCEPT_CPUID;
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
+        LOG_ERROR("cpuid stealth test: npt restore FAILED");
+        return STATUS_UNSUCCESSFUL;
+    }
+    svm_core_enter_resident_current(0);
+    LOG_ERROR("cpuid stealth test: hyper=0x%llx/0x%llx/0x%llx/0x%llx svm_ecx=0x%llx svm_leaf_eax=0x%llx",
+        v->regs.r8, v->regs.r9, v->regs.r10, v->regs.r11,
+        v->regs.r12, v->regs.r13);
+    if (v->regs.r8 != 0 || v->regs.r9 != 0 || v->regs.r10 != 0 ||
+        v->regs.r11 != 0)
+        ok = 0;
+    if (v->regs.r12 & (1ULL << 2))
+        ok = 0;
+    if (v->regs.r13 != 0)
+        ok = 0;
+    LOG_ERROR("cpuid stealth test: %s", ok ? "PASS" : "FAIL");
+    return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 static VOID yghv_hook_rendezvous_thread(PVOID context) {
     void *page;
     uint64_t target_va;
@@ -892,6 +925,19 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 
     if (!NT_SUCCESS(yghv_hook_boundary_test())) {
         LOG_ERROR("protect hook boundary test failed");
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        KeRevertToUserAffinityThread();
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (!NT_SUCCESS(yghv_cpuid_stealth_test())) {
+        LOG_ERROR("cpuid stealth test failed");
         if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
         npt_test_buf = NULL;
         yghv_protect_cleanup();

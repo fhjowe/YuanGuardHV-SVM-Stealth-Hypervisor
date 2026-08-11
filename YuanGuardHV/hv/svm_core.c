@@ -255,7 +255,7 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
 
     /* — Control area — */
     ctrl->general1_intercepts = 0;
-    ctrl->general1_intercepts = 0;
+    ctrl->general1_intercepts |= INTERCEPT_CPUID;
     ctrl->general2_intercepts = INTR_GEN2(SVM_INTERCEPT_VMRUN) |
                                 INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     ctrl->cr_read_intercepts = 0;

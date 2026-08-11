@@ -62,6 +62,28 @@ svm_trampoline_test_hook_guest:
     vmmcall
 svm_trampoline_test_hook_guest_end:
 
+# --- Resident CPUID stealth guest ---
+    .globl svm_trampoline_test_cpuid_guest
+    .globl svm_trampoline_test_cpuid_guest_end
+svm_trampoline_test_cpuid_guest:
+    mov     r15, rcx                # save cookie; cpuid clobbers rcx
+    mov     rax, 0x40000000
+    cpuid
+    mov     r8, rax
+    mov     r9, rbx
+    mov     r10, rcx
+    mov     r11, rdx
+    mov     rax, 0x80000001
+    cpuid
+    mov     r12, rcx                # ecx bit 2 = SVM
+    mov     rax, 0x8000000A
+    cpuid
+    mov     r13, rax
+    mov     rax, 2                  # YGHV_CMD_STOP_INTERNAL
+    mov     rcx, r15
+    vmmcall
+svm_trampoline_test_cpuid_guest_end:
+
 # --- Resident workload guest: protected write + hooked call + heartbeat ---
     .globl svm_trampoline_test_resident_guest
     .globl svm_trampoline_test_resident_guest_end
