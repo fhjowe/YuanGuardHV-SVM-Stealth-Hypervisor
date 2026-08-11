@@ -117,6 +117,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | 仓库整理（git mv 参考文档/lib、logs_archive、.gitignore）+ `hv/{svm_core.c,vmexit.c,svm_trampoline.S,main.c}` | Phase 3 Task G 收窄 v42：CPUID 隐身矩阵 + 仓库整理（MSR/IO 隐身留裸机/KVM） | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-11 | `docs/NEXT_WINDOW_PROMPT.md`、`docs/SESSION_20260811.md`、`PLAN.md` | 文档同步到 v42 状态（用户指示） | 进度快照/会话记录/计划状态已更新 |
 | 2026-08-11 | `YuanGuardHV/hv/main.c` | 实机适配 v43：r1 单测与 NPT 测试缓冲上限 0xFFFFFFFF → 0x400000000ULL（16GB identity 范围） | 构建 SUCCESS；实机测试进行中 |
+| 2026-08-11 | `YuanGuardHV/hv/main.c`、`build.bat` | 实机 v48-v50：r1 小分配/hex trace、NPT 全内存映射、`YGHV_BAREMETAL_NO_RESIDENT` 冒烟开关 | 裸机非 VMRUN 冒烟通过；VMRUN 裸机冻结留待 KD/换机 |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -585,6 +586,12 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - v46：r1 单测改为单个 4KB 池页（`test_pa`）+ `test_pa2 = test_pa + 2MB`（NPT identity 覆盖，无需分配）；裸机 r1 全 PASS（`r1 unit pass`），推进到 `before npt test` 后首次 VMRUN（NPT 测试 guest）挂起，服务 START_PENDING，无法 sc stop。
   - v47：观测埋点（resident 循环每 10 万次退出写 `resident exit tick`、NPF 写 `npf test`、STOP 写 `stop_internal`）；构建 SUCCESS，SHA256 `ECA61110D329DEC3391E5FFBE4DE30E3A5398BD1DC81437BB5F360DEA5356FD2`。
   - 已提交代码 `0f9db0a`。下一步：重启宿主清除卡住的 v46，加载 v47 读 `C:\Windows\yghv_progress.log` 定位 VMRUN 挂起点。
+- 实机调试续（2026-08-11，重启后）：
+  - v47：r1 在重启后失败（`r1 test_pa=0x42a38a000`、`trans=0`）——池页落在 16GB identity 覆盖外，宿主实际 RAM > 16GB。
+  - v48：加无 CRT 的 hex trace 确认上述地址；npt_translate 返回 0。
+  - v49：NPT 改为 `MmGetPhysicalMemoryRanges()` 全内存映射 + 测试缓冲上限 64GB；全量加载再次硬冻结（18:39:55 强制重启，无 dump/WHEA），确认裸机 VMRUN 路径会冻结宿主。
+  - v50：新增 `YGHV_BAREMETAL_NO_RESIDENT` 冒烟开关（跳过所有 resident/VMRUN，仅 r1 NPT API + hook 边界 + hook install/remove + 控制设备）；裸机加载 RUNNING，r1 `trans=test_pa` 全 PASS，宿主侧 `state`/`selftest` PASS，卸载回 STOPPED，无冻结。SHA256 `177B7D8C1CCCF62C68573B68041FF4FFB3F058C0C8D3AF8CB6E14D1DF568F5C7`。
+  - 结论：裸机上非 VMRUN 路径已冒烟通过；VMRUN 首次进入即冻结宿主，需内核调试器或换机定位，R1 私有页/自剔除/默认 NX 与 MSR/IO 隐身继续阻塞。
 - v41 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；SHA256 `349C32A95528B87F8449F3759F4ECF22B1F149A596C245EF59F34E32DFD25D7A`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v41.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v41.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
 - v41 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD `cpuid stealth test: leaf1_ecx=0x7ef83203 hyper=0x0/0x0/0x0/0x0 svm_ecx=0xc003f9 svm_leaf_eax=0x0` → `PASS`（leaf1 bit31 已清）；boundary/rendezvous 仍 PASS；卸载回 `STOPPED`，无蓝屏。
 - 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v40 SHA256 `5578A00FDC271A77084973CA668EC5B93698E413C84DE56A48D99CEDABC03F91`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v40.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v40.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。

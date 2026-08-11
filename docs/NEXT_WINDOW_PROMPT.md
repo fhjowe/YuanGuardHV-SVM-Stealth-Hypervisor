@@ -41,6 +41,7 @@
 - VMware 嵌套 SVM：不能剔除 NPT 私有页/自页；不能写 CR0（#UD）；MSRPM/IOPM 拦截不生效（MSR/IO 隐身留裸机/KVM）。
 - 非 resident 核上不要给真实系统函数装 hook（stub vmmcall 会 #UD），测试用驱动内 dummy。
 - VM ntoskrnl 19045.2965 只导出 ZwTerminateProcess（无 NtTerminateProcess）；PsSetCreateProcessNotifyRoutine/Ex 在测试签名驱动下返回 0xC000007A 且会残留回调（曾两次 0xCE），不要再用该 API。
+- 本机裸机（Ryzen 5 5500，RAM >16GB）VMRUN 首次进入会硬冻结宿主，需内核调试器或换机定位；裸机非 VMRUN 冒烟用 `set YGHV_BAREMETAL_NO_RESIDENT=1` 构建 v50+（r1/hook/IOCTL 已通过）。NPT identity 已改为按 `MmGetPhysicalMemoryRanges()` 全内存映射。
 - KD 控制端 kd_cmd.txt 有文件占用竞态风险；写命令后等待，不要并发写。
 
 【下一步（按优先级）】
