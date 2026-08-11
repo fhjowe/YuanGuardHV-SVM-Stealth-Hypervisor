@@ -130,13 +130,22 @@ public class YghvCtl {
                     pages.length, maxPages);
 
             int ok = 0;
+            int fails = 0;
             List<String> sample = new ArrayList<>();
             for (long va : pages) {
-                if (ioctl(handle, FN_ADD_PAGE, u64(va), null) == 0) {
+                if (ok >= maxPages) {
+                    break;
+                }
+                int err = ioctl(handle, FN_ADD_PAGE, u64(va), null);
+                if (err == 0) {
                     ok++;
                     if (sample.size() < 3) {
                         sample.add(String.format("0x%X", va));
                     }
+                } else if (fails < 3) {
+                    System.out.printf("protect: add fail err=0x%X va=0x%X%n",
+                            err, va);
+                    fails++;
                 }
             }
             System.out.printf("protect: add-page ok=%d failed=%d sample=[%s]%n",

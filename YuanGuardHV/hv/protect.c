@@ -1,4 +1,4 @@
-#include <ntddk.h>
+#include <ntifs.h>
 #include "protect.h"
 #include "svm_vcpu.h"
 #include "debug.h"
@@ -7,6 +7,11 @@
 extern npt_mgr_t g_npt;
 
 NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(HANDLE ProcessId, PEPROCESS *Process);
+NTKERNELAPI NTSTATUS MmCopyVirtualMemory(
+    PEPROCESS SourceProcess, PVOID SourceAddress,
+    PEPROCESS TargetProcess, PVOID TargetAddress,
+    SIZE_T BufferSize, KPROCESSOR_MODE PreviousMode,
+    PSIZE_T NumberOfBytesCopied);
 
 static const uint64_t YGHV_PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
 
@@ -61,6 +66,36 @@ uint64_t yghv_protect_guest_va_to_pa(uint64_t cr3, uint64_t va) {
     return (pte & YGHV_PT_ADDR_MASK) | (va & 0xFFFULL);
 }
 
+static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
+    KAPC_STATE apc;
+    uint64_t pa;
+
+    if (!g_protect.process)
+        return 0;
+
+    KeStackAttachProcess(g_protect.process, &apc);
+    pa = MmGetPhysicalAddress((PVOID)target_va).QuadPart;
+    KeUnstackDetachProcess(&apc);
+    if (pa)
+        return pa;
+
+    /* Demand-paged pages have no present PTE; fault one byte in. */
+    {
+        SIZE_T copied = 0;
+        UCHAR tmp;
+        NTSTATUS st = MmCopyVirtualMemory(g_protect.process, (PVOID)target_va,
+                                          IoGetCurrentProcess(), &tmp, 1,
+                                          KernelMode, &copied);
+        if (!NT_SUCCESS(st) || copied != 1)
+            return 0;
+    }
+
+    KeStackAttachProcess(g_protect.process, &apc);
+    pa = MmGetPhysicalAddress((PVOID)target_va).QuadPart;
+    KeUnstackDetachProcess(&apc);
+    return pa;
+}
+
 NTSTATUS yghv_protect_init(void) {
     ExInitializeFastMutex(&g_protect_lock);
     RtlZeroMemory(&g_protect, sizeof(g_protect));
@@ -94,6 +129,21 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
         return STATUS_INVALID_PARAMETER;
 
     ExAcquireFastMutex(&g_protect_lock);
+    if (g_protect.page_count) {
+        ULONG i;
+        for (i = 0; i < g_protect.page_count; i++) {
+            if (g_protect.pages[i].armed) {
+                int ds = yghv_protect_disarm_page_locked(&g_protect.pages[i]);
+                if (ds) {
+                    LOG_ERROR("protect set_target: disarm page %u failed 0x%x",
+                        i, ds);
+                    ExReleaseFastMutex(&g_protect_lock);
+                    return STATUS_UNSUCCESSFUL;
+                }
+            }
+        }
+        g_protect.page_count = 0;
+    }
     if (g_protect.process) {
         ObDereferenceObject(g_protect.process);
         g_protect.process = NULL;
@@ -153,7 +203,7 @@ static NTSTATUS yghv_protect_add_page_locked(uint64_t target_va) {
         return STATUS_INSUFFICIENT_RESOURCES;
     if (!g_protect.cr3)
         return STATUS_INVALID_PARAMETER;
-    gpa = yghv_protect_guest_va_to_pa(g_protect.cr3, target_va);
+    gpa = yghv_protect_resolve_va(target_va);
     gpa &= ~(uint64_t)0xFFFULL;
     if (!gpa) {
         LOG_ERROR("protect add_page: va 0x%llx not mapped", target_va);

@@ -75,6 +75,7 @@ Java_YghvCtl_enumeratePages(JNIEnv *env, jclass cls, jint pid, jint max_pages) {
     HANDLE proc;
     jlong *pages;
     int count = 0;
+    int cap;
     jlongArray result;
     (void)cls;
 
@@ -83,16 +84,17 @@ Java_YghvCtl_enumeratePages(JNIEnv *env, jclass cls, jint pid, jint max_pages) {
     if (!proc)
         return NULL;
 
-    pages = (jlong *)calloc(max_pages, sizeof(jlong));
+    cap = max_pages * 8;
+    pages = (jlong *)calloc(cap, sizeof(jlong));
     if (!pages) {
         CloseHandle(proc);
         return NULL;
     }
 
-    count = collect_committed_pages(proc, pages, max_pages, 1);
-    if (count < max_pages)
+    count = collect_committed_pages(proc, pages, cap, 1);
+    if (count < cap)
         count += collect_committed_pages(proc, pages + count,
-                                         max_pages - count, 0);
+                                         cap - count, 0);
 
     CloseHandle(proc);
     result = (*env)->NewLongArray(env, count);
@@ -119,8 +121,14 @@ static int collect_committed_pages(HANDLE proc, jlong *pages, int max_pages,
             && !(mbi.Protect & PAGE_GUARD)) {
             unsigned char *base = (unsigned char *)mbi.BaseAddress;
             SIZE_T region_pages = mbi.RegionSize / 4096;
-            for (k = 0; k < region_pages && count < max_pages; k++)
-                pages[count++] = (jlong)(uintptr_t)(base + k * 4096);
+            for (k = 0; k < region_pages && count < max_pages; k++) {
+                unsigned char *page = base + k * 4096;
+                BYTE probe;
+                SIZE_T rd = 0;
+                if (!ReadProcessMemory(proc, page, &probe, 1, &rd))
+                    continue;
+                pages[count++] = (jlong)(uintptr_t)page;
+            }
         }
 next:
         addr = (unsigned char *)mbi.BaseAddress + mbi.RegionSize;
