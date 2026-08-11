@@ -4,6 +4,7 @@
 #include "svm_vcpu.h"
 #include "npt.h"
 #include "control_plane.h"
+#include "protect.h"
 #include "debug.h"
 
 #define YGHV_R1_SKIP_NPT_TEST 0
@@ -23,6 +24,9 @@ extern const uint8_t svm_trampoline_test_guest_end[];
 extern const uint8_t svm_trampoline_test_npt_guest[];
 extern const uint8_t svm_trampoline_test_npt_guest_resume[];
 extern const uint8_t svm_trampoline_test_npt_guest_end[];
+extern const uint8_t svm_trampoline_test_prot_write[];
+extern const uint8_t svm_trampoline_test_prot_write_resume[];
+extern const uint8_t svm_trampoline_test_prot_write_end[];
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD DriverUnload;
@@ -256,6 +260,69 @@ done:
     return st;
 }
 
+static NTSTATUS yghv_protect_test(void) {
+    void *buf;
+    uint64_t buf_pa, buf_va;
+    uint64_t entry_after;
+    svm_vcpu_t *v;
+    int ok = 1;
+
+    /* Phase B: policy matrix (synthetic) */
+    g_protect.cr3 = 0x1000ULL;   /* fake target CR3 */
+    if (!yghv_protect_is_target_cr3(0x1000ULL)) ok = 0;
+    if (yghv_protect_is_target_cr3(0x2000ULL)) ok = 0;
+    LOG_ERROR("protect test: policy %s", ok ? "PASS" : "FAIL");
+    if (!ok) return STATUS_UNSUCCESSFUL;
+
+    /* Phase C: real write trap, target = System (current process) */
+    yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+    buf = MmAllocateContiguousMemory(HV_PAGE_SIZE,
+        (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(buf, HV_PAGE_SIZE);
+    buf_va = (uint64_t)buf;
+    buf_pa = MmGetPhysicalAddress(buf).QuadPart;
+    if (yghv_protect_add_page(buf_va) ||
+        yghv_protect_start()) {
+        LOG_ERROR("protect test: setup FAILED");
+        MmFreeContiguousMemory(buf);
+        return STATUS_UNSUCCESSFUL;
+    }
+    entry_after = npt_read_entry(&g_npt, buf_pa);
+    if (entry_after & NPT_PERM_WRITABLE) {
+        LOG_ERROR("protect test: page still writable after arm");
+        ok = 0;
+    }
+
+    v = svm_core_get_vcpu(0);
+    v->regs.rdi = buf_va;
+    v->regs.rcx = g_vmmcall_auth_cookie;
+    v->vmcb->state.rip = (uint64_t)svm_trampoline_test_prot_write;
+    v->vmcb->state.rax = 0;
+    /* Resident exit from the NPT test clears intercepts + NPT; restore them
+       so the write is trapped and STOP_INTERNAL VMMCALL can stop the loop. */
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
+        LOG_ERROR("protect test: npt restore FAILED");
+        yghv_protect_stop();
+        yghv_protect_remove_page(buf_va);
+        MmFreeContiguousMemory(buf);
+        return STATUS_UNSUCCESSFUL;
+    }
+    svm_core_enter_resident_current(0);
+    entry_after = npt_read_entry(&g_npt, buf_pa);
+    if (entry_after & NPT_PERM_WRITABLE) {
+        LOG_ERROR("protect test: page not re-armed after write");
+        ok = 0;
+    }
+    LOG_ERROR("protect test: real write %s", ok ? "PASS" : "FAIL");
+    yghv_protect_stop();
+    yghv_protect_remove_page(buf_va);
+    MmFreeContiguousMemory(buf);
+    return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 static NTSTATUS yghv_make_guest_code_executable(void) {
     uint64_t pa = MmGetPhysicalAddress(g_guest_code_page).QuadPart;
     NTSTATUS st = npt_split_2mb_to_4kb(&g_npt, pa);
@@ -472,6 +539,16 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 #else
     yghv_trace("npt test skipped");
 #endif
+
+    if (!NT_SUCCESS(yghv_protect_test())) {
+        LOG_ERROR("protect test failed");
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        KeRevertToUserAffinityThread();
+        return STATUS_UNSUCCESSFUL;
+    }
 
     /* Reset CPU0 to the heartbeat guest for the multi-core resident test. */
     svm_core_prepare_vcpu_other(0);

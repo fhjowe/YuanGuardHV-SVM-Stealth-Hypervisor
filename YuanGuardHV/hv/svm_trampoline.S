@@ -40,6 +40,18 @@ svm_trampoline_test_npt_guest_resume:
     jmp svm_trampoline_test_npt_guest
 svm_trampoline_test_npt_guest_end:
 
+# --- Protect write test guest ---
+    .globl svm_trampoline_test_prot_write
+    .globl svm_trampoline_test_prot_write_resume
+    .globl svm_trampoline_test_prot_write_end
+svm_trampoline_test_prot_write:
+    mov     qword ptr [rdi], 1      # write protected page -> NPF
+    mov     rax, 2                  # YGHV_CMD_STOP_INTERNAL
+    vmmcall
+svm_trampoline_test_prot_write_resume:
+    jmp svm_trampoline_test_prot_write
+svm_trampoline_test_prot_write_end:
+
 # ============================================================
 # uint64_t svm_vmrun_trampoline(svm_vcpu_t *vcpu)
 #   RCX = vcpu pointer
