@@ -213,8 +213,9 @@ uint64_t svm_core_resident_exit_count(uint32_t index);
 int      svm_core_prepare_vcpu_other(uint32_t core_id);
 ULONG_PTR svm_core_ipi_prepare_vcpu(ULONG_PTR arg);
 ULONG_PTR svm_core_ipi_set_npt(ULONG_PTR arg);
-void     svm_core_start_remote_residents(ULONG online);
+NTSTATUS svm_core_start_remote_residents(ULONG online);
 void     svm_core_stop_all_residents(void);
 void     svm_core_wait_all_stopped(ULONG online);
+void     svm_core_wait_remote_ready(ULONG online);
 
 #endif

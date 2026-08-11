@@ -124,8 +124,10 @@ typedef struct {
     uint64_t sysenter_esp;    /* +0x230 */
     uint64_t sysenter_eip;    /* +0x238 */
     uint64_t cr2;             /* +0x240 */
-    uint8_t  _pad_248[0x1B8];
-    uint8_t  gif;             /* +0x400 */
+    uint8_t  _pad_248[0x20];
+    uint64_t g_pat;           /* +0x268 */
+    uint8_t  _pad_270[0x190];
+    uint8_t  _pad_400;        /* +0x400: reserved area, not a GIF field */
     uint8_t  _pad_401[0x7FF]; /* pad to 0xC00 total */
 } vmcb_state_t;
 
@@ -134,6 +136,7 @@ _Static_assert(offsetof(vmcb_state_t, rflags) == 0x170, "VMCB RFLAGS offset");
 _Static_assert(offsetof(vmcb_state_t, rip) == 0x178, "VMCB RIP offset");
 _Static_assert(offsetof(vmcb_state_t, rsp) == 0x1D8, "VMCB RSP offset");
 _Static_assert(offsetof(vmcb_state_t, rax) == 0x1F8, "VMCB RAX offset");
+_Static_assert(offsetof(vmcb_state_t, g_pat) == 0x268, "VMCB G_PAT offset");
 
 /* Full VMCB (4KB page): control at +0x000, state at +0x400 */
 typedef struct {

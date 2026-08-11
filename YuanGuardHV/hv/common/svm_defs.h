@@ -21,6 +21,7 @@ typedef signed int         int32_t;
 
 /* === AMD SVM MSR addresses === */
 #define MSR_EFER          0xC0000080
+#define MSR_IA32_PAT      0x277
 #define MSR_VM_CR         0xC0010114
 #define MSR_VM_HSAVE      0xC0010117
 
@@ -40,6 +41,7 @@ typedef signed int         int32_t;
 
 /* SVM CPUID feature bits (CPUID 0x8000000A.EDX) */
 #define CPUID_NPT_FEATURE_NPT  (1 << 0)
+#define CPUID_NPT_FEATURE_FLUSHBYASID (1 << 6)
 
 /* VMCB control area intercept bit offsets */
 #define SVM_INTERCEPT_INTR       0

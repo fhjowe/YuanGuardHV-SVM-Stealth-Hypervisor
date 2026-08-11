@@ -21,6 +21,14 @@ static void yg_write_msr(uint32_t msr, uint64_t value) {
     __asm__ volatile("wrmsr" : : "c"(msr), "a"(low), "d"(high));
 }
 
+static void yg_svm_vmsave(uint64_t vmcb_pa) {
+    __asm__ volatile(".byte 0x0F, 0x01, 0xDB" : : "a"(vmcb_pa) : "memory");
+}
+
+static void yg_svm_vmload(uint64_t vmcb_pa) {
+    __asm__ volatile(".byte 0x0F, 0x01, 0xDA" : : "a"(vmcb_pa) : "memory");
+}
+
 /* --- Segment helpers --- */
 static uint16_t yg_read_cs(void) {
     uint16_t cs;
@@ -118,43 +126,48 @@ int svm_alloc_vcpu(uint32_t core_id, svm_vcpu_t **out) {
     RtlZeroMemory(vcpu, sizeof(svm_vcpu_t));
 
     /* VMCB — 4KB aligned physical page */
-    vcpu->vmcb = (vmcb_t *)MmAllocateContiguousMemory(HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = (ULONGLONG)-1 });
+    vcpu->vmcb = (vmcb_t *)MmAllocateContiguousMemory(HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
     if (!vcpu->vmcb) goto fail_vmcb;
     RtlZeroMemory(vcpu->vmcb, HV_PAGE_SIZE);
     vcpu->vmcb_pa = MmGetPhysicalAddress(vcpu->vmcb).QuadPart;
 
     /* Host VMCB — for VMLOAD after VMRUN exit (resident mode) */
-    vcpu->host_vmcb = (vmcb_t *)MmAllocateContiguousMemory(HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = (ULONGLONG)-1 });
+    vcpu->host_vmcb = (vmcb_t *)MmAllocateContiguousMemory(HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
     if (!vcpu->host_vmcb) goto fail_host_vmcb;
     RtlZeroMemory(vcpu->host_vmcb, HV_PAGE_SIZE);
     vcpu->host_vmcb_pa = MmGetPhysicalAddress(vcpu->host_vmcb).QuadPart;
 
     /* HSave area — 4KB aligned */
-    vcpu->hsave = MmAllocateContiguousMemory(HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = (ULONGLONG)-1 });
+    vcpu->hsave = MmAllocateContiguousMemory(HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
     if (!vcpu->hsave) goto fail_hsave;
     RtlZeroMemory(vcpu->hsave, HV_PAGE_SIZE);
     vcpu->hsave_pa = MmGetPhysicalAddress(vcpu->hsave).QuadPart;
 
     /* Host stack — 4 pages */
     vcpu->host_stack = MmAllocateContiguousMemory(SVM_HOST_STACK_PAGES * HV_PAGE_SIZE,
-        (PHYSICAL_ADDRESS){ .QuadPart = (ULONGLONG)-1 });
+        (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
     if (!vcpu->host_stack) goto fail_stack;
     RtlZeroMemory(vcpu->host_stack, SVM_HOST_STACK_PAGES * HV_PAGE_SIZE);
     vcpu->host_stack_top = (uint64_t)vcpu->host_stack + SVM_HOST_STACK_PAGES * HV_PAGE_SIZE - 8;
 
     /* MSRPM — 2 pages, zero = allow MSR access (bit=1 means intercept) */
     vcpu->msrpm = MmAllocateContiguousMemory(SVM_MSRPM_PAGES * HV_PAGE_SIZE,
-        (PHYSICAL_ADDRESS){ .QuadPart = (ULONGLONG)-1 });
+        (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
     if (!vcpu->msrpm) goto fail_msrpm;
     RtlZeroMemory(vcpu->msrpm, SVM_MSRPM_PAGES * HV_PAGE_SIZE);
     vcpu->msrpm_pa = MmGetPhysicalAddress(vcpu->msrpm).QuadPart;
 
     /* IOPM — 3 pages, zero = allow IO (bit=1 means intercept) */
     vcpu->iopm = MmAllocateContiguousMemory(SVM_IOPM_PAGES * HV_PAGE_SIZE,
-        (PHYSICAL_ADDRESS){ .QuadPart = (ULONGLONG)-1 });
+        (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
     if (!vcpu->iopm) goto fail_iopm;
     RtlZeroMemory(vcpu->iopm, SVM_IOPM_PAGES * HV_PAGE_SIZE);
     vcpu->iopm_pa = MmGetPhysicalAddress(vcpu->iopm).QuadPart;
+
+    LOG_ERROR("alloc vcpu core=%u: vmcb=0x%llx host_vmcb=0x%llx hsave=0x%llx host_stack=0x%llx msrpm=0x%llx iopm=0x%llx",
+        core_id, vcpu->vmcb_pa, vcpu->host_vmcb_pa, vcpu->hsave_pa,
+        MmGetPhysicalAddress(vcpu->host_stack).QuadPart,
+        vcpu->msrpm_pa, vcpu->iopm_pa);
 
     vcpu->resident_state = SVM_RESIDENT_OFF;
     *out = vcpu;
@@ -203,20 +216,32 @@ static void yg_read_seg_descriptor(uint16_t selector, uint16_t *attrib, uint32_t
     }
 
     uint64_t *desc = (uint64_t *)(gdt_base + (selector & ~7));
-    uint64_t hi = desc[1];
     uint64_t lo = desc[0];
+    uint64_t hi = 0;
 
-    /* Extract attribute (bits 40-55 of GDT entry) */
-    *attrib = (uint16_t)((hi >> 8) & 0xF0FF);
+    /* Code/data descriptors are 8 bytes in long mode; only system
+       descriptors (S=0, e.g. TSS/LDT) occupy a second 8-byte slot. */
+    if (!((lo >> 44) & 1))
+        hi = desc[1];
 
-    /* Extract limit */
-    *limit = (uint32_t)((lo & 0xFFFF) | (hi & 0xF0000));
-    if (hi & (1ULL << 55)) /* Granularity: 4KB units */
+    /* VMCB attr: bits 0-7 = GDT type/S/DPL/P (40-47), bits 8-11 = AVL/L/D/B/G (52-55) */
+    *attrib = (uint16_t)((lo >> 40) & 0xFF) | (uint16_t)(((lo >> 52) & 0xF) << 8);
+
+    /* Limit: bits 0-15 + bits 48-51, expanded by G bit (55) */
+    *limit = (uint32_t)((lo & 0xFFFF) | ((lo >> 32) & 0xF0000));
+    if (lo & (1ULL << 55))
         *limit = (*limit << 12) | 0xFFF;
 
-    /* Extract base */
-    *base = ((lo >> 16) & 0xFFFF) | ((lo >> 32) & 0xFF000000) |
-            ((hi << 16) & 0xFF000000) | ((hi >> 16) & 0xFF);
+    /* Base: low dword bits 16-39 and 56-63, plus high dword bits 0-31 */
+    *base = ((lo >> 16) & 0xFFFF)
+          | (((lo >> 32) & 0xFF) << 16)
+          | (((lo >> 56) & 0xFF) << 24)
+          | ((hi & 0xFF) << 32)
+          | (((hi >> 8) & 0xFF) << 40)
+          | ((hi >> 16) << 48);
+
+    LOG_ERROR("seg sel=0x%x lo=0x%llx hi=0x%llx attrib=0x%x limit=0x%x base=0x%llx",
+        selector, lo, hi, *attrib, *limit, *base);
 }
 
 /* --- VCPU preparation --- */
@@ -229,7 +254,8 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
     /* — Control area — */
     ctrl->general1_intercepts = 0;
     ctrl->general1_intercepts = 0;
-    ctrl->general2_intercepts = INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    ctrl->general2_intercepts = INTR_GEN2(SVM_INTERCEPT_VMRUN) |
+                                INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     ctrl->cr_read_intercepts = 0;
     ctrl->cr_write_intercepts = 0;
     ctrl->dr_read_intercepts = 0;
@@ -244,7 +270,7 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
     ctrl->np_enable = 0;
     /* Guest ASID — ASID 0 reserved for host, use core_id+1 in real multi-core */
     ctrl->guest_asid = 1;
-    ctrl->tlb_control = 0x01;  /* Flush guest TLB for this ASID on next VMRUN */
+    ctrl->tlb_control = 0;     /* Do nothing — 3 is a known VMware nested-SVM INVALID trigger */
 
     /* VMCB clean bits — 0 = force re-read all fields on VMRUN */
     ctrl->vmcb_clean_bits = 0;
@@ -298,9 +324,6 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
     /* CPL — ring 0 */
     state->cpl = 0;
 
-    /* GIF — set */
-    state->gif = 1;
-
     /* Guest RIP/RSP */
     state->rip = guest_rip;
     state->rsp = vcpu->host_stack_top;
@@ -315,6 +338,38 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
     state->sysenter_eip = yg_read_msr(0x176);
     state->kernel_gs_base = yg_read_msr(0xC0000102); /* MSR_KERNEL_GS_BASE */
     state->cr2 = 0;
+    state->g_pat = yg_read_msr(MSR_IA32_PAT);
+
+    /* Let hardware fill FS/GS/TR/LDTR hidden state + system MSRs into the
+       guest VMCB, and snapshot host state for VMLOAD after VMEXIT. */
+    yg_svm_vmsave(vcpu->vmcb_pa);
+    yg_svm_vmsave(vcpu->host_vmcb_pa);
+
+    /* Full VMCB state dump for diagnosing VMEXIT_INVALID under VMware nested SVM */
+    LOG_ERROR("VMCB dump: es=%x/%x/%x/0x%llx cs=%x/%x/%x/0x%llx ss=%x/%x/%x/0x%llx ds=%x/%x/%x/0x%llx",
+        state->es_selector, state->es_attrib, state->es_limit, state->es_base,
+        state->cs_selector, state->cs_attrib, state->cs_limit, state->cs_base,
+        state->ss_selector, state->ss_attrib, state->ss_limit, state->ss_base,
+        state->ds_selector, state->ds_attrib, state->ds_limit, state->ds_base);
+    LOG_ERROR("VMCB dump: fs=%x/%x/%x/0x%llx gs=%x/%x/%x/0x%llx gdtr=%x/%x/%x/0x%llx ldtr=%x/%x/%x/0x%llx",
+        state->fs_selector, state->fs_attrib, state->fs_limit, state->fs_base,
+        state->gs_selector, state->gs_attrib, state->gs_limit, state->gs_base,
+        state->gdtr_selector, state->gdtr_attrib, state->gdtr_limit, state->gdtr_base,
+        state->ldtr_selector, state->ldtr_attrib, state->ldtr_limit, state->ldtr_base);
+    LOG_ERROR("VMCB dump: idtr=%x/%x/%x/0x%llx tr=%x/%x/%x/0x%llx cpl=%u efer=0x%llx tlb_ctl=%u",
+        state->idtr_selector, state->idtr_attrib, state->idtr_limit, state->idtr_base,
+        state->tr_selector, state->tr_attrib, state->tr_limit, state->tr_base,
+        state->cpl, state->efer, (unsigned)ctrl->tlb_control);
+
+    {
+        int svm_feat[4];
+        __cpuidex(svm_feat, CPUID_AMD_NPT, 0);
+        LOG_ERROR("CPUID 8000000A: eax=%08x ebx=%08x ecx=%08x edx=%08x (NPT=%d FLUSHBYASID=%d)",
+            (unsigned)svm_feat[0], (unsigned)svm_feat[1],
+            (unsigned)svm_feat[2], (unsigned)svm_feat[3],
+            (svm_feat[3] & CPUID_NPT_FEATURE_NPT) ? 1 : 0,
+            (svm_feat[3] & CPUID_NPT_FEATURE_FLUSHBYASID) ? 1 : 0);
+    }
 
     LOG_INFO("svm_prepare_vcpu: guest_rip=0x%llx, cr3=0x%llx, efer=0x%llx",
         guest_rip, state->cr3, state->efer);
@@ -368,40 +423,47 @@ int svm_core_init(void) {
     g_vcpus[core_id]->old_efer = yg_read_msr(MSR_EFER);
 
     svm_prepare_vcpu(g_vcpus[core_id], (uint64_t)svm_trampoline_test_guest);
-    /* Set first VMMCALL to heartbeat so resident loop doesn't exit immediately */
+    /* Resident test: heartbeat loops in the guest; vmmcall.c auto-stops
+       after a bounded number of exits so DriverEntry can return. */
     g_vcpus[core_id]->regs.rax = YGHV_CMD_HEARTBEAT;
     g_vcpus[core_id]->vmcb->state.rax = YGHV_CMD_HEARTBEAT;
     LOG_INFO("svm_core_init: VCPU[%u] ready", (unsigned)core_id);
     return STATUS_SUCCESS;
 }
 
+static ULONG_PTR svm_core_ipi_cleanup(ULONG_PTR arg) {
+    (void)arg;
+    ULONG core = KeGetCurrentProcessorNumber();
+    svm_vcpu_t *vcpu = (core < SVM_MAX_CORES) ? g_vcpus[core] : NULL;
+
+    if (vcpu) {
+        if (vcpu->old_hsave)
+            yg_write_msr(MSR_VM_HSAVE, vcpu->old_hsave);
+        if (vcpu->old_efer) {
+            uint64_t efer = yg_read_msr(MSR_EFER);
+            if ((efer & EFER_SVME) && !(vcpu->old_efer & EFER_SVME)) {
+                efer &= ~EFER_SVME;
+                yg_write_msr(MSR_EFER, efer);
+                LOG_INFO("SVM disabled on core %u", core);
+            }
+        }
+    }
+    return 0;
+}
+
 int svm_core_cleanup(void) {
     ULONG i;
 
-    /* Restore per-core MSR state before freeing memory */
+    /* Restore per-core MSR state while VMCB/hsave memory is still valid. */
+    KeIpiGenericCall(svm_core_ipi_cleanup, 0);
+
     for (i = 0; i < SVM_MAX_CORES; i++) {
         if (g_vcpus[i]) {
-            /* Restore saved MSR values if we modified them */
-            if (g_vcpus[i]->old_hsave)
-                yg_write_msr(MSR_VM_HSAVE, g_vcpus[i]->old_hsave);
             svm_free_vcpu(g_vcpus[i]);
             g_vcpus[i] = NULL;
         }
     }
     g_vcpu_count = 0;
-
-    /* Disable SVM — only if we are the ones who set it.
-       ponytail: nested virt may #GP on EFER wrmsr; skip cleanup there.
-       On bare-metal, clearing EFER.SVME is safe after all VMs are stopped. */
-    {
-        uint64_t efer = yg_read_msr(MSR_EFER);
-        if (efer & EFER_SVME) {
-            efer &= ~EFER_SVME;
-            yg_write_msr(MSR_EFER, efer);
-            LOG_INFO("SVM disabled");
-        }
-    }
-
     return STATUS_SUCCESS;
 }
 
@@ -518,6 +580,9 @@ int svm_core_prepare_vcpu_other(uint32_t core_id) {
     if (core_id >= SVM_MAX_CORES || !g_vcpus[core_id])
         return STATUS_NOT_FOUND;
 
+    g_vcpus[core_id]->old_hsave = yg_read_msr(MSR_VM_HSAVE);
+    g_vcpus[core_id]->old_efer = yg_read_msr(MSR_EFER);
+
     efer = yg_read_msr(MSR_EFER);
     if (!(efer & EFER_SVME)) {
         efer |= EFER_SVME;
@@ -525,6 +590,12 @@ int svm_core_prepare_vcpu_other(uint32_t core_id) {
     }
 
     svm_prepare_vcpu(g_vcpus[core_id], (uint64_t)svm_trampoline_test_guest);
+    /* New system threads may report SS=0 under nested SVM; the test guest
+       only needs a canonical ring-0 long-mode SS. */
+    g_vcpus[core_id]->vmcb->state.ss_selector = 0x18;
+    g_vcpus[core_id]->vmcb->state.ss_attrib = 0x493;
+    g_vcpus[core_id]->vmcb->state.ss_limit = 0;
+    g_vcpus[core_id]->vmcb->state.ss_base = 0;
     g_vcpus[core_id]->regs.rax = YGHV_CMD_HEARTBEAT;
     g_vcpus[core_id]->vmcb->state.rax = YGHV_CMD_HEARTBEAT;
 

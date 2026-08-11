@@ -47,7 +47,7 @@ set "INCLUDES=%INCLUDES% /I"%HV_DIR%\pool""
 
 set "CFLAGS=/nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-"
 set "CFLAGS=%CFLAGS% -Wno-microsoft -Wno-unknown-pragmas -Wno-ignored-attributes -Wno-visibility -Wno-pragma-pack"
-set "CFLAGS=%CFLAGS% /D_KERNEL_MODE /D_AMD64_ /DNTDDI_VERSION=0x0A000005"
+set "CFLAGS=%CFLAGS% /D_KERNEL_MODE /D_AMD64_ /DNTDDI_VERSION=0x0A000005 /DYGHV_DEBUG_LOG"
 
 set "LINKS=/nologo /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /MACHINE:X64"
 set "LINKS=%LINKS% /OPT:NOREF,NOICF"
@@ -56,7 +56,7 @@ set "LINKS=%LINKS% /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VER%\km\x64""
 echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
-for %%f in (main svm_core npt_core vmexit vmmcall) do call :compile %%f || goto :error
+for %%f in (main svm_core npt_core vmexit vmmcall multi_core) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
@@ -69,6 +69,7 @@ echo   Linking (MSVC)...
     "%BIN_DIR%\npt_core.obj" ^
     "%BIN_DIR%\vmexit.obj" ^
     "%BIN_DIR%\vmmcall.obj" ^
+    "%BIN_DIR%\multi_core.obj" ^
     "%BIN_DIR%\svm_trampoline.obj" ^
     ntoskrnl.lib
 if errorlevel 1 goto :error

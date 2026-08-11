@@ -16,4 +16,6 @@
 #define YGHV_STATUS_OK          0ULL
 #define YGHV_STATUS_ERROR       1ULL
 
+extern uint64_t g_vmmcall_auth_cookie;
+
 #endif

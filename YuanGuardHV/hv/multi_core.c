@@ -3,39 +3,112 @@
 #include "svm_vcpu.h"
 #include "debug.h"
 
-static void svm_dpc_resident_start(struct _KDPC *dpc, void *ctx, void *arg1, void *arg2) {
-    (void)dpc;(void)ctx;(void)arg1;(void)arg2;
-    uint32_t core = (uint32_t)KeGetCurrentProcessorNumber();
-    if (core < SVM_MAX_CORES && g_vcpus[core])
-        svm_core_enter_resident_current(core);
+extern npt_mgr_t g_npt;
+extern uint64_t g_guest_hb_va;
+extern uint64_t g_vmmcall_auth_cookie;
+
+typedef struct {
+    uint32_t core;
+    NTSTATUS status;
+} yghv_resident_ctx_t;
+
+static HANDLE g_resident_threads[SVM_MAX_CORES];
+static yghv_resident_ctx_t *g_resident_ctx[SVM_MAX_CORES];
+static KEVENT g_ready_events[SVM_MAX_CORES];
+static ULONG g_resident_thread_count;
+
+static VOID yghv_resident_thread(PVOID context) {
+    yghv_resident_ctx_t *ctx = (yghv_resident_ctx_t *)context;
+    uint32_t core = ctx->core;
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    KeSetEvent(&g_ready_events[core], IO_NO_INCREMENT, FALSE);
+    ctx->status = (svm_core_enter_resident_current(core) == 0)
+                      ? STATUS_SUCCESS
+                      : STATUS_UNSUCCESSFUL;
+    KeRevertToUserAffinityThread();
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-void svm_core_start_remote_residents(ULONG online) {
+NTSTATUS svm_core_start_remote_residents(ULONG online) {
+    ULONG i;
+
+    g_resident_thread_count = 0;
+    for (i = 1; i < online && i < SVM_MAX_CORES; i++) {
+        yghv_resident_ctx_t *ctx;
+        HANDLE thread;
+        NTSTATUS status;
+
+        if (!g_vcpus[i]) continue;
+
+        ctx = (yghv_resident_ctx_t *)ExAllocatePoolWithTag(
+            NonPagedPool, sizeof(*ctx), YGHV_TAG);
+        if (!ctx) {
+            LOG_ERROR("alloc resident ctx core %u failed", i);
+            svm_core_stop_all_residents();
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(ctx, sizeof(*ctx));
+        ctx->core = i;
+        KeInitializeEvent(&g_ready_events[i], NotificationEvent, FALSE);
+
+        status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                                      yghv_resident_thread, ctx);
+        if (!NT_SUCCESS(status)) {
+            LOG_ERROR("PsCreateSystemThread core %u failed 0x%x", i, status);
+            ExFreePool(ctx);
+            svm_core_stop_all_residents();
+            return status;
+        }
+
+        g_resident_threads[i] = thread;
+        g_resident_ctx[i] = ctx;
+        g_resident_thread_count++;
+        LOG_INFO("resident thread created for core %u", i);
+    }
+
+    LOG_INFO("started %u remote resident threads", g_resident_thread_count);
+    return STATUS_SUCCESS;
+}
+
+void svm_core_wait_remote_ready(ULONG online) {
     ULONG i;
     for (i = 1; i < online && i < SVM_MAX_CORES; i++) {
-        KDPC *dpc;
-        if (!g_vcpus[i]) continue;
-        dpc = (KDPC *)ExAllocatePoolWithTag(NonPagedPool, sizeof(KDPC), YGHV_TAG);
-        if (!dpc) continue;
-        KeInitializeDpc(dpc, svm_dpc_resident_start, dpc);
-        KeSetTargetProcessorDpc(dpc, (CCHAR)i);
-        KeInsertQueueDpc(dpc, NULL, NULL);
-        LOG_INFO("DPC queued for core %u", i);
+        if (!g_resident_threads[i]) continue;
+        KeWaitForSingleObject(&g_ready_events[i], Executive, KernelMode, FALSE, NULL);
     }
 }
 
 void svm_core_wait_all_stopped(ULONG online) {
     ULONG i;
-    LARGE_INTEGER timeout;
-    timeout.QuadPart = -100000;
-    for (;;) {
-        ULONG running = 0;
-        for (i = 0; i < online && i < SVM_MAX_CORES; i++) {
-            if (g_vcpus[i] && g_vcpus[i]->resident_state == SVM_RESIDENT_ACTIVE)
-                running++;
+
+    for (i = 1; i < online && i < SVM_MAX_CORES; i++) {
+        PETHREAD thread_obj = NULL;
+        NTSTATUS status;
+
+        if (!g_resident_threads[i]) continue;
+
+        status = ObReferenceObjectByHandle(
+            g_resident_threads[i], THREAD_ALL_ACCESS, *PsThreadType,
+            KernelMode, (PVOID *)&thread_obj, NULL);
+        if (NT_SUCCESS(status) && thread_obj) {
+            KeWaitForSingleObject(thread_obj, Executive, KernelMode, FALSE, NULL);
+            ObDereferenceObject(thread_obj);
+        } else {
+            LOG_ERROR("ObReferenceObjectByHandle core %u failed 0x%x", i, status);
         }
-        if (running == 0) break;
-        KeDelayExecutionThread(KernelMode, FALSE, &timeout);
+
+        if (g_resident_ctx[i] && !NT_SUCCESS(g_resident_ctx[i]->status))
+            LOG_ERROR("resident thread core %u status 0x%x", i, g_resident_ctx[i]->status);
+
+        ZwClose(g_resident_threads[i]);
+        g_resident_threads[i] = NULL;
+        if (g_resident_ctx[i]) {
+            ExFreePool(g_resident_ctx[i]);
+            g_resident_ctx[i] = NULL;
+        }
     }
-    LOG_INFO("All cores stopped");
+    g_resident_thread_count = 0;
+    LOG_INFO("all resident threads joined");
 }

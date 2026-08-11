@@ -14,6 +14,15 @@ kd_*.log
 *.dmp
 *.gzd
 
+# KD control runtime files
+YuanGuardHV/kd_cmd.txt
+YuanGuardHV/kd_ctl_err.txt
+YuanGuardHV/kd_ctl_in.txt
+YuanGuardHV/kd_ctl_out.txt
+
+# clang-cl 在仓库根生成的中间汇编
+/svm_trampoline.asm
+
 # IDE / OS noise
 .vs/
 .idea/

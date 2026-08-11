@@ -11,8 +11,18 @@ _Static_assert(sizeof(npt_entry_t) == 8, "NPT size");
 #define NPT_PAGE_OFFSET(a) ((a)&0xFFF)
 #define NPT_LARGE_PAGE_FLAGS ((1ULL<<0)|(1ULL<<1)|(1ULL<<2)|(1ULL<<5)|(1ULL<<7))
 #define NPT_4K_PAGE_FLAGS ((1ULL<<0)|(1ULL<<1)|(1ULL<<2)|(1ULL<<5))
+#define NPT_PFN_4K(e)  (((e) >> 12) & 0xFFFFFFFFFULL)
+#define NPT_PFN_2MB(e) (((e) >> 21) & 0xFFFFFFFFFULL)
+#define NPT_PERM_PRESENT  (1ULL<<0)
+#define NPT_PERM_WRITABLE (1ULL<<1)
+#define NPT_PERM_NX       (1ULL<<63)
 typedef struct { uint64_t pml4_pa; npt_entry_t *pml4_va; uint64_t total_mapped_pages; uint64_t total_mapped_2mb_pages; } npt_mgr_t;
 int npt_init(npt_mgr_t*m,uint64_t x); int npt_identity_map_range(npt_mgr_t*m,uint64_t s,uint64_t e);
 int npt_set_page_perm(npt_mgr_t*m,uint64_t g,uint64_t f); int npt_set_page_perm_range(npt_mgr_t*m,uint64_t g,uint64_t s,uint64_t f);
 uint64_t npt_translate(npt_mgr_t*m,uint64_t g); int npt_cleanup(npt_mgr_t*m);
+uint64_t npt_read_entry(npt_mgr_t*m,uint64_t g);
+int npt_split_2mb_to_4kb(npt_mgr_t*m,uint64_t g);
+int npt_exclude_pa(npt_mgr_t*m,uint64_t g);
+int npt_exclude_range(npt_mgr_t*m,uint64_t g,uint64_t s);
+int npt_exclude_self(npt_mgr_t*m);
 #endif

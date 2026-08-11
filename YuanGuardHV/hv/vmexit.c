@@ -13,6 +13,9 @@ static int  svm_handle_msr(svm_vcpu_t *vcpu);
 static int  svm_handle_cr(svm_vcpu_t *vcpu);
 
 extern int vmmcall_dispatch(svm_vcpu_t *vcpu);
+extern npt_mgr_t g_npt;
+extern uint64_t g_npt_test_pa;
+extern volatile int g_npt_test_active;
 
 static void svm_advance_rip(svm_vcpu_t *vcpu) {
     vcpu->vmcb->state.rip = vcpu->vmcb->control.next_rip;
@@ -62,11 +65,25 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
 
     /* NPF = fault-like, no RIP advance — instruction re-executes */
     case SVM_EXIT_NPF: {
+        static uint64_t npf_logged = 0;
         uint64_t info1 = vcpu->vmcb->control.exitinfo1;
         uint64_t pf_ec = 0;
 
-        LOG_INFO("NPF: info1=0x%llx GPA=0x%llx RIP=0x%llx",
-            info1, vcpu->vmcb->control.exitinfo2, vcpu->vmcb->state.rip);
+        if (g_npt_test_active) {
+            LOG_ERROR("NPT test NPF: GPA=0x%llx RIP=0x%llx info1=0x%llx",
+                vcpu->vmcb->control.exitinfo2, vcpu->vmcb->state.rip, info1);
+            npt_set_page_perm(&g_npt, g_npt_test_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+            g_npt_test_active = 0;
+            return 0;
+        }
+
+        if (npf_logged < 5) {
+            LOG_ERROR("NPF early: exits=%llu np=0x%llx ncr3=0x%llx info1=0x%llx GPA=0x%llx RIP=0x%llx",
+                vcpu->resident_exits, vcpu->vmcb->control.np_enable,
+                vcpu->vmcb->control.ncr3, info1, vcpu->vmcb->control.exitinfo2,
+                vcpu->vmcb->state.rip);
+            npf_logged++;
+        }
 
         if (info1 & NPF_INFO1_PRESENT) pf_ec |= (1ULL << 0);
         if (info1 & NPF_INFO1_WRITE)   pf_ec |= (1ULL << 1);
@@ -113,6 +130,22 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     default:
         LOG_ERROR("Unhandled exit: 0x%llx, info1=0x%llx, RIP=0x%llx",
             exitcode, vcpu->vmcb->control.exitinfo1, vcpu->vmcb->state.rip);
+        LOG_ERROR("VMCB ctl: np=0x%llx ncr3=0x%llx asid=%u tlb=%u evinj=0x%llx nrip=0x%llx clean=0x%x",
+            vcpu->vmcb->control.np_enable, vcpu->vmcb->control.ncr3,
+            vcpu->vmcb->control.guest_asid, vcpu->vmcb->control.tlb_control,
+            vcpu->vmcb->control.event_injection, vcpu->vmcb->control.next_rip,
+            vcpu->vmcb->control.vmcb_clean_bits);
+        LOG_ERROR("VMCB state: rip=0x%llx rsp=0x%llx rflags=0x%llx rax=0x%llx cr0=0x%llx cr3=0x%llx cr4=0x%llx efer=0x%llx cpl=%u",
+            vcpu->vmcb->state.rip, vcpu->vmcb->state.rsp, vcpu->vmcb->state.rflags,
+            vcpu->vmcb->state.rax, vcpu->vmcb->state.cr0, vcpu->vmcb->state.cr3,
+            vcpu->vmcb->state.cr4, vcpu->vmcb->state.efer, vcpu->vmcb->state.cpl);
+        LOG_ERROR("VMCB seg: cs=%x/%x/%x base=0x%llx ss=%x/%x/%x base=0x%llx ds=%x/%x/%x base=0x%llx",
+            vcpu->vmcb->state.cs_selector, vcpu->vmcb->state.cs_attrib, vcpu->vmcb->state.cs_limit,
+            vcpu->vmcb->state.cs_base,
+            vcpu->vmcb->state.ss_selector, vcpu->vmcb->state.ss_attrib, vcpu->vmcb->state.ss_limit,
+            vcpu->vmcb->state.ss_base,
+            vcpu->vmcb->state.ds_selector, vcpu->vmcb->state.ds_attrib, vcpu->vmcb->state.ds_limit,
+            vcpu->vmcb->state.ds_base);
         return 1;
     }
 }

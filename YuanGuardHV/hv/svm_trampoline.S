@@ -3,10 +3,9 @@
 # On entry: RCX = vcpu pointer. Returns VMCB exitcode in RAX.
 #
 # Stack layout on entry:
-#   [rsp+0x48] host rbx  [rsp+0x40] host rbp  [rsp+0x38] host r12
-#   [rsp+0x30] host r13  [rsp+0x28] host r14  [rsp+0x20] host r15
-#   [rsp+0x18] host rdi  [rsp+0x10] host rsi  [rsp+0x08] saved vcpu
-#   [rsp+0x00] <- RSP after pushes
+#   [rsp+0x40] host rbx  [rsp+0x38] host rbp  [rsp+0x30] host r12
+#   [rsp+0x28] host r13  [rsp+0x20] host r14  [rsp+0x18] host r15
+#   [rsp+0x10] host rdi  [rsp+0x08] host rsi  [rsp+0x00] saved vcpu
 #
 # vcpu->regs offsets:
 #   +0x00 r15  +0x08 r14  +0x10 r13  +0x18 r12  +0x20 r11  +0x28 r10
@@ -22,10 +21,24 @@
     .globl svm_trampoline_test_guest_end
 
 svm_trampoline_test_guest:
+    mov     rax, 1                  # YGHV_CMD_HEARTBEAT
     vmmcall
 svm_trampoline_test_guest_resume:
-    ud2
+    jmp svm_trampoline_test_guest
 svm_trampoline_test_guest_end:
+
+# --- NPT permission test guest ---
+    .globl svm_trampoline_test_npt_guest
+    .globl svm_trampoline_test_npt_guest_resume
+    .globl svm_trampoline_test_npt_guest_end
+
+svm_trampoline_test_npt_guest:
+    mov     rax, qword ptr [rdi]    # access protected page -> NPF
+    mov     rax, 2                  # YGHV_CMD_STOP_INTERNAL
+    vmmcall
+svm_trampoline_test_npt_guest_resume:
+    jmp svm_trampoline_test_npt_guest
+svm_trampoline_test_npt_guest_end:
 
 # ============================================================
 # uint64_t svm_vmrun_trampoline(svm_vcpu_t *vcpu)
@@ -74,18 +87,21 @@ svm_vmrun_trampoline:
 
     mov     rax, qword ptr [rax + 0x08]  # vcpu->vmcb_pa
 
+    .byte   0x0F, 0x01, 0xDA             # VMLOAD rax — guest FS/GS/TR/LDTR + system MSRs
     clgi
     .byte   0x0F, 0x01, 0xD8             # VMRUN rax
 
     # --- VMEXIT return point ---
-    stgi
-
     # Save guest rdi / rsi to stack (they are guest values; we need rdi/rsi as temps)
-    push    rdi                     # [rsp+0x00] = guest rdi
-    push    rsi                     # [rsp+0x00] = guest rsi, [rsp+0x08] = guest rdi
-    # vcpu is now at [rsp + 0x18]
+    push    rdi                     # [rsp+0x08] = guest rdi
+    push    rsi                     # [rsp+0x00] = guest rsi
+    # vcpu is now at [rsp + 0x10]
 
-    mov     rdi, qword ptr [rsp + 0x18]  # vcpu
+    mov     rdi, qword ptr [rsp + 0x10]  # vcpu
+    mov     rax, qword ptr [rdi + 0x08]  # vcpu->vmcb_pa
+    .byte   0x0F, 0x01, 0xDB             # VMSAVE rax — save guest FS/GS/TR/LDTR + system MSRs
+    mov     rax, qword ptr [rdi + 0x18]  # vcpu->host_vmcb_pa
+    .byte   0x0F, 0x01, 0xDA             # VMLOAD rax — restore host FS/GS/TR/LDTR + system MSRs
 
     # Read guest RAX from VMCB state area (CPU saves it there on exit)
     mov     rsi, qword ptr [rdi]         # vcpu->vmcb
@@ -111,6 +127,7 @@ svm_vmrun_trampoline:
     mov     qword ptr [rdi + 0x78 + 0x48], rsi
     pop     rsi                     # guest rdi
     mov     qword ptr [rdi + 0x78 + 0x40], rsi
+    stgi                            # guest GPRs are saved; re-enable interrupts
 
     # --- Read exitcode from VMCB ---
     mov     rax, qword ptr [rdi]         # vcpu->vmcb

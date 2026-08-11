@@ -9,27 +9,38 @@
 - [x] 重新构建并签名，记录 sys 哈希
 - [x] 删除 Win11 VM 并清理 VMware 清单（文件暂存 `_win11_trash`，待手动删除）
 - [x] 禁用宿主机 WiFi 适配器 `WLAN`
-- [ ] 启动 VM + KD 连接验证（**本机永久阻塞**：本地完全重装 17.6.4 + 跳过 Networking 后仍复现，6/6 全部在 VM 启动数秒-3 分钟内硬卡死；根因在宿主系统/硬件，VMware 路线不可用）
-- [ ] `min_drv.sys` 加载链验证（sc create/start/stop/delete）
-- [ ] VM 内 CPUID SVM bit + CLGI 实测
-  - SVM 暴露：尝试 VM 内 VMRUN 冒烟
-  - 未暴露：准备裸机测试（testsigning、签名、usbwifi 处理）
-- [ ] 可运行环境最小冒烟：VMMCALL 心跳
+- [x] 启动 VM + KD 连接验证（2026-08-10 用官方镜像重装的新 VM `Windows 10 x64`，串口命名管道连接成功，KD 13:19 握手；旧“不忘初心”Guest 才是 COM1 缺失根因）
+- [x] `min_drv.sys` 加载链验证（sc create/start/delete，驱动可 RUNNING）
+- [x] VM 内 CPUID SVM bit + CLGI 实测
+  - SVM 暴露：VMRUN 冒烟已通过（VMLOAD/VMSAVE/CLGI/VMRUN 通路正常）
+  - 未暴露：不需要走裸机备选
+- [x] 可运行环境最小冒烟：VMMCALL 心跳（10000 轮稳定）
+- [x] 不重启反复测试：`DriverUnload` + `unload_driver.ps1`（NtUnloadDriver），启动/卸载/再启动验证
 
 ## 1. P0 复核（TECHNICAL_REVIEW.md 2026-07-30，需对照 7/31 后代码）
 
 | ID | 标题 | 复核结果 |
 |---|---|---|
-| YGHV-001 | VMCB 布局与 AMD APM 不一致 | 待复核 |
-| YGHV-002 | svm_core_init 真实路径（原 #if 0） | 待复核（文件已变） |
-| YGHV-003 | trampoline 寄存器保存/恢复 | 待复核 |
-| YGHV-004 | VMEXIT 不推进 RIP / 返回值写错 | 待复核 |
-| YGHV-005 | cleanup 分配释放不匹配 / 无条件清 SVME | 待复核 |
-| YGHV-006 | NPT 全物理 RWX | 待复核 |
-| YGHV-007 | VMMCALL 无认证 | 待复核 |
-| YGHV-008 | NPT 权限 API 假成功 | 待复核 |
-| YGHV-009 | NPF event injection VALID 位 | 待复核 |
-| YGHV-010 | ASID/TLB/PAT 未初始化 | 待复核 |
+| YGHV-001 | VMCB 布局与 AMD APM 不一致 | 已修复：字段/段属性对照 APM，VMRUN 通过 |
+| YGHV-002 | svm_core_init 真实路径（原 #if 0） | 已复核：真实路径跑通 |
+| YGHV-003 | trampoline 寄存器保存/恢复 | 已复核：栈偏移修复，心跳循环稳定 |
+| YGHV-004 | VMEXIT 不推进 RIP / 返回值写错 | 已复核：VMMCALL/STOP_INTERNAL 正常返回 |
+| YGHV-005 | cleanup 分配释放不匹配 / 无条件清 SVME | 部分完成：NPT 泄漏与 DriverUnload 已修；EFER.SVME 裸机恢复待复核 |
+| YGHV-006 | NPT 全物理 RWX | 待处理：16GB identity 仍是 RWX，未做权限收紧 |
+| YGHV-007 | VMMCALL 无认证 | 待处理：尚无调用方认证 |
+| YGHV-008 | NPT 权限 API 假成功 | 部分完成：2MB large-page perm 已实现；`range/translate` 仍 stub |
+| YGHV-009 | NPF event injection VALID 位 | 部分完成：NPF 恢复映射路径已验证；向 Guest 注入 #PF 未验证 |
+| YGHV-010 | ASID/TLB/PAT 未初始化 | 部分完成：`g_pat`/ASID/TLB 已配置；多 ASID 管理未做 |
+
+### 1.5 实际代码核对（2026-08-10 晚）
+
+- 正式构建只编译链接 `main.c svm_core.c npt_core.c vmexit.c vmmcall.c svm_trampoline.S`；`multi_core.c`、`loader_stealth.c`、`pool/*`、`test_*`、`min_drv.c` 均不进入 `yuanguard_hv.sys`。
+- `main.c` 当前只初始化 CPU0 + 单 VCPU + NPT/NPF 测试；`multi_core.c` 和 `svm_core_ipi_*` 存在但未被调用，多核未接线。
+- `svm_prepare_vcpu` 只开启 `INTERCEPT_VMRUN | INTERCEPT_VMMCALL`；`vmexit.c` 的 CPUID/MSR/CR handler 存在但当前不可达（拦截未开启）。
+- `vmmcall.c` 只实现 `HEARTBEAT/STOP_INTERNAL/VERSION/STATS`；`PROTECT_HANDLE/UNPROTECT/SCAN_PROCESS/READ_MEMORY/GET_CONFIG/SET_CONFIG/SHUTDOWN` 仅枚举，未实现。
+- NPT 单页 2MB 权限已实现并验证；`npt_set_page_perm_range` 仍假成功，`npt_translate` 返回 0，无 `npt_split_2mb_to_4kb`。
+- `loader_stealth.c` 未编译未调用；`stealth.c` 不存在；CPUID 隐身 handler 是死代码。
+- `tests/`、`mod/`、Java 层均不存在。
 
 ## 2. 后续 Phase（未开始）
 
@@ -42,3 +53,17 @@
 - [x] 本地完全重装 VMware 17.6.4（默认路径，跳过 Networking）——安装成功但无法解决 VM 启动崩溃
 - [ ] 后续调试通道：换机/KVM，或裸机验证（testsigning、min_drv 加载链、崩溃转储分析）
 - [ ] 验证串口管道假设：`Windows 10` VM 稳定运行中（`vhv.enable=TRUE`/USB 开/无调试管道），对照旧 VM 差异（`yuanhv_debug` 管道），决定下一步是否重建调试 VM
+
+## 3. 当前阶段结论（2026-08-10 晚）
+
+- [x] Phase 2a：SVM init + VMRUN 单核（10000 轮 VMMCALL 心跳）
+- [x] Phase 2b：NPT identity-map + NPF（16GB 映射 + 权限缺页注入）
+- [x] Phase 2c：多核 DPC（每核系统线程，双核 10000 轮心跳验证通过）
+- [ ] Phase 2d：物理机验证（未做）
+- [ ] Phase 3+：隐形/保护/Java 层（未开始）
+- [ ] R1 安全地基（代码已部分实现，VMware 嵌套环境阻塞验证）
+- [x] v22 稳定基线恢复（v7 路径 + 认证注入，双核心跳与卸载重载通过）
+- [x] R1 第一步：NPT translate/perm-range/split 安全单测（v25 验证通过）
+- [x] R1 第二步（VM 安全版）：NPT 权限注入/NPF 测试（v26 验证通过）
+- [ ] R1 第三步：小范围私有页剔除（VMCB/hsave，需裸机/KVM）
+- [ ] R1 第四步：NPT 自剔除 + 默认 NX（需裸机/KVM）

@@ -307,13 +307,15 @@ openspec/changes/yuanguard-hypervisor/
 
 ## 七、当前状态
 
-- [ ] 项目骨架创建
-- [ ] 可复用文件提取
-- [ ] 核心头文件编写
-- [ ] SVM 初始化 + VMRUN trampoline
-- [ ] NPT identity-map
-- [ ] VM Exit 基础分发
-- [ ] 后续 Phase...
+- [x] 项目骨架创建（`hv/` 已建；`mod/`、`tests/`、`vm/` 未建）
+- [x] 核心头文件编写（SVM/NPT/VMCB/control plane）
+- [x] SVM 初始化 + VMRUN trampoline（单核，10000 轮 VMMCALL 心跳）
+- [x] NPT identity-map（16GB + NPF 权限注入）
+- [x] VM Exit 基础分发（VMMCALL/NPF 可达；CPUID/MSR/CR 未开拦截）
+- [x] 多核 DPC（每核系统线程，双核 10000 轮心跳验证通过）
+- [ ] 安全地基（NPT 最小权限/VMMCALL 认证）
+- [ ] 隐形（loader_stealth 未编译、CPUID 隐身死代码）
+- [ ] 保护功能与 Java 层（均未开始）
 
 ---
 
