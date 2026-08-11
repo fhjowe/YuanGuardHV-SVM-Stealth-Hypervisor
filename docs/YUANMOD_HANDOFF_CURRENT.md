@@ -759,3 +759,19 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   归档 `D:\aaaaaavm\yuanguard_hv_v63_step12.sys`。
 - 三次崩溃均已有 dump/代码级根因：pop 顺序（0x7E）→ 同 bug 冻结 → RIP 覆写（0x101）；
   均未再加载验证。
+
+### 9.47 OS-as-Guest Phase A：第四次崩溃（仍 0x101）与“无拦截指令”修复（2026-08-11）
+
+- v63 实机再试仍蓝屏：**0x101 CLOCK_WATCHDOG_TIMEOUT**，处理器 1，与上次相同。
+- 根因（objdump 实锤）：`yghv_os_guest_main` 的 `__cpuidex(cpu_info,...)` 结果未使用，
+  **编译器整段删掉**，guest 循环只剩 `rdtsc + lock incl`，没有任何被拦截指令 →
+  永不 VMEXIT → guest IF=0 → core1 收不到时钟中断 → 看门狗。`volatile int cpu_info[4]`
+  仍被优化掉，无效。
+- 修复（`main.c`）：
+  - guest 循环改用内联 asm `cpuid` 并把 EAX 喂给共享计数（`InterlockedExchangeAdd`），
+    反汇编确认 `cpuid` 已保留；
+  - VMCB 拦截增加 `INTERCEPT_RDTSC` 作为兜底（vmexit 已有 RDTSC 分支推进 RIP）；
+  - 停止路径的 `cpuid` 也改内联 asm。
+- 构建：step12 v64 SHA256 `70D071622DF524FAC6603C8C9587BBB6D2195C593B74E68B5555277AE739072C`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v64_step12.sys`。
+- 现状：四次崩溃均有 dump/反汇编级根因并已修；v64 未加载。

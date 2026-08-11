@@ -627,16 +627,18 @@ static NTSTATUS yghv_cpuid_stealth_test(void) {
 }
 
 static __declspec(noinline) void yghv_os_guest_main(void) {
-    int cpu_info[4];
     volatile ULONG i;
+    uint32_t a, b, c, d;
 
     for (i = 0; i < 5000; i++) {
-        __cpuidex(cpu_info, 1, 0);
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                                 : "a"(1) : "memory");
+        InterlockedExchangeAdd(&g_os_guest_counter, a);
         (void)__rdtsc();
-        InterlockedIncrement(&g_os_guest_counter);
     }
     InterlockedExchange(&g_os_guest_stop, 1);
-    __cpuidex(cpu_info, 0, 0);
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                             : "a"(0) : "memory");
     for (;;) {
         __asm__ volatile("pause");
     }
@@ -667,7 +669,8 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     v->vmcb->state.rip = (uint64_t)yghv_os_guest_main;
     v->vmcb->state.rsp = 0;
     v->vmcb->control.general1_intercepts =
-        INTERCEPT_CPUID | INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+        INTERCEPT_CPUID | INTERCEPT_RDTSC |
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     v->vmcb->control.exception_intercepts = 0;
