@@ -531,6 +531,11 @@ int svm_core_enter_resident_current(uint32_t index) {
     svm_vcpu_t *vcpu = svm_core_get_vcpu(index);
     if (!vcpu) return STATUS_NOT_FOUND;
 
+    if (vcpu->resident_state == SVM_RESIDENT_STOPPING) {
+        vcpu->resident_state = SVM_RESIDENT_STOPPED;
+        return 0;
+    }
+
     vcpu->resident_state = SVM_RESIDENT_ACTIVE;
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
 
