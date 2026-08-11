@@ -642,3 +642,12 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - Step 10 非停止 2 核：RUNNING 后连续观察约 7 分钟（90s + 300s + 操作时间），主机始终响应，核 0/1 `% Processor Time` 均 100%（resident 持续运行），`bm persistent hb 2core running`；`sc stop` 干净回 `STOPPED`，无冻结/蓝屏。
   - 结论：**INTR/NMI/SHUTDOWN 拦截是裸机常驻冻结的关键修复路径**（此前 Step8b 同配置 2 核纯心跳+yield 冻结；本版同配置 7 分钟稳定且可卸载）。
 - 残余与下一步：全核常驻/真实 workload（Step8 形态）未测；VM 回归（selftest/exit-test）待用户启动 VM；BIOS/microcode errata 风险仍在，若长跑复现再查 WHEA 日志。
+
+### 9.39 裸机常驻全矩阵验证（v53，2026-08-11）
+
+- 用户确认继续下一步：全核常驻纯心跳 + Step8 形态（全核常驻 + CPU0 workload）裸机长跑。
+- Step 9（全核常驻纯心跳 + INTR/NMI/SHUTDOWN 拦截）：构建 SHA256 `454CE0B3F1FEB507D39621238871CAB3356847EE38193A66B41A4871D0403800`；`sc start` RUNNING 后连续观察约 6.5 分钟（90s + 300s），主机始终响应，12 核均有活动，日志 `bm persistent hb running`；`sc stop` 干净回 `STOPPED`。此前 Step8a（同形态）冻结。
+- Step 8（全核常驻 + CPU0 持续写受保护页 + hook 调用 + 其余核纯心跳）：构建 SHA256 `A40B734E3E8CFED65BB935B4A553B0208E393109D3A2C257B1506901C7881319`；`sc start` RUNNING 后连续观察约 6.5 分钟，主机始终响应，日志 `bm persistent running`；`sc stop` 干净回 `STOPPED`。此前 Step8（同形态）冻结。
+- 结论：**INTR/NMI/SHUTDOWN 拦截修复覆盖全部裸机常驻场景（2 核/全核、纯心跳/workload），每项约 6.5 分钟长跑稳定且可卸载**；裸机常驻冻结问题基本关闭。
+- 归档：`D:\aaaaaavm\yuanguard_hv_v53_step9.sys`、`D:\aaaaaavm\yuanguard_hv_v53_step8.sys`（step9 归档件为重编译，SHA256 `31D3FFFCFA316D99...`，与测试件 `454CE0B3...` 同源，仅 PE 时间戳差异）。
+- 残余：VM 回归（selftest/exit-test）待用户启动 VM；小时级长跑与 BIOS/microcode errata 风险未排除；后续可选去掉 `ZwYieldExecution` 再做无 yield 常驻长跑，验证真实 OS-as-guest 形态。
