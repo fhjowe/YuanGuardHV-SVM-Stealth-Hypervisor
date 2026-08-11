@@ -120,6 +120,15 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         vcpu->regs.rcx = g_protect.pid;
         return 0;
 
+    case YGHV_CMD_HOOK_QUERY:
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        vcpu->regs.rax = yghv_protect_on_hook_query(
+            (uint8_t)vcpu->regs.rbx, vcpu->vmcb->state.cr3);
+        return 0;
+
     default:
         LOG_ERROR("Unknown VMMCALL cmd=0x%llx RIP=0x%llx",
             cmd, vcpu->vmcb->state.rip);
