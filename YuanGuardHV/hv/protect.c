@@ -55,22 +55,34 @@ void yghv_protect_cleanup(void) {
 
 NTSTATUS yghv_protect_set_target(uint32_t pid) {
     PEPROCESS proc = NULL;
-    NTSTATUS st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &proc);
+    uint64_t cr3;
+    NTSTATUS st;
+
+    if (g_protect.process) {
+        ObDereferenceObject(g_protect.process);
+        g_protect.process = NULL;
+        g_protect.cr3 = 0;
+        g_protect.pid = 0;
+    }
+
+    st = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)pid, &proc);
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect set_target: lookup pid %u failed 0x%x", pid, st);
         return st;
     }
-    g_protect.pid = pid;
-    g_protect.process = proc;
+
     /* KPROCESS.DirectoryTableBase on 19045 is at offset 0x028. */
-    g_protect.cr3 = *(volatile uint64_t *)((uint8_t *)proc + 0x028);
-    if (!g_protect.cr3) {
+    cr3 = *(volatile uint64_t *)((uint8_t *)proc + 0x028);
+    if (!cr3) {
         ObDereferenceObject(proc);
         LOG_ERROR("protect set_target: pid %u has no CR3", pid);
         return STATUS_INVALID_PARAMETER;
     }
+    g_protect.pid = pid;
+    g_protect.process = proc;
+    g_protect.cr3 = cr3;
     LOG_ERROR("protect target: pid=%u process=0x%llx cr3=0x%llx", pid,
-        (uint64_t)proc, g_protect.cr3);
+        (uint64_t)proc, cr3);
     return STATUS_SUCCESS;
 }
 
@@ -103,8 +115,11 @@ NTSTATUS yghv_protect_remove_page(uint64_t target_va) {
     uint32_t i;
     for (i = 0; i < g_protect.page_count; i++) {
         if (g_protect.pages[i].target_va == target_va) {
-            if (g_protect.pages[i].armed)
-                yghv_protect_disarm_page(&g_protect.pages[i]);
+            if (g_protect.pages[i].armed) {
+                int st = yghv_protect_disarm_page(&g_protect.pages[i]);
+                if (st)
+                    return (NTSTATUS)st;
+            }
             g_protect.pages[i] = g_protect.pages[g_protect.page_count - 1];
             g_protect.page_count--;
             return STATUS_SUCCESS;
@@ -123,7 +138,10 @@ yghv_protect_page_t *yghv_protect_find_page(uint64_t gpa) {
 }
 
 int yghv_protect_arm_page(yghv_protect_page_t *p) {
-    int st = npt_set_page_perm(&g_npt, p->gpa, NPT_PERM_PRESENT);
+    int st = npt_split_2mb_to_4kb(&g_npt, p->gpa);
+    if (st)
+        return st;
+    st = npt_set_page_perm(&g_npt, p->gpa, NPT_PERM_PRESENT);
     if (!st) p->armed = 1;
     return st;
 }
@@ -153,9 +171,18 @@ NTSTATUS yghv_protect_start(void) {
 
 NTSTATUS yghv_protect_stop(void) {
     uint32_t i;
-    for (i = 0; i < g_protect.page_count; i++)
-        if (g_protect.pages[i].armed)
-            yghv_protect_disarm_page(&g_protect.pages[i]);
+    NTSTATUS first_failure = STATUS_SUCCESS;
+    for (i = 0; i < g_protect.page_count; i++) {
+        if (g_protect.pages[i].armed) {
+            int st = yghv_protect_disarm_page(&g_protect.pages[i]);
+            if (st && first_failure == STATUS_SUCCESS) {
+                first_failure = (NTSTATUS)st;
+                LOG_ERROR("protect stop: disarm page %u failed 0x%x", i, st);
+            }
+        }
+    }
+    if (first_failure != STATUS_SUCCESS)
+        return STATUS_UNSUCCESSFUL;
     g_protect.active = FALSE;
     return STATUS_SUCCESS;
 }
