@@ -200,16 +200,6 @@ NTSTATUS yghv_protect_stop(void) {
 
 static uint8_t *g_hook_stub_pages[YGHV_PROTECT_MAX_HOOKS];
 
-/* clang-cl exposes no __readcr0/__writecr0 intrinsics on this toolchain. */
-static uint64_t yghv_read_cr0(void) {
-    uint64_t v;
-    __asm__ volatile("mov %%cr0, %0" : "=r"(v));
-    return v;
-}
-static void yghv_write_cr0(uint64_t v) {
-    __asm__ volatile("mov %0, %%cr0" :: "r"(v) : "memory");
-}
-
 static void yghv_emit_u8(uint8_t *p, uint8_t v) { *p = v; }
 static void yghv_emit_u64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
@@ -231,6 +221,7 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
     uint8_t patch[YGHV_PROTECT_PATCH_LEN];
     uint64_t func_pa, page_va, page_pa;
     uint8_t *orig;
+    uint8_t *wmap = NULL;
     yghv_protect_page_t *pp;
     yghv_protect_hook_t *h;
     NTSTATUS st;
@@ -286,10 +277,17 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
 
     /* patch function entry: 16-byte absolute jump -> stub */
     yghv_emit_abs_jmp16(patch, (uint64_t)stub);
-    uint64_t old_cr0 = yghv_read_cr0();
-    yghv_write_cr0(old_cr0 & ~(1ULL << 16));       /* clear CR0.WP */
-    RtlCopyMemory((void *)func_va, patch, YGHV_PROTECT_PATCH_LEN);
-    yghv_write_cr0(old_cr0);
+    wmap = (uint8_t *)MmGetVirtualForPhysical(
+        (PHYSICAL_ADDRESS){ .QuadPart = page_pa });
+    if (!wmap) {
+        LOG_ERROR("protect hook %u: direct map of function page 0x%llx failed",
+            hook_id, page_pa);
+        st = STATUS_UNSUCCESSFUL;
+        goto fail;
+    }
+    RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), patch,
+        YGHV_PROTECT_PATCH_LEN);
+    KeInvalidateRangeAllCaches((PVOID)func_va, YGHV_PROTECT_PATCH_LEN);
 
     /* write-protect the function's page in NPT */
     st = npt_split_2mb_to_4kb(&g_npt, page_pa);
@@ -334,10 +332,11 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
 
 fail:
     npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-    old_cr0 = yghv_read_cr0();
-    yghv_write_cr0(old_cr0 & ~(1ULL << 16));
-    RtlCopyMemory((void *)func_va, h->original, YGHV_PROTECT_PATCH_LEN);
-    yghv_write_cr0(old_cr0);
+    if (wmap) {
+        RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), h->original,
+            YGHV_PROTECT_PATCH_LEN);
+        KeInvalidateRangeAllCaches((PVOID)func_va, YGHV_PROTECT_PATCH_LEN);
+    }
     if (g_hook_stub_pages[hook_id]) {
         ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
         g_hook_stub_pages[hook_id] = NULL;
@@ -347,10 +346,23 @@ fail:
 
 NTSTATUS yghv_protect_remove_hook(uint8_t hook_id) {
     yghv_protect_hook_t *h;
+    uint8_t *wmap;
+    uint64_t page_pa;
     NTSTATUS st;
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
     h = &g_protect_hooks[hook_id];
     if (!h->installed) return STATUS_NOT_FOUND;
+
+    page_pa = MmGetPhysicalAddress(
+        (PVOID)(h->func_va & ~(HV_PAGE_SIZE - 1))).QuadPart;
+    wmap = (uint8_t *)MmGetVirtualForPhysical(
+        (PHYSICAL_ADDRESS){ .QuadPart = page_pa });
+    if (!wmap) {
+        LOG_ERROR(
+            "protect remove hook %u: direct map of function page 0x%llx failed",
+            hook_id, page_pa);
+        return STATUS_UNSUCCESSFUL;
+    }
 
     /* remove the page from the NPF policy and restore NPT writable first */
     st = yghv_protect_remove_page(h->func_va);
@@ -360,10 +372,9 @@ NTSTATUS yghv_protect_remove_hook(uint8_t hook_id) {
         return st;
     }
 
-    uint64_t old_cr0 = yghv_read_cr0();
-    yghv_write_cr0(old_cr0 & ~(1ULL << 16));
-    RtlCopyMemory((void *)h->func_va, h->original, YGHV_PROTECT_PATCH_LEN);
-    yghv_write_cr0(old_cr0);
+    RtlCopyMemory(wmap + (h->func_va & (HV_PAGE_SIZE - 1)), h->original,
+        YGHV_PROTECT_PATCH_LEN);
+    KeInvalidateRangeAllCaches((PVOID)h->func_va, YGHV_PROTECT_PATCH_LEN);
     if (g_hook_stub_pages[hook_id]) {
         ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
         g_hook_stub_pages[hook_id] = NULL;
