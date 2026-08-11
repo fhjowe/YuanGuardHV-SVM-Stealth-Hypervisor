@@ -103,6 +103,7 @@ NTSTATUS yghv_protect_add_page(uint64_t target_va) {
     if (!g_protect.cr3)
         return STATUS_INVALID_PARAMETER;
     gpa = yghv_protect_guest_va_to_pa(g_protect.cr3, target_va);
+    gpa &= ~(uint64_t)0xFFFULL;
     if (!gpa) {
         LOG_ERROR("protect add_page: va 0x%llx not mapped", target_va);
         return STATUS_INVALID_ADDRESS;
