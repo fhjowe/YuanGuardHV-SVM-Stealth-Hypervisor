@@ -676,3 +676,19 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - `run.bat list-java` 能列出 java 进程；与 PowerShell `yghv_ctl.ps1 state` 交叉核对一致；`sc stop` 干净卸载。
 - 边界（已写入 README）：当前架构下真实进程代码仍跑 native，NPT/vmmcall 不会真正拦截它的写；本步交付的是真实目标接入的配置/页表通道与 Java 层基座。真实拦截需 OS-as-guest 里程碑。
 - 残余：Minecraft/Forge 实机接入未测；`protect` 目前按枚举页批量 add（部分页因 PTE 非 present 翻译失败属预期）；后续可加驱动侧“按目标 CR3 的合成写测试”验证 NPF 决策。
+
+### 9.42 v55：真实 Minecraft/Forge 目标接入修复（2026-08-11）
+
+- 用户选择直接用真实 Minecraft/Forge 进程测试；本机环境为 PCLN 启动的 Minecraft Forge 1.20.1（Forge 47.4.20，JDK 17 javaw.exe，PID 1788，用户名 Sejit，游戏目录 `Desktop\114514\.minecraft\versions\1.20.1-Forge_47.4.20`）。
+- 根因（实测定位）：
+  - `javaw.exe` 映像页多为 demand-paging，进程 PTE Present=0，驱动的 `yghv_protect_guest_va_to_pa()` 手工四级遍历返回 0（`STATUS_INVALID_ADDRESS` → Win32 0x3B）；`ReadProcessMemory` 能读但不保证让进程 PTE 变 Present；同一 VA 时而 PowerShell 可加、时而 Java 全失败，表现像瞬态。
+  - `set_target` 不清空上一目标页表，Sleepy 测试页占满 64 上限后 add-page 报 `STATUS_INSUFFICIENT_RESOURCES`（Win32 0x5AA）。
+- v55 修复（仅改 `YuanGuardHV/hv/protect.c`）：
+  - `add_page` 翻译改用 `KeStackAttachProcess(g_protect.process)` + `MmGetPhysicalAddress()`（内核自身页表翻译），首次失败时用 `MmCopyVirtualMemory(KernelMode)` 缺页调入 1 字节后重试；`#include <ntddk.h>` 改 `<ntifs.h>`（`KAPC_STATE/KeStackAttachProcess` 在 ntifs.h）。
+  - `set_target` 切换目标时先 disarm 已 armed 页并清零旧页表，任一 disarm 失败则返回 `STATUS_UNSUCCESSFUL` 不切换。
+  - 客户端（`YghvCtl.java`/`yghv_ctl_jni.c`）：枚举候选扩到 `maxPages*8`（512），用 `ReadProcessMemory` 预探测，add-page 只累计成功页并打印前 3 个失败错误码/地址；修复 JNI 候选缓冲区按 512 分配（曾因 64 分配堆溢出导致 JVM 崩溃）。
+- 构建：v55 默认版 SHA256 `2F94C4C467CC22715F28F49A3646E0319342D72D5D775D4D2CCF46E3868882C7`，归档 `D:\aaaaaavm\yuanguard_hv_v55.sys`。
+- 实机验证（Minecraft Forge PID=1788）：
+  - `run.bat protect 1788 64` → set-target OK、枚举 512 页、**add-page ok=64（全部 javaw 映像页）**、start OK、`state: active=1 pid=1788 page_count=64`。
+  - 60 秒常驻观察系统始终响应；`run.bat stop` disarm OK；`sc stop` 干净回 `STOPPED`；Minecraft 进程保留运行。
+- 边界不变：本步是真实目标接入/页表 arm 通道；真实写拦截仍需 OS-as-guest。
