@@ -125,6 +125,10 @@ typedef struct {
     volatile LONG npt_flush_pending;
     volatile LONG rearm_pending;
     volatile uint64_t rearm_gpa;
+    volatile LONG pause_requested;
+    volatile LONG pause_ack;
+    KEVENT pause_done_event;
+    KEVENT resume_event;
 } svm_vcpu_t;
 
 extern svm_vcpu_t *g_vcpus[SVM_MAX_CORES];
@@ -222,5 +226,7 @@ NTSTATUS svm_core_start_persistent_residents(ULONG online);
 void     svm_core_stop_all_residents(void);
 void     svm_core_wait_all_stopped(ULONG online);
 void     svm_core_wait_remote_ready(ULONG online);
+NTSTATUS svm_core_pause_residents_for_patch(void);
+void     svm_core_resume_residents(void);
 
 #endif

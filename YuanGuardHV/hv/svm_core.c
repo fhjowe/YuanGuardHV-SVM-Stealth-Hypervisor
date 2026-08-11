@@ -124,6 +124,8 @@ int svm_alloc_vcpu(uint32_t core_id, svm_vcpu_t **out) {
     vcpu = (svm_vcpu_t *)ExAllocatePoolWithTag(NonPagedPool, sizeof(svm_vcpu_t), YGHV_TAG);
     if (!vcpu) goto fail;
     RtlZeroMemory(vcpu, sizeof(svm_vcpu_t));
+    KeInitializeEvent(&vcpu->pause_done_event, NotificationEvent, FALSE);
+    KeInitializeEvent(&vcpu->resume_event, NotificationEvent, FALSE);
 
     /* VMCB — 4KB aligned physical page */
     vcpu->vmcb = (vmcb_t *)MmAllocateContiguousMemory(HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
@@ -555,6 +557,17 @@ int svm_core_enter_resident_current(uint32_t index) {
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
 
     while (vcpu->resident_state == SVM_RESIDENT_ACTIVE) {
+        if (vcpu->pause_requested) {
+            InterlockedExchange((volatile LONG *)&vcpu->pause_ack, 1);
+            KeSetEvent(&vcpu->pause_done_event, IO_NO_INCREMENT, FALSE);
+            KeWaitForSingleObject(&vcpu->resume_event, Executive, KernelMode,
+                                  FALSE, NULL);
+            KeResetEvent(&vcpu->resume_event);
+            KeResetEvent(&vcpu->pause_done_event);
+            InterlockedExchange((volatile LONG *)&vcpu->pause_ack, 0);
+            if (vcpu->resident_state != SVM_RESIDENT_ACTIVE)
+                break;
+        }
         if (vcpu->npt_flush_pending) {
             vcpu->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;
             InterlockedExchange((volatile LONG *)&vcpu->npt_flush_pending, 0);
@@ -654,6 +667,49 @@ void svm_core_stop_all_residents(void) {
                                 SVM_RESIDENT_STOPPING);
             LOG_INFO("Core %u marked STOPPING", i);
         }
+    }
+}
+
+NTSTATUS svm_core_pause_residents_for_patch(void) {
+    ULONG i;
+    ULONG requested = 0;
+    LARGE_INTEGER timeout;
+
+    for (i = 0; i < SVM_MAX_CORES; i++) {
+        svm_vcpu_t *v = g_vcpus[i];
+        if (!v || svm_core_resident_state(i) != SVM_RESIDENT_ACTIVE)
+            continue;
+        InterlockedExchange((volatile LONG *)&v->pause_requested, 1);
+        requested++;
+    }
+    if (!requested)
+        return STATUS_SUCCESS;
+
+    for (i = 0; i < SVM_MAX_CORES; i++) {
+        svm_vcpu_t *v = g_vcpus[i];
+        NTSTATUS st;
+        if (!v || !v->pause_requested)
+            continue;
+        timeout.QuadPart = -5 * 10000000LL;
+        st = KeWaitForSingleObject(&v->pause_done_event, Executive, KernelMode,
+                                   FALSE, &timeout);
+        if (st != STATUS_SUCCESS) {
+            LOG_ERROR("pause resident core %u timed out 0x%x", i, st);
+            svm_core_resume_residents();
+            return STATUS_TIMEOUT;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
+void svm_core_resume_residents(void) {
+    ULONG i;
+    for (i = 0; i < SVM_MAX_CORES; i++) {
+        svm_vcpu_t *v = g_vcpus[i];
+        if (!v || !v->pause_requested)
+            continue;
+        InterlockedExchange((volatile LONG *)&v->pause_requested, 0);
+        KeSetEvent(&v->resume_event, IO_NO_INCREMENT, FALSE);
     }
 }
 

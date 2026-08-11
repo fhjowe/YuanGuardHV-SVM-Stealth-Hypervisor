@@ -431,6 +431,203 @@ static void yghv_emit_abs_jmp16(uint8_t *p, uint64_t target) {
     p[13] = 0x90; p[14] = 0x90; p[15] = 0x90;  /* nop padding to 16 bytes */
 }
 
+static int yghv_decode_modrm(const uint8_t *p, size_t avail, size_t *pos) {
+    uint8_t modrm, mod, rm, sib;
+    if (*pos >= avail) return -1;
+    modrm = p[*pos];
+    (*pos)++;
+    mod = modrm >> 6;
+    rm = modrm & 7;
+    if (mod != 3 && rm == 4) {
+        if (*pos >= avail) return -1;
+        sib = p[*pos];
+        (*pos)++;
+        if (mod == 0 && (sib & 7) == 5) {
+            if (*pos + 4 > avail) return -1;
+            *pos += 4;
+        }
+    }
+    if (mod == 1) {
+        if (*pos >= avail) return -1;
+        (*pos)++;
+    } else if (mod == 2) {
+        if (*pos + 4 > avail) return -1;
+        *pos += 4;
+    } else if (mod == 0 && rm == 5) {
+        if (*pos + 4 > avail) return -1;
+        *pos += 4;
+    }
+    return 0;
+}
+
+/* Conservative x86-64 instruction length decoder. Returns 0 on any form it
+   cannot classify; callers reject such targets instead of guessing. */
+static int yghv_inst_len(const uint8_t *p, size_t avail) {
+    size_t pos = 0;
+    int rex = 0;
+    int prefixes = 0;
+    uint8_t b, op;
+
+    for (;;) {
+        if (pos >= avail) return 0;
+        b = p[pos];
+        if (b >= 0x40 && b <= 0x4F) {
+            if (rex) return 0;
+            rex = 1;
+            pos++;
+            continue;
+        }
+        if (b == 0x66 || b == 0x67 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
+            b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 || b == 0x64 ||
+            b == 0x65) {
+            if (++prefixes > 15) return 0;
+            pos++;
+            continue;
+        }
+        break;
+    }
+    if (pos >= avail) return 0;
+    op = p[pos];
+    pos++;
+
+    if (op == 0x62 || op == 0xC4 || op == 0xC5)
+        return 0;  /* EVEX/VEX prefixes: reject unknown forms */
+
+    if ((op >= 0x50 && op <= 0x5F) || (op >= 0x90 && op <= 0x9F) ||
+        (op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF) ||
+        op == 0x37 || op == 0x3F || op == 0x9B || op == 0xC3 || op == 0xC9 ||
+        op == 0xCB || op == 0xCC || op == 0xCE || op == 0xCF ||
+        op == 0xEC || op == 0xED || op == 0xEE || op == 0xEF ||
+        op == 0xF4 || op == 0xF5 || op == 0xF8 || op == 0xF9 || op == 0xFA ||
+        op == 0xFB || op == 0xFC || op == 0xFD) {
+        return (int)pos;
+    }
+    if ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xEB) {
+        if (pos + 1 > avail) return 0;
+        return (int)(pos + 1);
+    }
+    if (op == 0xE8 || op == 0xE9) {
+        if (pos + 4 > avail) return 0;
+        return (int)(pos + 4);
+    }
+    if (op >= 0xB0 && op <= 0xB7) {
+        if (pos + 1 > avail) return 0;
+        return (int)(pos + 1);
+    }
+    if (op >= 0xB8 && op <= 0xBF) {
+        if (pos + 8 > avail) return 0;
+        return (int)(pos + 8);
+    }
+    if (op >= 0xA0 && op <= 0xA3) {
+        size_t sz = (op & 1) ? 8 : 4;
+        if (pos + sz > avail) return 0;
+        return (int)(pos + sz);
+    }
+    if (op == 0xA8 || op == 0xA9) {
+        size_t sz = (op == 0xA8) ? 1 : 4;
+        if (pos + sz > avail) return 0;
+        return (int)(pos + sz);
+    }
+    if (op == 0x68 || op == 0x6A) {
+        size_t sz = (op == 0x68) ? 4 : 1;
+        if (pos + sz > avail) return 0;
+        return (int)(pos + sz);
+    }
+    if (op == 0xC2 || op == 0xCA) {
+        if (pos + 2 > avail) return 0;
+        return (int)(pos + 2);
+    }
+    if (op == 0xCD) {
+        if (pos + 1 > avail) return 0;
+        return (int)(pos + 1);
+    }
+    if (op == 0xE4 || op == 0xE5 || op == 0xE6 || op == 0xE7) {
+        if (pos + 1 > avail) return 0;
+        return (int)(pos + 1);
+    }
+
+    if (op == 0x0F) {
+        uint8_t op2;
+        if (pos >= avail) return 0;
+        op2 = p[pos];
+        pos++;
+        if (op2 >= 0x80 && op2 <= 0x8F) {
+            if (pos + 4 > avail) return 0;
+            return (int)(pos + 4);
+        }
+        if (op2 == 0x05 || op2 == 0x07 || op2 == 0x08 || op2 == 0x09 ||
+            op2 == 0x0B || op2 == 0x0D || op2 == 0x34 || op2 == 0x35 ||
+            op2 == 0x77 || op2 == 0xA2 || (op2 >= 0xC8 && op2 <= 0xCF)) {
+            return (int)pos;
+        }
+        if (op2 == 0x38 || op2 == 0x3A) {
+            size_t after = pos;
+            uint8_t op3;
+            if (pos >= avail) return 0;
+            op3 = p[pos];
+            pos++;
+            (void)op3;
+            if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
+            if (op2 == 0x3A) {
+                if (after + 1 > avail) return 0;
+                after++;
+            }
+            return (int)after;
+        }
+        if (op2 == 0x0F || op2 == 0xBA || op2 == 0xC0 || op2 == 0xC1 ||
+            op2 == 0xC4 || op2 == 0xC5) {
+            size_t after = pos;
+            if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
+            if (after + 1 > avail) return 0;
+            return (int)(after + 1);
+        }
+        {
+            size_t after = pos;
+            if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
+            return (int)after;
+        }
+    }
+
+    if (op == 0x69 || op == 0x6B || op == 0x80 || op == 0x81 || op == 0x83 ||
+        op == 0xC0 || op == 0xC1 || op == 0xC6 || op == 0xC7 || op == 0xF6 ||
+        op == 0xF7) {
+        size_t after = pos;
+        size_t imm = (op == 0x69 || op == 0x81 || op == 0xC7 || op == 0xF7)
+                         ? 4 : 1;
+        if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
+        if (after + imm > avail) return 0;
+        return (int)(after + imm);
+    }
+
+    {
+        size_t after = pos;
+        if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
+        return (int)after;
+    }
+}
+
+int yghv_protect_validate_hook_target(uint64_t func_va) {
+    const uint8_t *p;
+    size_t off = 0;
+    size_t avail;
+
+    if (!func_va)
+        return -1;
+    if ((func_va & (HV_PAGE_SIZE - 1)) > HV_PAGE_SIZE - YGHV_PROTECT_PATCH_LEN)
+        return -1;
+    p = (const uint8_t *)func_va;
+    avail = HV_PAGE_SIZE - (func_va & (HV_PAGE_SIZE - 1));
+    while (off < YGHV_PROTECT_PATCH_LEN) {
+        int len = yghv_inst_len(p + off, avail - off);
+        if (len <= 0)
+            return -1;
+        if (off + (size_t)len > YGHV_PROTECT_PATCH_LEN)
+            return -1;
+        off += (size_t)len;
+    }
+    return off == YGHV_PROTECT_PATCH_LEN ? 0 : -1;
+}
+
 NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
     NTSTATUS st;
     ExAcquireFastMutex(&g_protect_lock);
@@ -452,6 +649,10 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
     h = &g_protect_hooks[hook_id];
     if (h->installed) return STATUS_ALREADY_COMMITTED;
+    if (yghv_protect_validate_hook_target(func_va)) {
+        LOG_ERROR("protect hook %u: invalid target va=0x%llx", hook_id, func_va);
+        return STATUS_INVALID_PARAMETER;
+    }
 
     func_pa = MmGetPhysicalAddress((PVOID)func_va).QuadPart;
     page_va = func_va & ~(HV_PAGE_SIZE - 1);
@@ -508,9 +709,15 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
         st = STATUS_UNSUCCESSFUL;
         goto fail;
     }
+    st = svm_core_pause_residents_for_patch();
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect hook %u: patch rendezvous failed 0x%x", hook_id, st);
+        goto fail;
+    }
     RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), patch,
         YGHV_PROTECT_PATCH_LEN);
     KeInvalidateRangeAllCaches((PVOID)func_va, YGHV_PROTECT_PATCH_LEN);
+    svm_core_resume_residents();
 
     /* write-protect the function's page in NPT */
     st = npt_split_2mb_to_4kb(&g_npt, page_pa);
@@ -603,9 +810,16 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
         return st;
     }
 
+    st = svm_core_pause_residents_for_patch();
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect remove hook %u: patch rendezvous failed 0x%x",
+            hook_id, st);
+        return st;
+    }
     RtlCopyMemory(wmap + (h->func_va & (HV_PAGE_SIZE - 1)), h->original,
         YGHV_PROTECT_PATCH_LEN);
     KeInvalidateRangeAllCaches((PVOID)h->func_va, YGHV_PROTECT_PATCH_LEN);
+    svm_core_resume_residents();
     if (g_hook_stub_pages[hook_id]) {
         ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
         g_hook_stub_pages[hook_id] = NULL;

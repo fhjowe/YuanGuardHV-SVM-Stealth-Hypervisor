@@ -18,6 +18,7 @@ volatile int g_npt_test_active;
 volatile BOOLEAN g_persistent_mode = FALSE;
 void *g_guest_code_page = NULL;
 void *g_resident_workload_page = NULL;
+HANDLE g_hook_rendezvous_thread = NULL;
 uint64_t g_guest_hb_va = 0;
 uint64_t g_guest_npt_va = 0;
 HANDLE g_trace_file = NULL;
@@ -524,6 +525,100 @@ static NTSTATUS yghv_hook_resident_test(void) {
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+static NTSTATUS yghv_hook_boundary_test(void) {
+    void *buf;
+    uint64_t va;
+    int ok = 1;
+
+    buf = MmAllocateContiguousMemory(
+        HV_PAGE_SIZE * 2, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (!buf)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(buf, HV_PAGE_SIZE * 2);
+    va = ((uint64_t)buf + HV_PAGE_SIZE - 1) & ~(uint64_t)(HV_PAGE_SIZE - 1);
+
+    /* valid target: 16 NOPs then ret */
+    RtlFillMemory((void *)va, 16, 0x90);
+    *(uint8_t *)(va + 16) = 0xC3;
+    if (yghv_protect_validate_hook_target(va) != 0)
+        ok = 0;
+
+    /* patch region crossing the 4KB page boundary must be rejected */
+    if (yghv_protect_validate_hook_target(va + HV_PAGE_SIZE - 8) == 0)
+        ok = 0;
+
+    /* instruction stream crossing offset 16 (13 NOPs + E9 rel32) rejected */
+    RtlZeroMemory((void *)va, 32);
+    RtlFillMemory((void *)va, 13, 0x90);
+    *(uint8_t *)(va + 13) = 0xE9;
+    *(uint8_t *)(va + 17) = 0x01;
+    if (yghv_protect_validate_hook_target(va) == 0)
+        ok = 0;
+
+    LOG_ERROR("hook boundary test: %s", ok ? "PASS" : "FAIL");
+    MmFreeContiguousMemory(buf);
+    return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
+static VOID yghv_hook_rendezvous_thread(PVOID context) {
+    void *page;
+    uint64_t target_va;
+    LARGE_INTEGER delay;
+    ULONG pid;
+    NTSTATUS st_install, st_remove;
+    (void)context;
+
+    delay.QuadPart = -8 * 10000000LL;
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+
+    page = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE * 2, YGHV_TAG);
+    if (!page) {
+        LOG_ERROR("hook rendezvous test: alloc failed");
+        PsTerminateSystemThread(STATUS_INSUFFICIENT_RESOURCES);
+        return;
+    }
+    RtlZeroMemory(page, HV_PAGE_SIZE * 2);
+    target_va = ((uint64_t)page + HV_PAGE_SIZE - 1) &
+                ~(uint64_t)(HV_PAGE_SIZE - 1);
+    RtlFillMemory((void *)target_va, 16, 0x90);
+    *(uint8_t *)(target_va + 16) = 0xC3;
+
+    yghv_protect_get_state(NULL, &pid, NULL);
+    if (pid == 0)
+        yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+
+    st_install = yghv_protect_install_hook(1, target_va);
+    LOG_ERROR("hook rendezvous test: install rc=0x%x", st_install);
+    delay.QuadPart = -1000 * 10000LL;
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    st_remove = yghv_protect_remove_hook(1);
+    LOG_ERROR("hook rendezvous test: remove rc=0x%x", st_remove);
+    LOG_ERROR("hook rendezvous test: %s",
+        (NT_SUCCESS(st_install) && NT_SUCCESS(st_remove)) ? "PASS" : "FAIL");
+
+    ExFreePoolWithTag(page, YGHV_TAG);
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+static void yghv_hook_rendezvous_join(void) {
+    PETHREAD thread_obj = NULL;
+    NTSTATUS status;
+    if (!g_hook_rendezvous_thread)
+        return;
+    status = ObReferenceObjectByHandle(
+        g_hook_rendezvous_thread, THREAD_ALL_ACCESS, *PsThreadType,
+        KernelMode, (PVOID *)&thread_obj, NULL);
+    if (NT_SUCCESS(status) && thread_obj) {
+        KeWaitForSingleObject(thread_obj, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(thread_obj);
+    } else {
+        LOG_ERROR("hook rendezvous: ObReferenceObjectByHandle failed 0x%x",
+            status);
+    }
+    ZwClose(g_hook_rendezvous_thread);
+    g_hook_rendezvous_thread = NULL;
+}
+
 static NTSTATUS yghv_make_guest_code_executable(void) {
     uint64_t pa = MmGetPhysicalAddress(g_guest_code_page).QuadPart;
     NTSTATUS st = npt_split_2mb_to_4kb(&g_npt, pa);
@@ -541,6 +636,7 @@ static void yghv_init_auth_cookie(void) {
 }
 
 void DriverUnload(struct _DRIVER_OBJECT *d) {
+    yghv_hook_rendezvous_join();
     g_npt_test_active = 0;
     svm_core_stop_all_residents();
     svm_core_wait_all_stopped(g_vcpu_count);
@@ -792,6 +888,19 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         return STATUS_UNSUCCESSFUL;
     }
 
+    if (!NT_SUCCESS(yghv_hook_boundary_test())) {
+        LOG_ERROR("protect hook boundary test failed");
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        KeRevertToUserAffinityThread();
+        return STATUS_UNSUCCESSFUL;
+    }
+
     /* Reset CPU0 to the heartbeat guest for the multi-core resident test. */
     svm_core_prepare_vcpu_other(0);
     yghv_trace("cpu0 reset");
@@ -938,6 +1047,15 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
     svm_core_wait_remote_ready(online);
     g_persistent_mode = TRUE;
+    {
+        NTSTATUS status = PsCreateSystemThread(
+            &g_hook_rendezvous_thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+            yghv_hook_rendezvous_thread, NULL);
+        if (!NT_SUCCESS(status)) {
+            LOG_ERROR("hook rendezvous: thread create failed 0x%x", status);
+            g_hook_rendezvous_thread = NULL;
+        }
+    }
     LOG_ERROR("persistent protect mode active: %u cores", online);
     KeRevertToUserAffinityThread();
     return STATUS_SUCCESS;
