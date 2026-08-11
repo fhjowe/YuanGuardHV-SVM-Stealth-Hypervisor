@@ -375,6 +375,7 @@ svm_os_guest_host_done:
     # restore it before jumping to the C cleanup path.
     mov     rax, qword ptr [rsp + 8]            # vcpu
     mov     rsp, qword ptr [rax + 0x40]         # vcpu->host_rsp (thread stack)
+    mov     rcx, rax
     lea     rax, [rip + yghv_os_guest_host_done]
     jmp     rax
 

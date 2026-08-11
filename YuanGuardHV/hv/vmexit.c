@@ -18,7 +18,8 @@ extern npt_mgr_t g_npt;
 extern uint64_t g_npt_test_pa;
 extern volatile int g_npt_test_active;
 extern volatile LONG g_os_guest_test_active;
-extern volatile LONG g_os_guest_stop;
+
+#define YGHV_OS_GUEST_EXIT_LIMIT 10000ULL
 
 static void svm_advance_rip(svm_vcpu_t *vcpu) {
     vcpu->vmcb->state.rip = vcpu->vmcb->control.next_rip;
@@ -38,7 +39,8 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     uint64_t exitcode = vcpu->vmcb->control.exitcode;
 
     vcpu->resident_exits++;
-    if (g_os_guest_test_active && g_os_guest_stop)
+    if (g_os_guest_test_active &&
+        vcpu->resident_exits >= YGHV_OS_GUEST_EXIT_LIMIT)
         return 1;
 
     switch (exitcode) {

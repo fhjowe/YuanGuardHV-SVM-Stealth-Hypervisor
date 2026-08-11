@@ -807,3 +807,16 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `mov ecx,edi` 截断 vcpu 指针（0x139）。
 - 下一步 Phase B：全核 OS guest + OS profile 拦截矩阵；Phase C：真实 hook/NPF；
   Phase D：整机隐形与 R1。
+
+### 9.50 Phase B step13：双核 OS-guest 有界试点实机通过（2026-08-11）
+
+- 机制调整：guest 停止改由 host 按每核退出次数限停（`YGHV_OS_GUEST_EXIT_LIMIT=10000`），
+  不再依赖 guest 全局 stop 旗标；`yghv_os_guest_thread` 参数化为 core，host_done
+  改为带 `vcpu` 参数、按 `resident_index` 触发每核完成事件。
+- step13（2 核，core1/2）：实机 `sc start` RUNNING，日志
+  `os guest thread enter=1/2` → `os guest host done=1/2` →
+  `os guest c1 exits=0x2710`、`c2 exits=0x2710`、`os guest counter=0x2710` →
+  `bm os guest multi done`；`sc stop` 干净回 STOPPED，无蓝屏/冻结。
+- 构建：step13 v67 SHA256 `A45850CB25B2677D05687617593856AAF82E9ADC6A59DDCE47EBC20FA0BFF971`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v67_step13.sys`。
+- 下一步：step13b 全核（12 核）OS-guest 有界试点 → step14 无缝全核 OS 常驻（真正 OS-as-guest）。

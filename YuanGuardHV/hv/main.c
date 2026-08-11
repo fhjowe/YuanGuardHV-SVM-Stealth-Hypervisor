@@ -29,10 +29,9 @@ uint64_t g_guest_hb_va = 0;
 uint64_t g_guest_npt_va = 0;
 HANDLE g_trace_file = NULL;
 volatile LONG g_os_guest_test_active = 0;
-volatile LONG g_os_guest_stop = 0;
 volatile LONG g_os_guest_counter = 0;
 volatile ULONG64 g_os_guest_cpuid_acc = 0;
-static KEVENT g_os_guest_done_event;
+static KEVENT g_os_guest_done_events[SVM_MAX_CORES];
 
 extern const uint8_t svm_trampoline_test_guest[];
 extern const uint8_t svm_trampoline_test_guest_resume[];
@@ -628,40 +627,35 @@ static NTSTATUS yghv_cpuid_stealth_test(void) {
 }
 
 static __declspec(noinline) void yghv_os_guest_main(void) {
-    volatile ULONG i;
     uint32_t a, b, c, d;
 
-    for (i = 0; i < 5000; i++) {
+    for (;;) {
         __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
                                  : "a"(1) : "memory");
         InterlockedIncrement(&g_os_guest_counter);
         g_os_guest_cpuid_acc += a;
         (void)__rdtsc();
     }
-    InterlockedExchange(&g_os_guest_stop, 1);
-    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
-                             : "a"(0) : "memory");
-    for (;;) {
-        __asm__ volatile("pause");
-    }
 }
 
-__declspec(noinline) __declspec(noreturn) void yghv_os_guest_host_done(void) {
-    yghv_trace("os guest host done");
-    g_os_guest_test_active = 0;
-    KeSetEvent(&g_os_guest_done_event, IO_NO_INCREMENT, FALSE);
+__declspec(noinline) __declspec(noreturn)
+void yghv_os_guest_host_done(svm_vcpu_t *vcpu) {
+    uint32_t core = vcpu ? vcpu->resident_index : 0;
+    yghv_trace_u64("os guest host done", core);
+    if (core < SVM_MAX_CORES)
+        KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
 static VOID yghv_os_guest_thread(PVOID ctx) {
+    uint32_t core = (uint32_t)(uintptr_t)ctx;
     svm_vcpu_t *v;
-    uint32_t core = 1;
-    (void)ctx;
 
     KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
     v = svm_core_get_vcpu(core);
     if (!v || g_vcpu_count <= core) {
-        KeSetEvent(&g_os_guest_done_event, IO_NO_INCREMENT, FALSE);
+        if (core < SVM_MAX_CORES)
+            KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
         PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
     }
 
@@ -678,11 +672,13 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     v->vmcb->control.exception_intercepts = 0;
     v->vmcb->control.tlb_control = 0;
     v->vmcb->control.vmcb_clean_bits = 0;
+    v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
-    yghv_trace("os guest thread enter");
+    yghv_trace_u64("os guest thread enter", core);
     svm_trampoline_os_enter(v);
     /* Trampoline exits via yghv_os_guest_host_done; this is a fallback. */
-    KeSetEvent(&g_os_guest_done_event, IO_NO_INCREMENT, FALSE);
+    if (core < SVM_MAX_CORES)
+        KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -695,7 +691,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 12)
+    if (step > 13)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -891,24 +887,74 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         LARGE_INTEGER timeout;
 
         yghv_trace("bm os guest start");
-        KeInitializeEvent(&g_os_guest_done_event, NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
         g_os_guest_test_active = 1;
-        g_os_guest_stop = 0;
         g_os_guest_counter = 0;
         st12 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
-                                    NULL, yghv_os_guest_thread, NULL);
+                                    NULL, yghv_os_guest_thread,
+                                    (PVOID)(uintptr_t)1);
         if (!NT_SUCCESS(st12)) {
             LOG_ERROR("bm step 12: thread create failed 0x%x", st12);
             return st12;
         }
         timeout.QuadPart = -60LL * 10000000LL;
-        st12 = KeWaitForSingleObject(&g_os_guest_done_event, Executive,
+        st12 = KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
                                      KernelMode, FALSE, &timeout);
         ZwClose(thread);
+        g_os_guest_test_active = 0;
         yghv_trace_u64("os guest counter", g_os_guest_counter);
         yghv_trace("bm os guest done");
         if (st12 == STATUS_TIMEOUT)
             return st12;
+        return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    }
+
+    if (step == 13) {
+        ULONG i;
+        ULONG j;
+        ULONG bm_cores = 2;
+        HANDLE threads[SVM_MAX_CORES] = { 0 };
+        LARGE_INTEGER timeout;
+        NTSTATUS st13 = STATUS_SUCCESS;
+
+        yghv_trace("bm os guest multi start");
+        g_os_guest_test_active = 1;
+        g_os_guest_counter = 0;
+        timeout.QuadPart = -60LL * 10000000LL;
+        for (i = 1; i <= bm_cores; i++) {
+            KeInitializeEvent(&g_os_guest_done_events[i], NotificationEvent, FALSE);
+            st13 = PsCreateSystemThread(&threads[i], THREAD_ALL_ACCESS, NULL,
+                                        NULL, NULL, yghv_os_guest_thread,
+                                        (PVOID)(uintptr_t)i);
+            if (!NT_SUCCESS(st13)) {
+                LOG_ERROR("bm step 13: thread core %u failed 0x%x", i, st13);
+                break;
+            }
+        }
+        if (!NT_SUCCESS(st13)) {
+            g_os_guest_test_active = 0;
+            for (j = 1; j <= bm_cores; j++)
+                if (threads[j]) ZwClose(threads[j]);
+            return st13;
+        }
+        for (i = 1; i <= bm_cores; i++) {
+            st13 = KeWaitForSingleObject(&g_os_guest_done_events[i], Executive,
+                                         KernelMode, FALSE, &timeout);
+            if (st13 == STATUS_TIMEOUT)
+                break;
+        }
+        for (i = 1; i <= bm_cores; i++)
+            if (threads[i]) ZwClose(threads[i]);
+        g_os_guest_test_active = 0;
+        for (i = 1; i <= bm_cores; i++) {
+            if (!g_vcpus[i]) continue;
+            yghv_trace_u64(i == 1 ? "os guest c1 exits" : "os guest c2 exits",
+                           g_vcpus[i]->resident_exits);
+        }
+        yghv_trace_u64("os guest counter", g_os_guest_counter);
+        yghv_trace("bm os guest multi done");
+        if (st13 == STATUS_TIMEOUT)
+            return st13;
         return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
     }
 
