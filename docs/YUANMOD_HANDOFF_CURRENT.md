@@ -93,6 +93,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | 用户确认第 4 项：目标进程生命周期（EPROCESS 校验、退出自动 disarm、PID 复用防护）v35 | 当前 set_target 无退出监控，目标退出后页仍武装、CR3 可能被复用 | `PsSetCreateProcessNotifyRoutineEx` 退出回调按 EPROCESS 身份清除；`g_persistent_mode` 让 auto-disarm 不退出 resident；新增 exit-test 工具验证 |
 | 2026-08-11 | 用户确认第 4 项改用 v36 轮询方案 | VM 的 ntoskrnl 对测试签名驱动调用 `PsSetCreateProcessNotifyRoutine`/`Ex` 都返回 0xC000007A 且残留回调，两次 0xCE | 删除进程通知注册；HEARTBEAT 每 10000 次退出用 `PsGetProcessExitTime`（MmGetSystemRoutineAddress 动态解析）轮询目标退出，命中则自动 disarm |
 | 2026-08-11 | 用户确认第 5 项 hook 加固 v38：页边界/指令边界校验 + 跨核 rendezvous | 现有 install_hook 直接覆盖 16 字节，无边界校验；运行时 hook 无跨核保护 | install_hook 增加边界校验；resident 循环协作暂停（pause_requested/ack + 事件）后写入补丁；新增负向测试与运行时 rendezvous 测试线程 |
+| 2026-08-11 | 用户确认第 6 项控制面安全 v39：管理命令限制调用方 CPL/CR3 | IOCTL 设备 FILE_ANY_ACCESS、任意进程可下发；VMMCALL 仅 cookie 认证 | IOCTL 句柄级绑定打开者 EPROCESS+CR3；VMMCALL 管理命令增加 cpl==0 && cr3==g_control_cr3 |
 
 ## 7. 变更日志
 
@@ -109,6 +110,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | `YuanGuardHV/hv/{protect.c,vmexit.c,vmmcall.c,control_device.c,main.c,common/svm_vcpu.h,common/protect.h}`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task C：NPT 共享状态加锁 v34 | 构建 SUCCESS + VM 验证通过（含并发 selftest） |
 | 2026-08-11 | `YuanGuardHV/hv/{protect.c,main.c,vmmcall.c,common/protect.h}`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task D：目标进程生命周期（v35-v37，最终为 KeWaitForSingleObject 轮询判活） | 构建 SUCCESS + VM 验证通过（selftest + exit-test） |
 | 2026-08-11 | `YuanGuardHV/hv/{protect.c,main.c,svm_core.c,common/svm_vcpu.h,common/protect.h}` | Phase 3 下一步 Task E：hook 加固（页/指令边界校验 + 跨核 rendezvous）v38 | 构建 SUCCESS + VM 验证通过（boundary + rendezvous + selftest/exit-test） |
+| 2026-08-11 | `YuanGuardHV/hv/{control_device.c,vmmcall.c,main.c,common/control_plane.h}` | Phase 3 下一步 Task F：控制面安全（CPL/CR3）v39 | 构建 SUCCESS + VM 验证通过（selftest/exit-test 回归，无 unauthorized 拒绝） |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -534,3 +536,13 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v38 SHA256 `DD9F76E2D09DC1D1953D3848461982C260E2638A7685A8CAC208EF8B09264D26`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v38.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v38.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
 - 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD 日志 `hook boundary test: PASS`、`hook rendezvous test: install rc=0x0 / remove rc=0x0 / PASS`（persistent 运行期间对独立池页 install/remove hook 1，pause/resume 生效）；workload 心跳持续滚动（4.6M+）；卸载回 `STOPPED`，无蓝屏。
 - 结论：第 5 项完成。install_hook 增加页边界 + 指令边界校验；install/remove 补丁写入走协作式跨核暂停（VMRUN 边界，超时 5s）。残余项为控制面认证（第 6 项）与 R1 私有页/NX（裸机/KVM）。
+
+### 9.32 Phase 3 下一步 Task F：控制面安全（2026-08-11）
+
+- 用户确认方案：
+  - `control_device.c`：IRP_MJ_CREATE 用 `IoGetRequestorProcess` 捕获打开者 `EPROCESS` + `DirectoryTableBase`（0x028），存入 `FileObject->FsContext`；每个 DEVICE_CONTROL 校验请求进程与当前 CR3 都等于句柄所有者，否则 `STATUS_ACCESS_DENIED`；IRP_MJ_CLEANUP 释放上下文。
+  - `control_plane.h`/`vmmcall.c`/`main.c`：新增 `g_control_cr3`（`svm_core_init()` 后从 `g_vcpus[0]->vmcb->state.cr3` 捕获）；`yghv_vmmcall_authorized(vcpu)` = cookie + `cpl==0` + `cr3==g_control_cr3`，用于 SET_TARGET/ADD_PAGE/REMOVE_PAGE/START/STOP/GET_STATE/HOOK_QUERY/STOP_INTERNAL/SHUTDOWN；HEARTBEAT/VERSION/STATS 保持开放。
+- 范围：不加 token/提权校验（记入残余项）；客户端每进程开自己的句柄，无需改动。
+- 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v39 SHA256 `B2BAE80BC6F7A9519A69A053ACE65DE730C0DDC694E61627B2430604906B104F`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v39.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v39.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。构建中修复：`IoGetRequestorProcess` 在所用 WDK 头未声明，补 `NTKERNELAPI` 前向声明。
+- 验证（2026-08-11，VM 双核）：`sc start` RUNNING；KD `control cr3=0x1ad000`；`selftest: PASS`；`exit-test: PASS`；`hook boundary test: PASS`；`hook rendezvous test: install rc=0x0 / remove rc=0x0 / PASS`；全程无 `unauthorized caller` 拒绝日志（各客户端进程用自己的句柄，句柄级 CR3 绑定未误伤）；卸载回 `STOPPED`，无蓝屏。
+- 结论：第 6 项完成。IOCTL 每个句柄绑定打开者 EPROCESS+CR3；VMMCALL 管理命令要求 cookie + cpl==0 + cr3==g_control_cr3。残余：token/提权校验、R1 私有页/NX（裸机/KVM）、隐形、Java 层、真实系统 hook。
