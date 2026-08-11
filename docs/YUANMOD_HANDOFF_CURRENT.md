@@ -868,3 +868,14 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 里程碑：**单核/双核/全核的 OS-guest 有界 + 无缝延续机制全部实机通过**。
 - 下一步：step17 全核无缝常驻（真正 OS-as-guest），需先设计卸载/devirtualize，
   全程最高风险。
+
+### 9.55 step17 设计文档（2026-08-12）
+
+- 新增 `docs/superpowers/plans/2026-08-11-os-as-guest-step17.md`：
+  - 每核真实上下文经 `svm_os_seamless_cont` 无缝进入，常驻线程 guest 内永久阻塞；
+  - OS profile 拦截矩阵：NPF/VMMCALL/CPUID/SHUTDOWN 开，INTR/NMI/RDTSC/MSR/CR 关；
+  - 未知 VMEXIT 不再停机，日志后继续；
+  - **卸载/devirtualize 未实现**：停止 VMRUN 会丢弃 guest 内线程上下文，
+    step17 验证只能“加载→观察→重启清除”；`sc stop` 会挂起，不接受；
+  - 测试顺序：17a 单核常驻（IF=1，30-60 秒观察后重启）→ 17b 全核常驻。
+- 状态：设计已定，待用户确认后实现 step17a。
