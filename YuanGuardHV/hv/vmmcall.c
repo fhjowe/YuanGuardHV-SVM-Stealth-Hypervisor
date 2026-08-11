@@ -3,6 +3,7 @@
 #include "svm_vcpu.h"
 #include "vmcb.h"
 #include "control_plane.h"
+#include "protect.h"
 #include "debug.h"
 
 #define YUANGUARD_VERSION 0x00010000
@@ -61,6 +62,53 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         vcpu->regs.rbx = vcpu->resident_msr_exits;
         vcpu->regs.rcx = vcpu->resident_cr_exits;
         vcpu->regs.rdx = vcpu->resident_interrupt_exits;
+        return 0;
+
+    case YGHV_CMD_SET_TARGET:
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        vcpu->regs.rax = (uint64_t)yghv_protect_set_target((uint32_t)vcpu->regs.rdx);
+        return 0;
+
+    case YGHV_CMD_ADD_PAGE:
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        vcpu->regs.rax = (uint64_t)yghv_protect_add_page(vcpu->regs.rdx);
+        return 0;
+
+    case YGHV_CMD_REMOVE_PAGE:
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        vcpu->regs.rax = (uint64_t)yghv_protect_remove_page(vcpu->regs.rdx);
+        return 0;
+
+    case YGHV_CMD_START_PROTECT:
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        vcpu->regs.rax = (uint64_t)yghv_protect_start();
+        return 0;
+
+    case YGHV_CMD_STOP_PROTECT:
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        yghv_protect_stop();
+        vcpu->regs.rax = YGHV_STATUS_OK;
+        return 0;
+
+    case YGHV_CMD_GET_STATE:
+        vcpu->regs.rax = g_protect.active ? 1 : 0;
+        vcpu->regs.rbx = g_protect.page_count;
+        vcpu->regs.rcx = g_protect.pid;
         return 0;
 
     default:
