@@ -832,3 +832,13 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 修一个构建坑：`RtlStringCchPrintfA` 在 /Zl 无 CRT 链接下引入
   `__stdio_common_vsprintf` 未解析符号，step14 日志改为顺序 `os guest exits`。
 - 下一步：无缝全核 OS 常驻（真正把整个 Windows 放进 guest，最高风险项）需单独立项设计。
+
+### 9.52 Phase B step15：单核无缝延续有界试点（2026-08-11，待实机加载）
+
+- 新增 `svm_os_seamless_cont` 标签：guest 从该标签 `ret` 回 trampoline 调用者，
+  调用者后续代码在 guest mode 中继续（无缝延续语义）。
+- 新增 `yghv_os_guest_seamless_thread` + step15：core1 单核有界无缝版，5000 次
+  CPUID/RDTSC，host 按 10000 次退出限停。
+- 设计文档：`docs/superpowers/plans/2026-08-11-os-as-guest-step15.md`。
+- 构建：step15 v69 SHA256 `B7F18153DFE727881C85E0AB28BB8D9BD9288C21B3725FF9F8C31D518E8C7CE4`。
+- 状态：编译通过，未加载；step16 全核无缝常驻为最高风险项（卸载/devirtualize 未实现）。

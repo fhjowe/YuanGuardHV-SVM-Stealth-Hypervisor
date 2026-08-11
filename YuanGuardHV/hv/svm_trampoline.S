@@ -379,6 +379,13 @@ svm_os_guest_host_done:
     lea     rax, [rip + yghv_os_guest_host_done]
     jmp     rax
 
+# --- Seamless guest continuation ---
+# When entered with this RIP, the guest simply returns to the caller of
+# svm_trampoline_os_enter, so that caller's code continues in guest mode.
+    .globl svm_os_seamless_cont
+svm_os_seamless_cont:
+    ret
+
 # --- Context proof trampoline (stub) ---
     .globl svm_vmrun_context_proof
 svm_vmrun_context_proof:
