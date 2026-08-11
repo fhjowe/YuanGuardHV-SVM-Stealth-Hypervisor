@@ -363,6 +363,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 状态：VMware 内 R1 安全部分（API 单测 + NPF 触发/恢复）验证完成；私有页剔除与 NPT 自剔除仍建议留给裸机/KVM。
 - 2026-08-11 固化：v26 作为当前可信基线，git 提交检查点，覆盖 v22→v26 全部调试与修复记录。
 - 2026-08-11 Phase 3 设计：方案 A 已确认；AMD SVM 无 RET 拦截，终止/句柄保护修订为补丁 stub + VMMCALL 决策 + NPT 写保护，正式设计见 `docs/superpowers/specs/2026-08-11-phase3-protection-design.md`。
+- 2026-08-11 Phase 3 实现计划：见 `docs/superpowers/plans/2026-08-11-phase3-protection.md`；计划中终止/句柄第一版先用导出函数 `NtTerminateProcess`/`NtOpenProcess` 跑通 stub 链路，`PspTerminateProcess`/`ObpCreateHandle` 模式扫描作为后续增强。
 
 ### 9.19 Phase 2c 多核接线实现（2026-08-10）
 
