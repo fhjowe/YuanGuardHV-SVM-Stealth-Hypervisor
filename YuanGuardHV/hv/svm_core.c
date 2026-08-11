@@ -527,16 +527,30 @@ int svm_core_prepare_resident(uint32_t count) {
     return STATUS_SUCCESS;
 }
 
+int svm_resident_try_activate(svm_vcpu_t *vcpu) {
+    LONG old;
+
+    do {
+        old = InterlockedCompareExchange(
+            (volatile LONG *)&vcpu->resident_state,
+            SVM_RESIDENT_ACTIVE, -1);   /* probe: no change */
+        if (old == SVM_RESIDENT_STOPPING) {
+            InterlockedExchange((volatile LONG *)&vcpu->resident_state,
+                                SVM_RESIDENT_STOPPED);
+            return 0;
+        }
+    } while (InterlockedCompareExchange(
+                 (volatile LONG *)&vcpu->resident_state,
+                 SVM_RESIDENT_ACTIVE, old) != old);
+    return 1;
+}
+
 int svm_core_enter_resident_current(uint32_t index) {
     svm_vcpu_t *vcpu = svm_core_get_vcpu(index);
     if (!vcpu) return STATUS_NOT_FOUND;
 
-    LONG old = InterlockedCompareExchange(
-        (volatile LONG *)&vcpu->resident_state, SVM_RESIDENT_ACTIVE, SVM_RESIDENT_OFF);
-    if (old == SVM_RESIDENT_STOPPING) {
-        vcpu->resident_state = SVM_RESIDENT_STOPPED;
+    if (!svm_resident_try_activate(vcpu))
         return 0;
-    }
 
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
 
@@ -551,7 +565,8 @@ int svm_core_enter_resident_current(uint32_t index) {
         vcpu->resident_state, vcpu->resident_exits);
 
     /* Devirtualize */
-    vcpu->resident_state = SVM_RESIDENT_STOPPED;
+    InterlockedExchange((volatile LONG *)&vcpu->resident_state,
+                        SVM_RESIDENT_STOPPED);
     vcpu->vmcb->control.general1_intercepts = 0;
     vcpu->vmcb->control.general2_intercepts = 0;
     vcpu->vmcb->control.np_enable = 0;

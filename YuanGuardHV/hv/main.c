@@ -729,6 +729,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         return (NTSTATUS)sv;
     }
     KeIpiGenericCall(svm_core_ipi_prepare_vcpu, 0);
+    svm_core_prepare_vcpu_other(0);
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;

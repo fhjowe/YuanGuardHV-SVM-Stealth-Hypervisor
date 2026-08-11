@@ -205,6 +205,7 @@ svm_vcpu_t *svm_core_get_vcpu(uint32_t index);
 
 /* Resident lifecycle */
 int  svm_core_prepare_resident(uint32_t count);
+int  svm_resident_try_activate(svm_vcpu_t *vcpu);
 int  svm_core_enter_resident_current(uint32_t index);
 int  svm_core_stop_resident_current(uint32_t index);
 int  svm_core_resident_state(uint32_t index);
