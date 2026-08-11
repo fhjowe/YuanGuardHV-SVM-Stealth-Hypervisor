@@ -651,3 +651,13 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 结论：**INTR/NMI/SHUTDOWN 拦截修复覆盖全部裸机常驻场景（2 核/全核、纯心跳/workload），每项约 6.5 分钟长跑稳定且可卸载**；裸机常驻冻结问题基本关闭。
 - 归档：`D:\aaaaaavm\yuanguard_hv_v53_step9.sys`、`D:\aaaaaavm\yuanguard_hv_v53_step8.sys`（step9 归档件为重编译，SHA256 `31D3FFFCFA316D99...`，与测试件 `454CE0B3...` 同源，仅 PE 时间戳差异）。
 - 残余：VM 回归（selftest/exit-test）待用户启动 VM；小时级长跑与 BIOS/microcode errata 风险未排除；后续可选去掉 `ZwYieldExecution` 再做无 yield 常驻长跑，验证真实 OS-as-guest 形态。
+
+### 9.40 默认版 v54 本机实机完整流程验证（2026-08-11）
+
+- 用户决定跳过 VM 回归，直接实机测试（最终运行目标即本机）。
+- 默认版 v54（无 `YGHV_BAREMETAL_STEP`/`YGHV_BAREMETAL_NO_RESIDENT`）：构建 SHA256 `F531C366A8B43688C1D368F2B8769174FBC7EA069176B62B4C832AA988A3F9C2`，归档 `D:\aaaaaavm\yuanguard_hv_v54.sys`。
+- 本机加载：`sc start yuanguard` → RUNNING；进度日志完整走到 `r1 unit pass` → `npt set ok` → NPT 测试（`npf test`）→ protect/hook 各 resident 测试 → 多核 `before/after heartbeat` → `all stopped`，全程无冻结。
+- 控制面回归（宿主侧 `yghv_ctl.ps1`）：`selftest: PASS`（pid=12652，set-target/add-page/start/user write-read 全 OK）；`exit-test: PASS`（child pid=2432 退出后自动 disarm）。
+- 常驻观察：selftest/exit-test 后保持常驻约 90 秒，系统始终响应；`sc stop` 干净回 `STOPPED`。
+- 结论：**完整产品流程（常驻模式 + IOCTL 控制设备 + 目标生命周期 + 干净卸载）已在本机实机通过**，裸机不再只是冒烟/有界测试。
+- 下一步候选：小时级实机长跑；真实目标进程接入（Java/Minecraft 通过 IOCTL）；R1 私有页剔除/NPT 自剔除/默认 NX 在本机启用验证。
