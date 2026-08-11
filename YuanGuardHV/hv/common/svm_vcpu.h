@@ -188,7 +188,7 @@ typedef struct {
 
 /* Assembly trampoline entry points */
 uint64_t svm_vmrun_trampoline(svm_vcpu_t *vcpu);
-uint64_t svm_trampoline_os_enter(svm_vcpu_t *vcpu);
+uint64_t svm_trampoline_os_enter(svm_vcpu_t *vcpu, int if1);
 int  svm_vmrun_context_proof(svm_vcpu_t *vcpu);
 void svm_vmrun_trampoline_poisoned(svm_vcpu_t *vcpu);
 int  svm_resident_enter(svm_vcpu_t *vcpu);

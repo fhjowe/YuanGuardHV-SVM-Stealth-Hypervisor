@@ -245,14 +245,18 @@ svm_trampoline_os_enter:
     push    r15
 
     mov     rax, rcx                   # vcpu
+    mov     r11, rdx                   # if1 (second arg)
     mov     rdx, rsp
     add     rdx, 120                   # original thread rsp
     mov     qword ptr [rax + 0x40], rdx # vcpu->host_rsp = guest stack base
 
-    # guest RFLAGS: preserve current, but clear IF for the bounded test
+    # guest RFLAGS: preserve current; clear IF only when if1 == 0
     pushfq
     pop     rdx
+    test    r11, r11
+    jnz     1f
     and     rdx, 0xFFFFFFFFFFFFFDFF
+1:
     mov     r11, qword ptr [rax]       # vcpu->vmcb
     mov     qword ptr [r11 + 0x570], rdx
 

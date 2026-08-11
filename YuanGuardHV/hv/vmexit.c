@@ -18,6 +18,7 @@ extern npt_mgr_t g_npt;
 extern uint64_t g_npt_test_pa;
 extern volatile int g_npt_test_active;
 extern volatile LONG g_os_guest_test_active;
+extern volatile BOOLEAN g_os_resident_mode;
 
 #define YGHV_OS_GUEST_EXIT_LIMIT 10000ULL
 
@@ -175,6 +176,12 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         return 1;
 
     default:
+        if (g_os_resident_mode) {
+            static ULONG resident_unknown_logged = 0;
+            if (resident_unknown_logged++ < 8)
+                LOG_ERROR("resident unknown exit: 0x%llx", exitcode);
+            return 0;
+        }
         LOG_ERROR("Unhandled exit: 0x%llx, info1=0x%llx, RIP=0x%llx",
             exitcode, vcpu->vmcb->control.exitinfo1, vcpu->vmcb->state.rip);
         LOG_ERROR("VMCB ctl: np=0x%llx ncr3=0x%llx asid=%u tlb=%u evinj=0x%llx nrip=0x%llx clean=0x%x",

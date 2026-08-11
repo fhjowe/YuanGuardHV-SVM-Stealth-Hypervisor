@@ -31,7 +31,9 @@ HANDLE g_trace_file = NULL;
 volatile LONG g_os_guest_test_active = 0;
 volatile LONG g_os_guest_counter = 0;
 volatile ULONG64 g_os_guest_cpuid_acc = 0;
+volatile BOOLEAN g_os_resident_mode = FALSE;
 static KEVENT g_os_guest_done_events[SVM_MAX_CORES];
+static KEVENT g_os_resident_stop_event;
 
 extern const uint8_t svm_trampoline_test_guest[];
 extern const uint8_t svm_trampoline_test_guest_resume[];
@@ -676,7 +678,7 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_trace_u64("os guest thread enter", core);
-    svm_trampoline_os_enter(v);
+    svm_trampoline_os_enter(v, 0);
     /* Trampoline exits via yghv_os_guest_host_done; this is a fallback. */
     if (core < SVM_MAX_CORES)
         KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
@@ -710,7 +712,7 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_trace_u64("os seamless enter", core);
-    svm_trampoline_os_enter(v);
+    svm_trampoline_os_enter(v, 0);
     /* Seamless continuation: this caller now runs in guest mode. */
     for (i = 0; i < 5000; i++) {
         __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
@@ -718,6 +720,43 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
         InterlockedIncrement(&g_os_guest_counter);
         (void)__rdtsc();
     }
+    for (;;) {
+        __asm__ volatile("pause");
+    }
+}
+
+static VOID yghv_os_guest_resident_thread(PVOID ctx) {
+    uint32_t core = (uint32_t)(uintptr_t)ctx;
+    svm_vcpu_t *v;
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    v = svm_core_get_vcpu(core);
+    if (!v || g_vcpu_count <= core) {
+        if (core < SVM_MAX_CORES)
+            KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
+    }
+    svm_prepare_vcpu(v, (uint64_t)svm_os_seamless_cont);
+    v->vmcb->state.rip = (uint64_t)svm_os_seamless_cont;
+    v->vmcb->state.rsp = 0;
+    v->vmcb->control.general1_intercepts =
+        INTERCEPT_CPUID | INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    v->vmcb->control.exception_intercepts = 0;
+    v->vmcb->control.tlb_control = 0;
+    v->vmcb->control.vmcb_clean_bits = 0;
+    v->resident_index = core;
+    svm_core_set_npt(core, g_npt.pml4_pa);
+    g_os_resident_mode = TRUE;
+    yghv_trace_u64("os resident enter", core);
+    if (core < SVM_MAX_CORES)
+        KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+    svm_trampoline_os_enter(v, 1);
+    /* Guest continuation: block forever so the scheduler keeps this core
+       running the rest of Windows in guest mode. */
+    KeWaitForSingleObject(&g_os_resident_stop_event, Executive,
+                          KernelMode, FALSE, NULL);
     for (;;) {
         __asm__ volatile("pause");
     }
@@ -732,7 +771,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 16)
+    if (step > 17)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -1122,6 +1161,29 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         if (st16 == STATUS_TIMEOUT)
             return st16;
         return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    }
+
+    if (step == 17) {
+        HANDLE thread;
+        NTSTATUS st17;
+
+        yghv_trace("bm os resident start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_resident_mode = TRUE;
+        st17 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st17)) {
+            LOG_ERROR("bm step 17: thread create failed 0x%x", st17);
+            g_os_resident_mode = FALSE;
+            return st17;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        yghv_trace("bm os resident running");
+        return STATUS_SUCCESS;
     }
 
     v->regs.rcx = g_vmmcall_auth_cookie;

@@ -879,3 +879,14 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
     step17 验证只能“加载→观察→重启清除”；`sc stop` 会挂起，不接受；
   - 测试顺序：17a 单核常驻（IF=1，30-60 秒观察后重启）→ 17b 全核常驻。
 - 状态：设计已定，待用户确认后实现 step17a。
+
+### 9.56 step17a：单核无缝常驻实现（2026-08-12，待实机加载）
+
+- `svm_trampoline_os_enter` 增加 `if1` 参数：if1=1 时保留 guest RFLAGS.IF
+  （OS 自己收中断）；既有 step12-16 传 0（IF=0 有界测试）。
+- 新增 `yghv_os_guest_resident_thread`：core1 常驻线程以 `svm_os_seamless_cont`
+  无缝进入 guest（IF=1、无退出上限），guest 内永久阻塞让调度器运行其它 Windows
+  线程；VMCB 只开 CPUID/SHUTDOWN/VMMCALL 拦截。
+- `vmexit.c`：`g_os_resident_mode=TRUE` 时未知 VMEXIT 日志后继续（不再停机）。
+- step17：创建常驻线程后 DriverEntry 返回 RUNNING；**不可卸载**，验证后重启清除。
+- 构建：step17 v71 SHA256 `CAC5B3ADC5F8ABBCBC200C27FB591753D3318734B1838BA3019D1601204FDD7D`。
