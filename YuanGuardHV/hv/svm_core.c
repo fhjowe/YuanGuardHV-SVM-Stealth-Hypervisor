@@ -260,7 +260,7 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
     ctrl->cr_write_intercepts = 0;
     ctrl->dr_read_intercepts = 0;
     ctrl->dr_write_intercepts = 0;
-    ctrl->exception_intercepts = 0;
+    ctrl->exception_intercepts = (1ULL << 1); /* #DB: single-step re-arm for NPT write protection */
 
     /* Bitmap base addresses */
     ctrl->msrpm_base_pa = vcpu->msrpm_pa;
