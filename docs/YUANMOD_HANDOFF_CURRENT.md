@@ -744,3 +744,18 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 构建：step12 v62 SHA256 `3975A99FDCA654136C826F9B9B938229721FC9864688CCEC065658164D8AB833`，
   归档 `D:\aaaaaavm\yuanguard_hv_v62_step12.sys`。
 - 状态：根因已修，未再加载；下次加载仍有进一步风险（首次真实 OS 进 guest）。
+
+### 9.46 OS-as-Guest Phase A：第三次崩溃（0x101）与 RIP 覆写修复（2026-08-11）
+
+- v62 实机再试仍蓝屏：**0x101 CLOCK_WATCHDOG_TIMEOUT**，挂起处理器 index=1
+  （测试核），bucket `CLOCK_WATCHDOG_TIMEOUT_INTERRUPTS_DISABLED`。
+- 根因（代码审查 + dump 交叉确认）：`svm_prepare_vcpu()` 末尾执行
+  `yg_svm_vmsave(vcpu->vmcb_pa)`，会把**当前 RIP/RSP 覆写进 VMCB state 区**；
+  其它测试都在 prepare 后重新设置 `state.rip`，而 `yghv_os_guest_thread` 漏了，
+  导致 guest 从驱动内错误地址开始执行、无 CPUID 退出、IF=0 → 看门狗 0x101。
+- 修复（仅 `main.c`）：prepare 后显式
+  `v->vmcb->state.rip = (uint64_t)yghv_os_guest_main;`。
+- 构建：step12 v63 SHA256 `A611682000161A7778204C4976B7416C7253565BC445DC2DF9BE071530982592`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v63_step12.sys`。
+- 三次崩溃均已有 dump/代码级根因：pop 顺序（0x7E）→ 同 bug 冻结 → RIP 覆写（0x101）；
+  均未再加载验证。

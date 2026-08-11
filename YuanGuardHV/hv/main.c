@@ -662,6 +662,9 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     }
 
     svm_prepare_vcpu(v, (uint64_t)yghv_os_guest_main);
+    /* svm_prepare_vcpu's final VMSAVE overwrites RIP/RSP with the current
+       context; restore the guest entry point like the synthetic tests do. */
+    v->vmcb->state.rip = (uint64_t)yghv_os_guest_main;
     v->vmcb->state.rsp = 0;
     v->vmcb->control.general1_intercepts =
         INTERCEPT_CPUID | INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
