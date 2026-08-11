@@ -842,3 +842,17 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 设计文档：`docs/superpowers/plans/2026-08-11-os-as-guest-step15.md`。
 - 构建：step15 v69 SHA256 `B7F18153DFE727881C85E0AB28BB8D9BD9288C21B3725FF9F8C31D518E8C7CE4`。
 - 状态：编译通过，未加载；step16 全核无缝常驻为最高风险项（卸载/devirtualize 未实现）。
+
+### 9.53 Phase B step15：单核无缝延续实机通过（2026-08-11）
+
+- v69 实机加载：`sc start` RUNNING，日志
+  `bm os seamless start → os seamless enter=1 → os guest host done=1 →
+  os guest counter=0x1388(5000) → bm os seamless done → bm done`；
+  `sc stop` 干净回 STOPPED，无蓝屏/冻结。
+- 意义：**“VMRUN 后调用者代码无缝继续”语义实机验证通过**（guest 从
+  `svm_os_seamless_cont` ret 回调用者，调用者在 guest mode 中执行 5000 次
+  CPUID/RDTSC）。
+- 归档：`D:\aaaaaavm\yuanguard_hv_v69_step15.sys`（SHA256
+  `B7F18153DFE727881C85E0AB28BB8D9BD9288C21B3725FF9F8C31D518E8C7CE4`）。
+- 下一步：step16 全核无缝有界（扩展 step15 到 12 核）→ step17 全核无缝常驻
+  （真正 OS-as-guest，最高风险，需先解决卸载/devirtualize）。
