@@ -214,12 +214,21 @@ static void yghv_emit_rel32(uint8_t *p, uint64_t from, uint64_t to) {
     p[0] = 0xE9;
     for (int i = 0; i < 4; i++) p[1 + i] = (uint8_t)((uint64_t)d >> (i * 8));
 }
+static void yghv_emit_abs_jmp16(uint8_t *p, uint64_t target) {
+    p[0] = 0x49; p[1] = 0xBB;                  /* movabs r11, imm64 */
+    yghv_emit_u64(p + 2, target);
+    p[10] = 0x41; p[11] = 0xFF; p[12] = 0xE3;  /* jmp r11 */
+    p[13] = 0x90; p[14] = 0x90; p[15] = 0x90;  /* nop padding to 16 bytes */
+}
 
 NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
     uint8_t *stub;
+    uint8_t patch[YGHV_PROTECT_PATCH_LEN];
     uint64_t func_pa, page_va, page_pa;
     uint8_t *orig;
+    yghv_protect_page_t *pp;
     yghv_protect_hook_t *h;
+    NTSTATUS st;
 
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
     h = &g_protect_hooks[hook_id];
@@ -233,8 +242,8 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
     h->func_pa = func_pa;
     h->hook_id = hook_id;
 
-    stub = (uint8_t *)MmAllocateContiguousMemory(HV_PAGE_SIZE,
-        (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    stub = (uint8_t *)ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE,
+        YGHV_TAG);
     if (!stub) return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(stub, HV_PAGE_SIZE);
     g_hook_stub_pages[hook_id] = stub;
@@ -270,33 +279,88 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
 
     yghv_emit_rel32(p + 41, (uint64_t)(p + 41), (uint64_t)orig);
 
-    /* patch function entry: E9 rel32 -> stub */
+    /* patch function entry: 16-byte absolute jump -> stub */
+    yghv_emit_abs_jmp16(patch, (uint64_t)stub);
     uint64_t old_cr0 = yghv_read_cr0();
     yghv_write_cr0(old_cr0 & ~(1ULL << 16));       /* clear CR0.WP */
-    yghv_emit_rel32((uint8_t *)func_va, func_va, (uint64_t)stub);
+    RtlCopyMemory((void *)func_va, patch, YGHV_PROTECT_PATCH_LEN);
     yghv_write_cr0(old_cr0);
 
     /* write-protect the function's page in NPT */
-    npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT);
+    st = npt_split_2mb_to_4kb(&g_npt, page_pa);
+    if (st) {
+        LOG_ERROR("protect hook %u: split function page failed 0x%x",
+            hook_id, st);
+        goto fail;
+    }
+    st = npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT);
+    if (st) {
+        LOG_ERROR("protect hook %u: set function page perm failed 0x%x",
+            hook_id, st);
+        goto fail;
+    }
+
+    /* route writes through the Task 4 NPF policy and arm the page */
+    st = yghv_protect_add_page(h->func_va);
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect hook %u: add function page failed 0x%x",
+            hook_id, st);
+        goto fail;
+    }
+    pp = yghv_protect_find_page(page_pa);
+    if (!pp) {
+        LOG_ERROR("protect hook %u: function page missing from table",
+            hook_id);
+        yghv_protect_remove_page(h->func_va);
+        st = STATUS_UNSUCCESSFUL;
+        goto fail;
+    }
+    st = yghv_protect_arm_page(pp);
+    if (st) {
+        LOG_ERROR("protect hook %u: arm function page failed 0x%x",
+            hook_id, st);
+        yghv_protect_remove_page(h->func_va);
+        goto fail;
+    }
+
     h->installed = 1;
     LOG_ERROR("protect hook %u installed: va=0x%llx pa=0x%llx", hook_id, func_va, func_pa);
     return STATUS_SUCCESS;
+
+fail:
+    npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    old_cr0 = yghv_read_cr0();
+    yghv_write_cr0(old_cr0 & ~(1ULL << 16));
+    RtlCopyMemory((void *)func_va, h->original, YGHV_PROTECT_PATCH_LEN);
+    yghv_write_cr0(old_cr0);
+    if (g_hook_stub_pages[hook_id]) {
+        ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
+        g_hook_stub_pages[hook_id] = NULL;
+    }
+    return st;
 }
 
 NTSTATUS yghv_protect_remove_hook(uint8_t hook_id) {
     yghv_protect_hook_t *h;
-    uint64_t page_pa;
+    NTSTATUS st;
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
     h = &g_protect_hooks[hook_id];
     if (!h->installed) return STATUS_NOT_FOUND;
+
+    /* remove the page from the NPF policy and restore NPT writable first */
+    st = yghv_protect_remove_page(h->func_va);
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect remove hook %u: remove_page failed 0x%x",
+            hook_id, st);
+        return st;
+    }
+
     uint64_t old_cr0 = yghv_read_cr0();
     yghv_write_cr0(old_cr0 & ~(1ULL << 16));
     RtlCopyMemory((void *)h->func_va, h->original, YGHV_PROTECT_PATCH_LEN);
     yghv_write_cr0(old_cr0);
-    page_pa = MmGetPhysicalAddress((PVOID)(h->func_va & ~(HV_PAGE_SIZE - 1))).QuadPart;
-    npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
     if (g_hook_stub_pages[hook_id]) {
-        MmFreeContiguousMemory(g_hook_stub_pages[hook_id]);
+        ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
         g_hook_stub_pages[hook_id] = NULL;
     }
     h->installed = 0;
@@ -316,6 +380,7 @@ uint64_t yghv_protect_on_hook_query(uint8_t hook_id, uint64_t accessor_cr3) {
 uint64_t yghv_protect_find_func_pattern(PCWSTR name_hint, uint8_t *pat, SIZE_T pat_len) {
     UNICODE_STRING name;
     (void)pat; (void)pat_len;
+    if (!name_hint) return 0;
     RtlInitUnicodeString(&name, name_hint);
     return (uint64_t)MmGetSystemRoutineAddress(&name);
 }
