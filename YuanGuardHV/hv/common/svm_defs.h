@@ -127,6 +127,9 @@ typedef signed int         int32_t;
 #define VMCB_CLEAN_LBR         (1 << 10)
 #define VMCB_CLEAN_AVIC        (1 << 11)
 
+/* VMCB TLB control values */
+#define SVM_TLB_CONTROL_FLUSH  1ULL
+
 /* SVM Exit codes */
 #define SVM_EXIT_CR0_READ         0x00
 #define SVM_EXIT_CR1_READ         0x01

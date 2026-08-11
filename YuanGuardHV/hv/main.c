@@ -334,6 +334,28 @@ static NTSTATUS yghv_protect_test(void) {
         ok = 0;
     }
     LOG_ERROR("protect test: real write %s", ok ? "PASS" : "FAIL");
+
+    /* Second write to the same page: TLB flush + re-arm must keep trapping. */
+    v->regs.rdi = buf_va;
+    v->regs.rcx = g_vmmcall_auth_cookie;
+    v->vmcb->state.rip = (uint64_t)svm_trampoline_test_prot_write;
+    v->vmcb->state.rax = 0;
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
+        LOG_ERROR("protect test: npt restore #2 FAILED");
+        yghv_protect_stop();
+        yghv_protect_remove_page(buf_va);
+        MmFreeContiguousMemory(buf);
+        return STATUS_UNSUCCESSFUL;
+    }
+    svm_core_enter_resident_current(0);
+    entry_after = npt_read_entry(&g_npt, buf_pa);
+    if (entry_after & NPT_PERM_WRITABLE) {
+        LOG_ERROR("protect test: page not re-armed after second write");
+        ok = 0;
+    }
+    LOG_ERROR("protect test: real write #2 %s", ok ? "PASS" : "FAIL");
     st = yghv_protect_stop();
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect test: stop FAILED 0x%x", st);

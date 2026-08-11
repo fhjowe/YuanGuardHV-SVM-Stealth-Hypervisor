@@ -555,7 +555,12 @@ int svm_core_enter_resident_current(uint32_t index) {
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
 
     while (vcpu->resident_state == SVM_RESIDENT_ACTIVE) {
+        if (vcpu->npt_flush_pending) {
+            vcpu->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;
+            InterlockedExchange((volatile LONG *)&vcpu->npt_flush_pending, 0);
+        }
         uint64_t exitcode = svm_vmrun_trampoline(vcpu);
+        vcpu->vmcb->control.tlb_control = 0;
         (void)exitcode;
         int stop = svm_dispatch_exit(vcpu);
         if (stop) break;

@@ -65,15 +65,17 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         return 0;
 
     case SVM_EXIT_EXCEPTION_DB:
-        if (vcpu->rearm_gpa) {
-            yghv_protect_page_t *pp = yghv_protect_find_page(vcpu->rearm_gpa);
-            if (pp) {
-                int st = yghv_protect_arm_page(pp);
+        if (vcpu->rearm_pending) {
+            uint32_t i;
+            for (i = 0; i < g_protect.page_count; i++) {
+                if (g_protect.pages[i].armed)
+                    continue;
+                int st = yghv_protect_arm_page(&g_protect.pages[i]);
                 if (st)
                     LOG_ERROR("protect: re-arm failed gpa=0x%llx st=0x%x",
-                        pp->gpa, st);
+                        g_protect.pages[i].gpa, st);
             }
-            vcpu->rearm_gpa = 0;
+            vcpu->rearm_pending = 0;
             vcpu->vmcb->state.rflags &= ~0x100ULL;
             return 0;
         }
@@ -101,7 +103,7 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
                         pp->gpa, st);
                     return 0;
                 }
-                vcpu->rearm_gpa = pp->gpa;
+                vcpu->rearm_pending = 1;
                 vcpu->vmcb->state.rflags |= 0x100ULL;  /* TF */
                 if (vcpu->vmcb->state.cpl == 0 && ring0_logged++ < 32)
                     LOG_ERROR("protect: ring0 write allowed gpa=0x%llx", pp->gpa);

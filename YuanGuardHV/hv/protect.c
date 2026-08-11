@@ -1,5 +1,6 @@
 #include <ntddk.h>
 #include "protect.h"
+#include "svm_vcpu.h"
 #include "debug.h"
 #include "control_plane.h"
 
@@ -144,18 +145,32 @@ yghv_protect_page_t *yghv_protect_find_page(uint64_t gpa) {
 }
 
 int yghv_protect_arm_page(yghv_protect_page_t *p) {
+    ULONG i;
     int st = npt_split_2mb_to_4kb(&g_npt, p->gpa);
     if (st)
         return st;
     st = npt_set_page_perm(&g_npt, p->gpa, NPT_PERM_PRESENT);
-    if (!st) p->armed = 1;
+    if (!st) {
+        p->armed = 1;
+        for (i = 0; i < SVM_MAX_CORES; i++) {
+            if (g_vcpus[i])
+                g_vcpus[i]->npt_flush_pending = 1;
+        }
+    }
     return st;
 }
 
 int yghv_protect_disarm_page(yghv_protect_page_t *p) {
+    ULONG i;
     int st = npt_set_page_perm(&g_npt, p->gpa,
         NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-    if (!st) p->armed = 0;
+    if (!st) {
+        p->armed = 0;
+        for (i = 0; i < SVM_MAX_CORES; i++) {
+            if (g_vcpus[i])
+                g_vcpus[i]->npt_flush_pending = 1;
+        }
+    }
     return st;
 }
 
