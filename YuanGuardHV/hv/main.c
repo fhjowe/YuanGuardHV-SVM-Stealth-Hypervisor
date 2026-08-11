@@ -351,6 +351,37 @@ static NTSTATUS yghv_protect_test(void) {
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+static NTSTATUS yghv_hook_test(void) {
+    uint64_t term;
+    uint64_t gpa;
+    uint64_t entry_before, entry_after;
+    int ok = 1;
+
+    term = yghv_protect_find_func_pattern(L"NtTerminateProcess", NULL, 0);
+    if (!term) {
+        LOG_ERROR("protect hook test: locate FAILED");
+        return STATUS_NOT_FOUND;
+    }
+    if (yghv_protect_install_hook(0, term)) {
+        LOG_ERROR("protect hook test: install FAILED");
+        return STATUS_UNSUCCESSFUL;
+    }
+    gpa = MmGetPhysicalAddress((PVOID)(term & ~(HV_PAGE_SIZE - 1))).QuadPart;
+    entry_before = npt_read_entry(&g_npt, gpa);
+    if (entry_before & NPT_PERM_WRITABLE) ok = 0;
+
+    if (yghv_protect_on_hook_query(0, g_protect.cr3) != YGHV_STATUS_OK) ok = 0;
+    if (yghv_protect_on_hook_query(0, g_protect.cr3 + 0x1000) != YGHV_STATUS_DENIED) ok = 0;
+
+    yghv_protect_remove_hook(0);
+    entry_after = npt_read_entry(&g_npt, gpa);
+    if (!(entry_after & NPT_PERM_WRITABLE)) ok = 0;
+    if (memcmp((void *)term, &g_protect_hooks[0].original, YGHV_PROTECT_PATCH_LEN) != 0) ok = 0;
+
+    LOG_ERROR("protect hook test: %s", ok ? "PASS" : "FAIL");
+    return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 static NTSTATUS yghv_make_guest_code_executable(void) {
     uint64_t pa = MmGetPhysicalAddress(g_guest_code_page).QuadPart;
     NTSTATUS st = npt_split_2mb_to_4kb(&g_npt, pa);
@@ -570,6 +601,19 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 
     if (!NT_SUCCESS(yghv_protect_test())) {
         LOG_ERROR("protect test failed");
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        KeRevertToUserAffinityThread();
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    if (!NT_SUCCESS(yghv_hook_test())) {
+        LOG_ERROR("protect hook test failed");
         if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
         npt_test_buf = NULL;
         yghv_protect_cleanup();
