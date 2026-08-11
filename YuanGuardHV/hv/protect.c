@@ -44,6 +44,11 @@ NTSTATUS yghv_protect_init(void) {
 }
 
 void yghv_protect_cleanup(void) {
+    uint32_t i;
+    for (i = 0; i < YGHV_PROTECT_MAX_HOOKS; i++) {
+        if (g_protect_hooks[i].installed)
+            yghv_protect_remove_hook(i);
+    }
     yghv_protect_stop();
     if (g_protect.process) {
         ObDereferenceObject(g_protect.process);
