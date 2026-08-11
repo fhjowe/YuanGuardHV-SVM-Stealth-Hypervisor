@@ -5,6 +5,8 @@
 #include "debug.h"
 #define YGHV_DEBUG_LOG  /* development only */
 
+NTKERNELAPI NTSTATUS ZwYieldExecution(void);
+
 svm_vcpu_t *g_vcpus[SVM_MAX_CORES];
 ULONG g_vcpu_count;
 
@@ -557,6 +559,8 @@ int svm_core_enter_resident_current(uint32_t index) {
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
     yghv_trace("resident start");
 
+    {
+        uint64_t iter = 0;
     while (vcpu->resident_state == SVM_RESIDENT_ACTIVE) {
         if (vcpu->pause_requested) {
             InterlockedExchange((volatile LONG *)&vcpu->pause_ack, 1);
@@ -575,11 +579,14 @@ int svm_core_enter_resident_current(uint32_t index) {
         }
         uint64_t exitcode = svm_vmrun_trampoline(vcpu);
         vcpu->vmcb->control.tlb_control = 0;
+        if ((++iter & 0x7FFFULL) == 0)
+            ZwYieldExecution();
         if ((vcpu->resident_exits % 100000ULL) == 0)
             yghv_trace("resident exit tick");
         (void)exitcode;
         int stop = svm_dispatch_exit(vcpu);
         if (stop) break;
+    }
     }
 
     LOG_INFO("Resident loop exit: state=%d, exits=%llu",

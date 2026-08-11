@@ -631,7 +631,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 7)
+    if (step > 10)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -655,6 +655,131 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         svm_core_enter_resident_current(0);
         svm_core_wait_all_stopped(g_vcpu_count);
         yghv_trace("bm multi done");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 8) {
+        ULONG i;
+        yghv_trace("bm persistent start");
+        g_resident_workload_page = ExAllocatePoolWithTag(
+            NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
+        if (!g_resident_workload_page)
+            return STATUS_INSUFFICIENT_RESOURCES;
+        RtlZeroMemory(g_resident_workload_page, HV_PAGE_SIZE);
+        st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+        if (!st)
+            st = yghv_protect_add_page((uint64_t)g_resident_workload_page);
+        if (!st)
+            st = yghv_protect_install_hook(0, (uint64_t)yghv_hook_test_dummy);
+        if (!st)
+            st = yghv_protect_start();
+        if (st) {
+            LOG_ERROR("bm step 8: setup failed 0x%x", st);
+            yghv_protect_cleanup();
+            if (g_resident_workload_page) ExFreePoolWithTag(g_resident_workload_page, YGHV_TAG);
+            g_resident_workload_page = NULL;
+            return st;
+        }
+        for (i = 0; i < g_vcpu_count; i++) {
+            svm_vcpu_t *cv = g_vcpus[i];
+            if (!cv) continue;
+            cv->regs.rcx = g_vmmcall_auth_cookie;
+            cv->vmcb->state.cr3 = g_protect.cr3;
+            cv->vmcb->control.general1_intercepts = INTERCEPT_CPUID;
+            cv->vmcb->control.general2_intercepts =
+                INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+            if (i == 0) {
+                cv->vmcb->state.rip = (uint64_t)svm_trampoline_test_resident_guest;
+                cv->regs.rdi = (uint64_t)g_resident_workload_page;
+                cv->regs.rsi = (uint64_t)yghv_hook_test_dummy;
+            } else {
+                cv->vmcb->state.rip = (uint64_t)svm_trampoline_test_guest;
+                cv->regs.rdi = 0;
+                cv->regs.rsi = 0;
+            }
+            cv->vmcb->state.rax = 0;
+        }
+        st = svm_core_start_persistent_residents(g_vcpu_count);
+        if (st) {
+            LOG_ERROR("bm step 8: persistent start failed 0x%x", st);
+            yghv_protect_cleanup();
+            if (g_resident_workload_page) ExFreePoolWithTag(g_resident_workload_page, YGHV_TAG);
+            g_resident_workload_page = NULL;
+            return st;
+        }
+        svm_core_wait_remote_ready(g_vcpu_count);
+        yghv_trace("bm persistent running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 9) {
+        ULONG i;
+        yghv_trace("bm persistent hb start");
+        st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+        if (!st)
+            st = yghv_protect_start();  /* 0 pages: keepalive heartbeat only */
+        if (st) {
+            LOG_ERROR("bm step 9: setup failed 0x%x", st);
+            yghv_protect_cleanup();
+            return st;
+        }
+        for (i = 0; i < g_vcpu_count; i++) {
+            svm_vcpu_t *cv = g_vcpus[i];
+            if (!cv) continue;
+            cv->regs.rcx = g_vmmcall_auth_cookie;
+            cv->vmcb->state.cr3 = g_control_cr3;
+            cv->vmcb->control.general1_intercepts = INTERCEPT_CPUID;
+            cv->vmcb->control.general2_intercepts =
+                INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+            cv->vmcb->state.rip = (uint64_t)svm_trampoline_test_guest;
+            cv->regs.rdi = 0;
+            cv->regs.rsi = 0;
+            cv->vmcb->state.rax = 0;
+        }
+        st = svm_core_start_persistent_residents(g_vcpu_count);
+        if (st) {
+            LOG_ERROR("bm step 9: persistent start failed 0x%x", st);
+            yghv_protect_cleanup();
+            return st;
+        }
+        svm_core_wait_remote_ready(g_vcpu_count);
+        yghv_trace("bm persistent hb running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 10) {
+        ULONG i;
+        ULONG bm_cores = 2;
+        yghv_trace("bm persistent hb 2core start");
+        st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+        if (!st)
+            st = yghv_protect_start();  /* 0 pages: keepalive heartbeat only */
+        if (st) {
+            LOG_ERROR("bm step 10: setup failed 0x%x", st);
+            yghv_protect_cleanup();
+            return st;
+        }
+        for (i = 0; i < bm_cores && i < g_vcpu_count; i++) {
+            svm_vcpu_t *cv = g_vcpus[i];
+            if (!cv) continue;
+            cv->regs.rcx = g_vmmcall_auth_cookie;
+            cv->vmcb->state.cr3 = g_control_cr3;
+            cv->vmcb->control.general1_intercepts = INTERCEPT_CPUID;
+            cv->vmcb->control.general2_intercepts =
+                INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+            cv->vmcb->state.rip = (uint64_t)svm_trampoline_test_guest;
+            cv->regs.rdi = 0;
+            cv->regs.rsi = 0;
+            cv->vmcb->state.rax = 0;
+        }
+        st = svm_core_start_persistent_residents(bm_cores);
+        if (st) {
+            LOG_ERROR("bm step 10: persistent start failed 0x%x", st);
+            yghv_protect_cleanup();
+            return st;
+        }
+        svm_core_wait_remote_ready(bm_cores);
+        yghv_trace("bm persistent hb 2core running");
         return STATUS_SUCCESS;
     }
 
