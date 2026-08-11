@@ -631,7 +631,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 10)
+    if (step > 11)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -780,6 +780,44 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         }
         svm_core_wait_remote_ready(bm_cores);
         yghv_trace("bm persistent hb 2core running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 11) {
+        ULONG i;
+        ULONG bm_cores = 2;
+        yghv_trace("bm bounded hb 2core intr start");
+        for (i = 0; i < bm_cores && i < g_vcpu_count; i++) {
+            svm_vcpu_t *cv = g_vcpus[i];
+            if (!cv) continue;
+            cv->regs.rcx = g_vmmcall_auth_cookie;
+            cv->vmcb->state.cr3 = g_control_cr3;
+            cv->vmcb->control.general1_intercepts =
+                INTERCEPT_CPUID | INTR_GEN1(SVM_INTERCEPT_INTR) |
+                INTR_GEN1(SVM_INTERCEPT_NMI) |
+                INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+            cv->vmcb->control.general2_intercepts =
+                INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+            cv->vmcb->state.rip = (uint64_t)svm_trampoline_test_guest;
+            cv->regs.rdi = 0;
+            cv->regs.rsi = 0;
+            cv->vmcb->state.rax = 0;
+        }
+        st = svm_core_start_remote_residents(bm_cores);
+        if (st)
+            return st;
+        svm_core_wait_remote_ready(bm_cores);
+        yghv_trace("bm bounded hb 2core intr vmrun");
+        svm_core_enter_resident_current(0);
+        svm_core_wait_all_stopped(bm_cores);
+        for (i = 0; i < bm_cores && i < g_vcpu_count; i++) {
+            svm_vcpu_t *cv = g_vcpus[i];
+            if (!cv) continue;
+            const char *lbl = (i == 0) ? "bm s11 c0" : "bm s11 c1";
+            yghv_trace_u64(lbl, cv->resident_interrupt_exits);
+            yghv_trace_u64("bm s11 ext", cv->resident_exits);
+        }
+        yghv_trace("bm bounded hb 2core intr done");
         return STATUS_SUCCESS;
     }
 

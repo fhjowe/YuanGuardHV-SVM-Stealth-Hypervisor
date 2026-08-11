@@ -559,6 +559,13 @@ int svm_core_enter_resident_current(uint32_t index) {
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
     yghv_trace("resident start");
 
+    /* Synthetic resident guest runs Windows code in guest mode; intercept
+       physical interrupts/shutdown so they are handled natively and a guest
+       triple fault cannot reset the machine. */
+    vcpu->vmcb->control.general1_intercepts |=
+        INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI) |
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+
     {
         uint64_t iter = 0;
     while (vcpu->resident_state == SVM_RESIDENT_ACTIVE) {
