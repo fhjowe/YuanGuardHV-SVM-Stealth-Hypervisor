@@ -112,6 +112,7 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         if (g_npt_test_active) {
             LOG_ERROR("NPT test NPF: GPA=0x%llx RIP=0x%llx info1=0x%llx",
                 vcpu->vmcb->control.exitinfo2, vcpu->vmcb->state.rip, info1);
+            yghv_trace("npf test");
             npt_set_page_perm(&g_npt, g_npt_test_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
             g_npt_test_active = 0;
             return 0;

@@ -15,4 +15,6 @@
 #define LOG_WARN(fmt, ...)  ((void)0)
 #endif
 
+void yghv_trace(const char *msg);
+
 #endif

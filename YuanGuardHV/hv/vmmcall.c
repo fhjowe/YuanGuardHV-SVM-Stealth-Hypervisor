@@ -69,6 +69,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             return 0;
         }
         LOG_INFO("VMMCALL stop — broadcasting to all cores");
+        yghv_trace("stop_internal");
         svm_core_stop_all_residents();
         vcpu->regs.rax = YGHV_STATUS_OK;
         return 1;

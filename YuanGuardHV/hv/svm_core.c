@@ -555,6 +555,7 @@ int svm_core_enter_resident_current(uint32_t index) {
         return 0;
 
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
+    yghv_trace("resident start");
 
     while (vcpu->resident_state == SVM_RESIDENT_ACTIVE) {
         if (vcpu->pause_requested) {
@@ -574,6 +575,8 @@ int svm_core_enter_resident_current(uint32_t index) {
         }
         uint64_t exitcode = svm_vmrun_trampoline(vcpu);
         vcpu->vmcb->control.tlb_control = 0;
+        if ((vcpu->resident_exits % 100000ULL) == 0)
+            yghv_trace("resident exit tick");
         (void)exitcode;
         int stop = svm_dispatch_exit(vcpu);
         if (stop) break;

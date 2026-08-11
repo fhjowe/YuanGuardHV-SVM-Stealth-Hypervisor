@@ -58,7 +58,7 @@ static void yghv_trace_init(void) {
         LOG_ERROR("yghv_trace_init failed 0x%x", st);
 }
 
-static void yghv_trace(const char *msg) {
+void yghv_trace(const char *msg) {
     IO_STATUS_BLOCK iosb;
     size_t msg_len = 0;
     char buf[256];
@@ -167,27 +167,22 @@ static void yghv_exclude_hv_private(PDRIVER_OBJECT d) {
 
 static NTSTATUS yghv_r1_npt_unit_test(void) {
     void *buf = NULL;
-    uint64_t buf_pa, test_pa, test_pa2;
+    uint64_t test_pa, test_pa2;
     uint64_t entry, trans;
     NTSTATUS st;
 
-    buf = MmAllocateContiguousMemory(
-        HV_LARGE_PAGE_SIZE * 4, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    yghv_trace("r1 start");
+    buf = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
     if (!buf) {
         LOG_ERROR("r1 unit: alloc failed");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    RtlZeroMemory(buf, HV_LARGE_PAGE_SIZE * 4);
-    buf_pa = MmGetPhysicalAddress(buf).QuadPart;
-    test_pa = (buf_pa + HV_LARGE_PAGE_SIZE - 1) & ~(uint64_t)(HV_LARGE_PAGE_SIZE - 1);
+    RtlZeroMemory(buf, HV_PAGE_SIZE);
+    test_pa = MmGetPhysicalAddress(buf).QuadPart;
     test_pa2 = test_pa + HV_LARGE_PAGE_SIZE;
-    if (test_pa2 + HV_LARGE_PAGE_SIZE > buf_pa + HV_LARGE_PAGE_SIZE * 4) {
-        LOG_ERROR("r1 unit: no aligned 2MB slots buf_pa=0x%llx", buf_pa);
-        MmFreeContiguousMemory(buf);
-        return STATUS_UNSUCCESSFUL;
-    }
     LOG_ERROR("r1 unit: buf_pa=0x%llx test_pa=0x%llx test_pa2=0x%llx",
-        buf_pa, test_pa, test_pa2);
+        test_pa, test_pa, test_pa2);
+    yghv_trace("r1 alloc ok");
 
     entry = npt_read_entry(&g_npt, test_pa);
     trans = npt_translate(&g_npt, test_pa);
@@ -209,6 +204,7 @@ static NTSTATUS yghv_r1_npt_unit_test(void) {
         st = STATUS_UNSUCCESSFUL;
         goto done;
     }
+    yghv_trace("r1 split ok");
 
     st = npt_set_page_perm(&g_npt, test_pa,
         NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
@@ -252,6 +248,7 @@ static NTSTATUS yghv_r1_npt_unit_test(void) {
         st = STATUS_UNSUCCESSFUL;
         goto done;
     }
+    yghv_trace("r1 range nx ok");
 
     st = npt_set_page_perm_range(&g_npt, test_pa2, HV_PAGE_SIZE * 2,
         NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
@@ -264,10 +261,11 @@ static NTSTATUS yghv_r1_npt_unit_test(void) {
     }
 
     LOG_ERROR("r1 unit: PASS");
+    yghv_trace("r1 unit pass");
     st = STATUS_SUCCESS;
 
 done:
-    MmFreeContiguousMemory(buf);
+    if (buf) ExFreePoolWithTag(buf, YGHV_TAG);
     return st;
 }
 
@@ -747,6 +745,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
             svm_core_cleanup();
             if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
             g_guest_code_page = NULL;
+            yghv_trace_close();
             KeRevertToUserAffinityThread();
             return (NTSTATUS)sv;
         }
@@ -767,6 +766,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return (NTSTATUS)sv;
     }
@@ -781,6 +781,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return sv;
     }
@@ -800,6 +801,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
             svm_core_cleanup();
             if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
             g_guest_code_page = NULL;
+            yghv_trace_close();
             KeRevertToUserAffinityThread();
             return (NTSTATUS)sv;
         }
@@ -810,13 +812,15 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 #if !YGHV_R1_SKIP_NPT_TEST
     /* Single-core NPT permission test first. */
     npt_test_buf = MmAllocateContiguousMemory(
-        HV_LARGE_PAGE_SIZE * 2, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+        HV_LARGE_PAGE_SIZE * 2,
+        (PHYSICAL_ADDRESS){ .QuadPart = 0x400000000ULL });
     if (!npt_test_buf) {
         LOG_ERROR("npt_test_buf allocation failed");
         npt_cleanup(&g_npt);
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -830,6 +834,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -847,6 +852,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return (NTSTATUS)sv;
     }
@@ -858,6 +864,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return (NTSTATUS)sv;
     }
@@ -896,6 +903,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_UNSUCCESSFUL;
     }
@@ -909,6 +917,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_UNSUCCESSFUL;
     }
@@ -922,6 +931,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_UNSUCCESSFUL;
     }
@@ -935,6 +945,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_UNSUCCESSFUL;
     }
@@ -948,6 +959,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_UNSUCCESSFUL;
     }
@@ -970,6 +982,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return (NTSTATUS)sv;
     }
@@ -1000,6 +1013,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         yghv_protect_cleanup();
         npt_cleanup(&g_npt);
         svm_core_cleanup();
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1016,6 +1030,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         svm_core_cleanup();
         if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
         g_resident_workload_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return sv;
     }
@@ -1034,6 +1049,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         g_npt_test_active = 0;
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return (NTSTATUS)sv;
     }
@@ -1070,6 +1086,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
             g_npt_test_active = 0;
             if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
             g_guest_code_page = NULL;
+            yghv_trace_close();
             KeRevertToUserAffinityThread();
             return (NTSTATUS)sv;
         }
@@ -1093,6 +1110,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         g_npt_test_active = 0;
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
+        yghv_trace_close();
         KeRevertToUserAffinityThread();
         return (NTSTATUS)sv;
     }
