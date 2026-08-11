@@ -412,3 +412,12 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 2026-08-11 Phase 3 Task 3 审查修复：`svm_core.c` 的 `svm_prepare_vcpu()` 启用 #DB 异常拦截（`exception_intercepts = (1ULL << 1)`），使 `SVM_EXIT_EXCEPTION_DB` 单步重新加锁路径可到达，覆盖单核/多核常驻路径；构建 SUCCESS（SHA256 `79AE2085C2E0D8071A52451D7AA86F09978F698CFC247886AC6A7E93F0D96F46`）；提交 `620a5d4`（仅 `svm_core.c`，docs/报告不提交）。
 - 2026-08-11 Phase 3 Task 3 复审修复：`vmexit.c` 的 #DB 分支在 `rearm_gpa==0` 时重新注入 guest #DB（向量 1）；外来用户态写 #PF 错误码由 `NPF_INFO1_*` 派生（含 U 位）；`arm_page`/`disarm_page` 返回值检查并记录失败；构建 SUCCESS（SHA256 `8D2126E823EF581D2CCD67CF8078F3373F3F76EA841DA162C6687CE3245AFA4A`）；提交 `5a80208`（仅 `vmexit.c`，docs/报告不提交）。
 - 2026-08-11 Phase 3 Task 4：驱动内保护测试完成（`svm_trampoline.S` 新增 `svm_trampoline_test_prot_write` 写陷阱 guest；`main.c` 新增 `yghv_protect_test()` 策略矩阵 + 真实写陷阱，调用点位于 NPT 测试块后、`svm_core_prepare_vcpu_other(0)` 前）；构建 SUCCESS，sys SHA256 `904A03B195F7AC30B1EB412F780B7BA3A3C9BE07B09FA2C4AFA344A2766D4BC2`，已复制 `D:\aaaaaavm\yuanguard_hv_v27.sys`；提交 `feat: 阶段1 内存页写保护 + 驱动内测试 v27`（仅两个代码文件，docs/报告不提交）。
+
+### 9.26 Phase 3 Task 4 审查修复：保护测试失败回滚与返回值检查（2026-08-11）
+
+- 审查发现的 3 处问题已按结论修复，仅改 `YuanGuardHV/hv/main.c`：
+  - `yghv_protect_test()` 检查 `yghv_protect_set_target()` 返回值；失败时记录 `protect test: set_target FAILED 0x%x`、清掉合成 `g_protect.cr3` 并返回原状态，不再以 `0x1000` 伪 CR3 继续。
+  - setup 失败路径拆分：`add_page` 失败仅释放缓冲区；`start` 失败先 `yghv_protect_stop()` 再 `yghv_protect_remove_page(buf_va)` 后释放。测试末尾检查 `stop`/`remove_page` 返回值，失败分别记录并返回对应状态（避免 `g_protect.active` 遗留 TRUE）。
+  - DriverEntry 的 protect-test 失败路径先释放 `npt_test_buf` 并置 NULL，再调用 `yghv_protect_cleanup()`，随后才 `npt_cleanup()`，避免 NPT 测试缓冲与保护状态泄漏。
+- 验证：`cmd /c build.bat`（`D:\yuanguard\YuanGuardHV`）→ `Build SUCCESS`，签名成功；sys SHA256 `2CAF175A4E78C1F11493D9F4572E45314EA7874FF722DB3C0BB0A915F2170E06`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v27.sys`）；仅预存 WDK intrinsic 警告与 `YGHV_DEBUG_LOG` 重定义警告，`main.c` 无新增警告。
+- 提交：`git commit -m "fix: Task4 保护测试失败回滚与返回值检查"`（仅 main.c；docs/报告不提交）。
