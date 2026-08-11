@@ -622,3 +622,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - `.gitignore` 追加 `YuanGuardHV/logs_archive/`。
 - 不动：核心代码、docs、脚本、证书、PLAN.md/HANDOFF.md/TECHNICAL_REVIEW.md。
 - 执行：`git mv` 参考文档到 `docs/reference/`、`SymbolicAccessKM.lib` 到 `reference/`；历史日志与中间 asm 移入 `YuanGuardHV/logs_archive/`（gitignore）；`.gitignore` 追加 logs_archive。
+
+### 9.38 常驻 VMRUN 冻结研究 + INTR/NMI/SHUTDOWN 拦截修复（2026-08-11）
+
+- 用户问题与范围：解释“非停止常驻 VMRUN”是什么；网络调研是否有解；没有它时的后果；确认后实施修复并做裸机验证。
+- 研究结论：
+  - 非停止常驻 VMRUN = 每核无限 `VMRUN → VMEXIT → 处理 → VMRUN` 循环，CPU 长期停留 guest mode；当前合成 guest 是心跳循环（`mov rax,1; vmmcall; jmp`），退出率百万级/秒。有界（10000 次/STOP_INTERNAL）全 PASS；无限常驻在裸机 2 核也硬冻结。
+  - 代码缺口：`svm_prepare_vcpu()` 只开 CPUID 拦截，`INTERCEPT_INTR/NMI/SHUTDOWN` 均未开；`vmexit.c` 的 `SVM_EXIT_INTR/NMI/SHUTDOWN` 分支是死代码。guest RFLAGS.IF=1 → 物理中断在 guest mode 内用宿主 IDT/GDT/CR3 执行 Windows ISR；合成 guest 不是真 OS-as-guest，这是与 KVM/bhyve 最本质的差异。
+  - AMD APM：不拦截 SHUTDOWN 时 guest 三重故障会直接处理器 shutdown（无 dump 硬复位），与现象吻合。
+  - AMD Zen3 errata（56683，Milan 同代 19h）：1363 持续 APIC 寄存器访问流可致系统挂起/复位；1407/1415/1450 特定时序致命 IF/LS MCA 可挂起/复位，无软件绕过（靠 BIOS/microcode）。KVM 2025 STI shadow/VMRUN quirk（be45bc4）与事件注入相关，本 trampoline `CLGI→VMRUN` 大概率不中招。
+  - 结论：有可修路径，优先验证 INTR/NMI/SHUTDOWN 拦截；若仍冻结再收集 WHEA/换 BIOS/换机/KVM 对照。
+- 无常驻 VMRUN 的后果：NPT/NPF 与 hook stub vmmcall 只在 guest mode 生效，无法持续保护真实目标；真实系统 hook 在非 resident 核会 #UD（已记录）；整机隐形不可行；没有等价替代架构，只能修稳常驻或换环境。
+- 修复（用户确认，v52）：
+  - `svm_core.c` 的 `svm_core_enter_resident_current()` 入口 OR 入 `INTERCEPT_INTR | INTERCEPT_NMI | INTERCEPT_SHUTDOWN`（所有 resident 路径统一生效；退出 devirtualize 仍清零）。
+  - `main.c` 新增 step 11 = 有界 2 核心跳 + 三拦截（把每核 `resident_interrupt_exits/exits` 写入进度日志）；step 10 保持 2 核非停止常驻纯心跳作为长跑测试。
+- 构建：step11 SHA256 `987FC1637E456D154137E0ECDEA79E861130388980DCDC46CE88A6EF0C0AA4F9`（归档 `D:\aaaaaavm\yuanguard_hv_v52_step11.sys`）；step10 SHA256 `91599A1FA6C77833ED17AE99C17036DDB0A049FD50FF696082B8B2BA76299405`（归档 `D:\aaaaaavm\yuanguard_hv_v52_step10.sys`）。仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 告警。
+- 裸机验证（Ryzen 5 5500）：
+  - Step 11 有界 2 核：`sc start` RUNNING，日志 `bm step=0xb` → `bm bounded hb 2core intr done`；`bm s11 c0=0xf / ext=0x2032`、`c1=0x4 / ext=0x2710`，证明 INTR 拦截真实生效，无冻结。
+  - Step 10 非停止 2 核：RUNNING 后连续观察约 7 分钟（90s + 300s + 操作时间），主机始终响应，核 0/1 `% Processor Time` 均 100%（resident 持续运行），`bm persistent hb 2core running`；`sc stop` 干净回 `STOPPED`，无冻结/蓝屏。
+  - 结论：**INTR/NMI/SHUTDOWN 拦截是裸机常驻冻结的关键修复路径**（此前 Step8b 同配置 2 核纯心跳+yield 冻结；本版同配置 7 分钟稳定且可卸载）。
+- 残余与下一步：全核常驻/真实 workload（Step8 形态）未测；VM 回归（selftest/exit-test）待用户启动 VM；BIOS/microcode errata 风险仍在，若长跑复现再查 WHEA 日志。
