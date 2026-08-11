@@ -79,7 +79,7 @@ void yghv_trace(const char *msg) {
     ZwWriteFile(g_trace_file, NULL, NULL, NULL, &iosb, buf, (ULONG)(msg_len + 2), NULL, NULL);
 }
 
-static void yghv_trace_u64(const char *label, uint64_t v) {
+void yghv_trace_u64(const char *label, uint64_t v) {
     static const char hex[] = "0123456789abcdef";
     char buf[64];
     size_t n = 0;
@@ -1194,7 +1194,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     /* Single-core NPT permission test first. */
     npt_test_buf = MmAllocateContiguousMemory(
         HV_LARGE_PAGE_SIZE * 2,
-        (PHYSICAL_ADDRESS){ .QuadPart = 0x1000000000ULL });
+        (PHYSICAL_ADDRESS){ .QuadPart = -1 });
     if (!npt_test_buf) {
         LOG_ERROR("npt_test_buf allocation failed");
         npt_cleanup(&g_npt);

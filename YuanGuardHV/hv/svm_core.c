@@ -9,6 +9,7 @@ NTKERNELAPI NTSTATUS ZwYieldExecution(void);
 
 svm_vcpu_t *g_vcpus[SVM_MAX_CORES];
 ULONG g_vcpu_count;
+static BOOLEAN g_svm_nested;
 
 /* --- MSR helpers --- */
 static uint64_t yg_read_msr(uint32_t msr) {
@@ -390,6 +391,19 @@ int svm_core_init(void) {
         return STATUS_HV_FEATURE_UNAVAILABLE;
     }
     LOG_INFO("SVM detected");
+    {
+        int cpu_info[4];
+        __cpuidex(cpu_info, 1, 0);
+        g_svm_nested = (cpu_info[2] & (1U << 31)) ? TRUE : FALSE;
+        __cpuidex(cpu_info, 0x40000000, 0);
+        if (!g_svm_nested &&
+            (cpu_info[1] == 0x61774D56 ||   /* "VMwa" (VMware) */
+             cpu_info[1] == 0x7269634D)) {  /* "Micr" (Hyper-V) */
+            g_svm_nested = TRUE;
+        }
+        LOG_INFO("SVM nested (hypervisor present): %s",
+            g_svm_nested ? "yes" : "no");
+    }
 
     if (cpu_has_npt())
         LOG_INFO("NPT supported");
@@ -559,12 +573,16 @@ int svm_core_enter_resident_current(uint32_t index) {
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
     yghv_trace("resident start");
 
-    /* Synthetic resident guest runs Windows code in guest mode; intercept
-       physical interrupts/shutdown so they are handled natively and a guest
-       triple fault cannot reset the machine. */
-    vcpu->vmcb->control.general1_intercepts |=
-        INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI) |
-        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+    /* Synthetic resident guest runs Windows code in guest mode; on bare metal
+       intercept INTR/NMI/SHUTDOWN so Windows ISRs run in native host context
+       and a guest triple fault cannot reset the machine.  Under a nested
+       hypervisor (VMware) those intercepts break L1 interrupt delivery, so
+       keep the v42 behavior there (no intercepts). */
+    if (!g_svm_nested) {
+        vcpu->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI) |
+            INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+    }
 
     {
         uint64_t iter = 0;

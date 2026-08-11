@@ -16,5 +16,6 @@
 #endif
 
 void yghv_trace(const char *msg);
+void yghv_trace_u64(const char *label, uint64_t v);
 
 #endif
