@@ -160,7 +160,13 @@ NTSTATUS yghv_protect_start(void) {
         int st = yghv_protect_arm_page(&g_protect.pages[i]);
         if (st) {
             LOG_ERROR("protect start: arm page %u failed 0x%x", i, st);
-            yghv_protect_stop();
+            NTSTATUS disarm_status = yghv_protect_stop();
+            if (disarm_status != STATUS_SUCCESS) {
+                LOG_ERROR("protect start: rollback disarm failed 0x%x",
+                    disarm_status);
+                g_protect.active = TRUE;
+                return STATUS_UNSUCCESSFUL;
+            }
             return (NTSTATUS)st;
         }
     }
