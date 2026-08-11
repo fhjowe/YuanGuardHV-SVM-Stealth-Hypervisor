@@ -85,6 +85,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-09 | 仓库初始化 git + .gitignore + 首次提交 | 后续可回滚、可审计 | 基线快照为 `docs` 建立后首次提交 |
 | 2026-08-09 | build.bat 失败只记录不擅自修改 | 铁律 1 要求代码改动先确认 | 修复方案待用户确认后执行 |
 | 2026-08-09 | 用户确认后修复 build.bat 并重跑基线 | 脚本路径含括号/空格导致无法编译 | 构建成功，sys 已签名，哈希见第 5 节 |
+| 2026-08-11 | Task 5 review 修复：stub 换可执行 NonPagedPool、入口改 16B 绝对跳转、函数页先 split 再置只读并纳入 NPF 写策略 | 评审发现 4 项问题，按反馈最小修复 | 仅改 `protect.c`；构建成功，v28 SHA256 `AC05BC52...3447EF` |
 
 ## 7. 变更日志
 
@@ -103,6 +104,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-10 | 火绒 `HipsDaemon`/`hrdevmon`/`sysdiag` | 尝试程序化禁用失败：`sc config` 与直接 `reg add Start=4` 均 `Access denied (5)`，`sc stop` 驱动返回 `1052`，进程无法终止 | 确认是火绒自我保护拦截；用户仅退出托盘，需在设置中关闭自我保护后再退出 |
 | 2026-08-10 | 火绒安全 | 用户确认已关闭/卸载；复核：`HipsDaemon` 服务、`hrdevmon`、`sysdiag` 驱动与进程均不存在 | 冲突源移除，可重试 VMware |
 | 2026-08-10 | 旧调试 VM `Windows 10 x64` | 按用户要求移除：34 文件（约 20.7GB）移入 `D:\win10_trash_backup\Windows 10 x64`，VMware 清单已清理（备份 `inventory.vmls.bak-20260810-remove-win10x64`） | 原路径已空，仅剩“Windows 10”VM |
+| 2026-08-11 | `YuanGuardHV/hv/protect.c` | Task 5 review 修复：可执行 stub 页、16B 绝对跳转、2MB split、函数页注册 NPF 策略、NULL 检查 | `Build SUCCESS`；v28 已复制并记录 SHA256 |
 
 ## 8. 2026-08-09 主机无响应/蓝屏调查
 
