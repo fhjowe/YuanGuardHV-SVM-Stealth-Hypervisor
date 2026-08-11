@@ -448,6 +448,9 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     (void)d;
     KeSetSystemAffinityThread((KAFFINITY)1);
     g_npt_test_active = 0;
+    svm_core_stop_all_residents();
+    svm_core_wait_all_stopped(g_vcpu_count);
+    yghv_protect_cleanup();
     if (g_guest_code_page)
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
     g_guest_code_page = NULL;
@@ -709,6 +712,43 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
     g_guest_code_page = NULL;
     yghv_trace_close();
+
+    sv = yghv_protect_start();
+    if (sv) {
+        LOG_ERROR("persistent protect start failed 0x%x", sv);
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        g_npt_test_active = 0;
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        KeRevertToUserAffinityThread();
+        return (NTSTATUS)sv;
+    }
+    for (i = 0; i < online; i++) {
+        if (!g_vcpus[i]) continue;
+        g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
+        g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
+    }
+    sv = svm_core_start_persistent_residents(online);
+    if (sv) {
+        LOG_ERROR("persistent residents start failed 0x%x", sv);
+        svm_core_stop_all_residents();
+        svm_core_wait_all_stopped(online);
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        g_npt_test_active = 0;
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        KeRevertToUserAffinityThread();
+        return (NTSTATUS)sv;
+    }
+    svm_core_wait_remote_ready(online);
+    LOG_ERROR("persistent protect mode active: %u cores", online);
     KeRevertToUserAffinityThread();
     return STATUS_SUCCESS;
 }

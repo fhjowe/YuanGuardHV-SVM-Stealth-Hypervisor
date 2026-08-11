@@ -31,11 +31,12 @@ static VOID yghv_resident_thread(PVOID context) {
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-NTSTATUS svm_core_start_remote_residents(ULONG online) {
+static NTSTATUS svm_core_start_residents_range(ULONG online, ULONG first,
+                                               const char *kind) {
     ULONG i;
 
     g_resident_thread_count = 0;
-    for (i = 1; i < online && i < SVM_MAX_CORES; i++) {
+    for (i = first; i < online && i < SVM_MAX_CORES; i++) {
         yghv_resident_ctx_t *ctx;
         HANDLE thread;
         NTSTATUS status;
@@ -68,13 +69,21 @@ NTSTATUS svm_core_start_remote_residents(ULONG online) {
         LOG_INFO("resident thread created for core %u", i);
     }
 
-    LOG_INFO("started %u remote resident threads", g_resident_thread_count);
+    LOG_INFO("started %u %s resident threads", g_resident_thread_count, kind);
     return STATUS_SUCCESS;
+}
+
+NTSTATUS svm_core_start_remote_residents(ULONG online) {
+    return svm_core_start_residents_range(online, 1, "remote");
+}
+
+NTSTATUS svm_core_start_persistent_residents(ULONG online) {
+    return svm_core_start_residents_range(online, 0, "persistent");
 }
 
 void svm_core_wait_remote_ready(ULONG online) {
     ULONG i;
-    for (i = 1; i < online && i < SVM_MAX_CORES; i++) {
+    for (i = 0; i < online && i < SVM_MAX_CORES; i++) {
         if (!g_resident_threads[i]) continue;
         KeWaitForSingleObject(&g_ready_events[i], Executive, KernelMode, FALSE, NULL);
     }
@@ -83,7 +92,7 @@ void svm_core_wait_remote_ready(ULONG online) {
 void svm_core_wait_all_stopped(ULONG online) {
     ULONG i;
 
-    for (i = 1; i < online && i < SVM_MAX_CORES; i++) {
+    for (i = 0; i < online && i < SVM_MAX_CORES; i++) {
         PETHREAD thread_obj = NULL;
         NTSTATUS status;
 
