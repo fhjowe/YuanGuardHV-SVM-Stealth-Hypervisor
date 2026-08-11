@@ -22,6 +22,7 @@ static VOID yghv_resident_thread(PVOID context) {
     uint32_t core = ctx->core;
 
     KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    g_vcpus[core]->resident_state = SVM_RESIDENT_ACTIVE;
     KeSetEvent(&g_ready_events[core], IO_NO_INCREMENT, FALSE);
     ctx->status = (svm_core_enter_resident_current(core) == 0)
                       ? STATUS_SUCCESS

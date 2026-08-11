@@ -446,10 +446,10 @@ static void yghv_init_auth_cookie(void) {
 
 void DriverUnload(struct _DRIVER_OBJECT *d) {
     (void)d;
-    KeSetSystemAffinityThread((KAFFINITY)1);
     g_npt_test_active = 0;
     svm_core_stop_all_residents();
     svm_core_wait_all_stopped(g_vcpu_count);
+    KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_protect_cleanup();
     if (g_guest_code_page)
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
@@ -708,6 +708,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     yghv_trace("all stopped");
 
     if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+    npt_test_buf = NULL;
     g_npt_test_active = 0;
     if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
     g_guest_code_page = NULL;
@@ -716,6 +717,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     sv = yghv_protect_start();
     if (sv) {
         LOG_ERROR("persistent protect start failed 0x%x", sv);
+        yghv_protect_cleanup();
         npt_cleanup(&g_npt);
         svm_core_cleanup();
         if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
@@ -728,8 +730,23 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
+        svm_core_prepare_vcpu_other(i);
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
+        sv = svm_core_set_npt(i, g_npt.pml4_pa);
+        if (sv) {
+            LOG_ERROR("persistent vcpu prepare core %u failed 0x%x", i, sv);
+            yghv_protect_cleanup();
+            npt_cleanup(&g_npt);
+            svm_core_cleanup();
+            if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+            npt_test_buf = NULL;
+            g_npt_test_active = 0;
+            if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+            g_guest_code_page = NULL;
+            KeRevertToUserAffinityThread();
+            return (NTSTATUS)sv;
+        }
     }
     sv = svm_core_start_persistent_residents(online);
     if (sv) {
