@@ -692,3 +692,18 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - `run.bat protect 1788 64` → set-target OK、枚举 512 页、**add-page ok=64（全部 javaw 映像页）**、start OK、`state: active=1 pid=1788 page_count=64`。
   - 60 秒常驻观察系统始终响应；`run.bat stop` disarm OK；`sc stop` 干净回 `STOPPED`；Minecraft 进程保留运行。
 - 边界不变：本步是真实目标接入/页表 arm 通道；真实写拦截仍需 OS-as-guest。
+
+### 9.43 v56-v60：VM 回归失败与实机冻结修复（2026-08-11）
+
+- 用户要求先补 VM 回归（v52-v55 只在实机验证过）。
+- v56（CPUID leaf1 bit31 嵌套检测，嵌套时关 INTR/NMI 只留 SHUTDOWN）：VM 仍整机冻结，说明 VMware 下问题不只是 INTR/NMI 拦截。
+- v57（嵌套检测加强为 VMwareVMware/Hyper-V 字符串，嵌套时三个拦截全关，完全回到 v42 行为）：VM 仍冻结；日志定位停在 `before heartbeat`（多核心跳测试），r1/NPT/protect/hook 全过。
+- v58（诊断：trace 每次同步刷盘 + 心跳每 1000 次退出写 `hb c0/c1`）：VM 仍冻结，且**实机 v58/v59 也硬冻结重启**。根因是诊断刷盘进了常驻热路径：12 核常驻下每秒成千上万次 `ZwFlushBuffersFile`，形成 I/O 风暴/文件锁等待死锁。
+- v59（NPT 测试缓冲 `HighestAcceptableAddress` 0x1000000000 → -1，与 v49 全内存映射对齐）：实机仍冻结，且首次出现 1450；查内存只剩 2.2GB（VMware VM 占 8.3GB），关 VM 后空闲 10.7GB。
+- v60（用户确认，清理诊断副作用）：
+  - 移除 `yghv_trace` 的 `ZwFlushBuffersFile`（恢复普通缓冲写）；
+  - 移除 vmmcall 心跳每 1000 次的 `hb c0/c1` trace；
+  - 保留 v59 的分配上限 -1 修复；
+  - `yghv_ctl.ps1 selftest` 断言改为适配 v55 语义：`set_target` 会清空旧页表 → set-target 后 page_count=0、add-page 后=1、stop+remove 后=0。
+- 实机验证（Ryzen 5 5500，重启后内存充足，无 VM）：v60 默认版 SHA256 `35261AC747C8F7006DD67C19FCAE34C062296233CBEF064B5577FA314A7E0BC9`，归档 `D:\aaaaaavm\yuanguard_hv_v60.sys`；`sc start` RUNNING → `selftest: PASS` → `exit-test: PASS` → 60 秒常驻观察正常 → `sc stop` 干净回 STOPPED。
+- 结论：**实机冻结由 v58 诊断刷盘引起，已清除；v60 与 v54/v55 稳定性一致**。VM 多核心跳冻结仍未解决（用户决定暂停 VM，走实机路线）；下一步回到 OS-as-guest Phase A（实机有界试点）。
