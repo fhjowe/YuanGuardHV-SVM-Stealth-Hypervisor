@@ -789,3 +789,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 构建：step12 v65 SHA256 `6C5DCA647334463D0A63FFDEEB598C824F3EA882C640465A8D875D587E1505B0`，
   归档 `D:\aaaaaavm\yuanguard_hv_v65_step12.sys`。
 - 现状：五次崩溃均有 dump/反汇编级根因并已修；v65 未加载。
+
+### 9.49 OS-as-Guest Phase A：实机首次通过（2026-08-11）
+
+- v66（修复计数为 `InterlockedIncrement`，cpuid 结果存 `g_os_guest_cpuid_acc`
+  保活）在实机加载：**`sc start` RUNNING**，日志完整
+  `bm os guest start → os guest thread enter → os guest host done →
+  os guest counter=0x1388(5000) → bm os guest done → bm done`；
+  `sc stop` 干净回 STOPPED，无蓝屏/冻结。
+- 意义：**真实内核线程在 guest mode 中执行 Windows 内核代码（5000 次 CPUID/RDTSC +
+  共享计数），有界跑完、host 收尾、干净卸载——OS-as-guest 无缝进入/VMEXIT 分发/
+  host 栈切换核心路径在实机验证通过**。
+- 构建：step12 v66 SHA256 `A9E6A8176BFEACC8B6611854A7FCB5305002371A3478B19B2D3538F844C13156`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v66_step12.sys`。
+- 五次崩溃复盘（全部 dump/反汇编级根因）：pop 顺序（0x7E）→ 同 bug 冻结 →
+  VMSAVE 覆写 RIP（0x101）→ cpuid 被优化删掉无拦截指令（0x101）→
+  `mov ecx,edi` 截断 vcpu 指针（0x139）。
+- 下一步 Phase B：全核 OS guest + OS profile 拦截矩阵；Phase C：真实 hook/NPF；
+  Phase D：整机隐形与 R1。

@@ -31,6 +31,7 @@ HANDLE g_trace_file = NULL;
 volatile LONG g_os_guest_test_active = 0;
 volatile LONG g_os_guest_stop = 0;
 volatile LONG g_os_guest_counter = 0;
+volatile ULONG64 g_os_guest_cpuid_acc = 0;
 static KEVENT g_os_guest_done_event;
 
 extern const uint8_t svm_trampoline_test_guest[];
@@ -633,7 +634,8 @@ static __declspec(noinline) void yghv_os_guest_main(void) {
     for (i = 0; i < 5000; i++) {
         __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
                                  : "a"(1) : "memory");
-        InterlockedExchangeAdd(&g_os_guest_counter, a);
+        InterlockedIncrement(&g_os_guest_counter);
+        g_os_guest_cpuid_acc += a;
         (void)__rdtsc();
     }
     InterlockedExchange(&g_os_guest_stop, 1);
