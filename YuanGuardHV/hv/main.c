@@ -360,27 +360,34 @@ __attribute__((naked, noinline)) static void yghv_hook_test_dummy(void) {
 
 static NTSTATUS yghv_hook_test(void) {
     uint64_t term;
+    uint64_t dummy;
+    uint64_t dummy_page_va;
     uint64_t gpa;
     uint64_t entry_before, entry_after;
     int ok = 1;
 
     term = yghv_protect_find_func_pattern(L"ZwTerminateProcess", NULL, 0);
     LOG_ERROR("protect hook test: ZwTerminateProcess=0x%llx", term);
+    dummy = (uint64_t)yghv_hook_test_dummy;
+    dummy_page_va = dummy & ~(HV_PAGE_SIZE - 1);
+    gpa = MmGetPhysicalAddress((PVOID)dummy_page_va).QuadPart;
     if (yghv_protect_install_hook(0, (uint64_t)yghv_hook_test_dummy)) {
         LOG_ERROR("protect hook test: install FAILED");
         return STATUS_UNSUCCESSFUL;
     }
-    gpa = MmGetPhysicalAddress((PVOID)(term & ~(HV_PAGE_SIZE - 1))).QuadPart;
     entry_before = npt_read_entry(&g_npt, gpa);
     if (entry_before & NPT_PERM_WRITABLE) ok = 0;
 
     if (yghv_protect_on_hook_query(0, g_protect.cr3) != YGHV_STATUS_OK) ok = 0;
     if (yghv_protect_on_hook_query(0, g_protect.cr3 + 0x1000) != YGHV_STATUS_DENIED) ok = 0;
 
-    yghv_protect_remove_hook(0);
+    if (!NT_SUCCESS(yghv_protect_remove_hook(0))) {
+        LOG_ERROR("protect hook test: remove FAILED");
+        ok = 0;
+    }
     entry_after = npt_read_entry(&g_npt, gpa);
     if (!(entry_after & NPT_PERM_WRITABLE)) ok = 0;
-    if (memcmp((void *)term, &g_protect_hooks[0].original, YGHV_PROTECT_PATCH_LEN) != 0) ok = 0;
+    if (memcmp((void *)dummy, &g_protect_hooks[0].original, YGHV_PROTECT_PATCH_LEN) != 0) ok = 0;
 
     LOG_ERROR("protect hook test: %s", ok ? "PASS" : "FAIL");
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
