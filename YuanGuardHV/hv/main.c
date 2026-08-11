@@ -691,7 +691,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 13)
+    if (step > 14)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -955,6 +955,54 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         yghv_trace("bm os guest multi done");
         if (st13 == STATUS_TIMEOUT)
             return st13;
+        return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    }
+
+    if (step == 14) {
+        ULONG i;
+        ULONG j;
+        ULONG bm_cores = g_vcpu_count;
+        HANDLE threads[SVM_MAX_CORES] = { 0 };
+        LARGE_INTEGER timeout;
+        NTSTATUS st14 = STATUS_SUCCESS;
+
+        yghv_trace("bm os guest all start");
+        g_os_guest_test_active = 1;
+        g_os_guest_counter = 0;
+        timeout.QuadPart = -120LL * 10000000LL;
+        for (i = 0; i < bm_cores; i++) {
+            KeInitializeEvent(&g_os_guest_done_events[i], NotificationEvent, FALSE);
+            st14 = PsCreateSystemThread(&threads[i], THREAD_ALL_ACCESS, NULL,
+                                        NULL, NULL, yghv_os_guest_thread,
+                                        (PVOID)(uintptr_t)i);
+            if (!NT_SUCCESS(st14)) {
+                LOG_ERROR("bm step 14: thread core %u failed 0x%x", i, st14);
+                break;
+            }
+        }
+        if (!NT_SUCCESS(st14)) {
+            g_os_guest_test_active = 0;
+            for (j = 0; j < bm_cores; j++)
+                if (threads[j]) ZwClose(threads[j]);
+            return st14;
+        }
+        for (i = 0; i < bm_cores; i++) {
+            st14 = KeWaitForSingleObject(&g_os_guest_done_events[i], Executive,
+                                         KernelMode, FALSE, &timeout);
+            if (st14 == STATUS_TIMEOUT)
+                break;
+        }
+        for (i = 0; i < bm_cores; i++)
+            if (threads[i]) ZwClose(threads[i]);
+        g_os_guest_test_active = 0;
+        for (i = 0; i < bm_cores; i++) {
+            if (!g_vcpus[i]) continue;
+            yghv_trace_u64("os guest exits", g_vcpus[i]->resident_exits);
+        }
+        yghv_trace_u64("os guest counter", g_os_guest_counter);
+        yghv_trace("bm os guest all done");
+        if (st14 == STATUS_TIMEOUT)
+            return st14;
         return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
     }
 

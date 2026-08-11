@@ -820,3 +820,15 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 构建：step13 v67 SHA256 `A45850CB25B2677D05687617593856AAF82E9ADC6A59DDCE47EBC20FA0BFF971`，
   归档 `D:\aaaaaavm\yuanguard_hv_v67_step13.sys`。
 - 下一步：step13b 全核（12 核）OS-guest 有界试点 → step14 无缝全核 OS 常驻（真正 OS-as-guest）。
+
+### 9.51 Phase B step14：全核 12 核 OS-guest 有界试点实机通过（2026-08-11）
+
+- step14（全部 12 核，core0-11）：实机 `sc start` RUNNING，日志 12 个
+  `os guest thread enter` / `os guest host done`，每核 `os guest exits=0x2710`
+  （10000 次退出），`os guest counter=0xea60`（5000 次迭代 × 12 核），
+  `bm os guest all done`；`sc stop` 干净回 STOPPED，无蓝屏/冻结。
+- 构建：step14 v68 SHA256 `B6C716D4D167598C075684AA98C62784BB4D68D7CC45077412862D806265972A`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v68_step14.sys`。
+- 修一个构建坑：`RtlStringCchPrintfA` 在 /Zl 无 CRT 链接下引入
+  `__stdio_common_vsprintf` 未解析符号，step14 日志改为顺序 `os guest exits`。
+- 下一步：无缝全核 OS 常驻（真正把整个 Windows 放进 guest，最高风险项）需单独立项设计。
