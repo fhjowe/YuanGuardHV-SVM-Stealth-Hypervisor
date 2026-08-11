@@ -67,3 +67,8 @@
 - [x] R1 第二步（VM 安全版）：NPT 权限注入/NPF 测试（v26 验证通过）
 - [ ] R1 第三步：小范围私有页剔除（VMCB/hsave，需裸机/KVM）
 - [ ] R1 第四步：NPT 自剔除 + 默认 NX（需裸机/KVM）
+- [x] Phase 3 第一版内存页写保护（v27，NPF+单步重放 VM 验证通过）
+- [x] Phase 3 第一版终止保护（v28，stub+VMMCALL 决策 VM 验证通过）
+- [x] Phase 3 第一版句柄保护（v29，双 hook 测试 VM 验证通过）
+- [x] Phase 3 常驻保护模式（v30，全核线程化 + 干净卸载 VM 验证通过）
+- [ ] 下一阶段：真实目标进程接入（IOCTL/Java 层配置通道）
