@@ -579,9 +579,12 @@ static NTSTATUS yghv_cpuid_stealth_test(void) {
         return STATUS_UNSUCCESSFUL;
     }
     svm_core_enter_resident_current(0);
-    LOG_ERROR("cpuid stealth test: hyper=0x%llx/0x%llx/0x%llx/0x%llx svm_ecx=0x%llx svm_leaf_eax=0x%llx",
+    LOG_ERROR("cpuid stealth test: leaf1_ecx=0x%llx hyper=0x%llx/0x%llx/0x%llx/0x%llx svm_ecx=0x%llx svm_leaf_eax=0x%llx",
+        v->regs.r14,
         v->regs.r8, v->regs.r9, v->regs.r10, v->regs.r11,
         v->regs.r12, v->regs.r13);
+    if (v->regs.r14 & (1ULL << 31))
+        ok = 0;
     if (v->regs.r8 != 0 || v->regs.r9 != 0 || v->regs.r10 != 0 ||
         v->regs.r11 != 0)
         ok = 0;

@@ -206,6 +206,10 @@ static void svm_emulate_cpuid(svm_vcpu_t *vcpu) {
     } else if (leaf == 0x8000000A) {
         /* SVM revision/features: return zeros */
         cpu_info[0] = cpu_info[1] = cpu_info[2] = cpu_info[3] = 0;
+    } else if (leaf == 1) {
+        /* Feature flags: clear hypervisor present bit */
+        __cpuidex(cpu_info, leaf, subleaf);
+        cpu_info[2] &= ~(1U << 31);
     } else {
         __cpuidex(cpu_info, leaf, subleaf);
     }

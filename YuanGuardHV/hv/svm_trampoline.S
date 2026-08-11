@@ -67,6 +67,9 @@ svm_trampoline_test_hook_guest_end:
     .globl svm_trampoline_test_cpuid_guest_end
 svm_trampoline_test_cpuid_guest:
     mov     r15, rcx                # save cookie; cpuid clobbers rcx
+    mov     rax, 1
+    cpuid
+    mov     r14, rcx                # leaf 1 ecx: bit31 = hypervisor present
     mov     rax, 0x40000000
     cpuid
     mov     r8, rax
