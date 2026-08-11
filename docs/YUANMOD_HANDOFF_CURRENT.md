@@ -92,6 +92,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | 用户确认第 3 项：NPT 共享状态加锁（g_protect/g_protect_hooks 跨 VCPU 保护）v34 | `npt_split_2mb_to_4kb` 用 `MmAllocateContiguousMemory` 只能 PASSIVE，自旋锁不可用 | `protect.c` 用 `FAST_MUTEX` 串行化共享状态与 NPT 权限修改；NPF/#DB 改走 on_npf_write/rearm 定点重锁；GET_STATE/HEARTBEAT 改快照 API |
 | 2026-08-11 | 用户确认第 4 项：目标进程生命周期（EPROCESS 校验、退出自动 disarm、PID 复用防护）v35 | 当前 set_target 无退出监控，目标退出后页仍武装、CR3 可能被复用 | `PsSetCreateProcessNotifyRoutineEx` 退出回调按 EPROCESS 身份清除；`g_persistent_mode` 让 auto-disarm 不退出 resident；新增 exit-test 工具验证 |
 | 2026-08-11 | 用户确认第 4 项改用 v36 轮询方案 | VM 的 ntoskrnl 对测试签名驱动调用 `PsSetCreateProcessNotifyRoutine`/`Ex` 都返回 0xC000007A 且残留回调，两次 0xCE | 删除进程通知注册；HEARTBEAT 每 10000 次退出用 `PsGetProcessExitTime`（MmGetSystemRoutineAddress 动态解析）轮询目标退出，命中则自动 disarm |
+| 2026-08-11 | 用户确认第 5 项 hook 加固 v38：页边界/指令边界校验 + 跨核 rendezvous | 现有 install_hook 直接覆盖 16 字节，无边界校验；运行时 hook 无跨核保护 | install_hook 增加边界校验；resident 循环协作暂停（pause_requested/ack + 事件）后写入补丁；新增负向测试与运行时 rendezvous 测试线程 |
 
 ## 7. 变更日志
 
@@ -107,6 +108,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | `YuanGuardHV/hv/{svm_trampoline.S,main.c,vmmcall.c}` | Phase 3 下一步 Task B：常驻模式接入真实受保护页与真实 hook v33 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-11 | `YuanGuardHV/hv/{protect.c,vmexit.c,vmmcall.c,control_device.c,main.c,common/svm_vcpu.h,common/protect.h}`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task C：NPT 共享状态加锁 v34 | 构建 SUCCESS + VM 验证通过（含并发 selftest） |
 | 2026-08-11 | `YuanGuardHV/hv/{protect.c,main.c,vmmcall.c,common/protect.h}`、`tools/yghv_ctl.ps1` | Phase 3 下一步 Task D：目标进程生命周期（v35-v37，最终为 KeWaitForSingleObject 轮询判活） | 构建 SUCCESS + VM 验证通过（selftest + exit-test） |
+| 2026-08-11 | `YuanGuardHV/hv/{protect.c,main.c,svm_core.c,common/svm_vcpu.h,common/protect.h}` | Phase 3 下一步 Task E：hook 加固（页/指令边界校验 + 跨核 rendezvous）v38 | 构建 SUCCESS + VM 验证通过（boundary + rendezvous + selftest/exit-test） |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -520,3 +522,15 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - v37 修复（用户确认）：判活原语改用 `KeWaitForSingleObject(g_protect.process, Executive, KernelMode, FALSE, 零超时)`，进程对象退出后变为 Signaled，返回 `STATUS_SUCCESS` 即判定退出；无新增内核导出依赖，轮询节奏不变。构建 SUCCESS，v37 SHA256 `2EA38EA2FF1833DF27C4D887D675D6F357CC71A168DF2E9724527E8EB66E8B47`，已复制 `D:\aaaaaavm\yuanguard_hv_v37.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 警告。
 - 验证（2026-08-11，VM 双核）：`sc start yuanguard` → RUNNING；`selftest: PASS`；`exit-test: PASS (active=0 pid=0 page_count=0)`（child pid=1692 退出后轮询自动 disarm）；KD 日志 `protect target: pid=1692 ...` → `protect target exited: auto disarm, pid cleared` → 心跳继续（`page=0x0 hook=0x0`）；`unload_driver.ps1` 干净卸载回 `STOPPED`，无蓝屏。
 - 结论：第 4 项完成。目标进程生命周期采用“持 EPROCESS 引用 + HEARTBEAT 轮询 KeWaitForSingleObject 判活 + 退出自动 disarm/清空目标与页表”，PID 复用防护靠引用期间 PID 不复用 + 退出即清空。残余项为 hook 加固（第 5 项）与控制面认证（第 6 项）。
+
+### 9.31 Phase 3 下一步 Task E：hook 加固（2026-08-11）
+
+- 用户确认方案：
+  - 页边界：install_hook 校验 `[func_va, func_va+16)` 不跨 4KB 页边界。
+  - 指令边界：新增最小 x86-64 长度解码器（REX/0F/ModRM/SIB/disp/imm 常见形式），要求第 16 字节处为指令边界，跨边界或未知指令拒绝。
+  - 跨核 rendezvous：svm_vcpu 增加 `pause_requested/pause_ack` 与暂停/恢复事件；resident 循环 VMRUN 前检查暂停标志，协作暂停后写入 16 字节补丁（install/remove 都走 pause/resume）；带超时上限。
+  - 测试：负向边界用例（跨页、指令流跨 16）在 DriverEntry 校验；运行时测试线程（卸载时 join）在 persistent 运行期间对独立池页 install/remove hook 1，验证 pause/resume 且 workload 心跳不断。
+- 范围：不加 IOCTL hook 接口、不改真实系统 hook；VMRUN 边界暂停对无退出的长函数不保证，留作后续 stop/restart 方案。
+- 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v38 SHA256 `DD9F76E2D09DC1D1953D3848461982C260E2638A7685A8CAC208EF8B09264D26`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v38.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v38.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
+- 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD 日志 `hook boundary test: PASS`、`hook rendezvous test: install rc=0x0 / remove rc=0x0 / PASS`（persistent 运行期间对独立池页 install/remove hook 1，pause/resume 生效）；workload 心跳持续滚动（4.6M+）；卸载回 `STOPPED`，无蓝屏。
+- 结论：第 5 项完成。install_hook 增加页边界 + 指令边界校验；install/remove 补丁写入走协作式跨核暂停（VMRUN 边界，超时 5s）。残余项为控制面认证（第 6 项）与 R1 私有页/NX（裸机/KVM）。
