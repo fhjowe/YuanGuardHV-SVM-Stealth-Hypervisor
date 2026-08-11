@@ -11,6 +11,9 @@
 #define YGHV_R1_SKIP_NPT_TEST 0
 #define YGHV_R1_NPT_UNIT_TEST 1
 #define YGHV_RESIDENT_WORKLOAD_TEST 1
+#ifndef YGHV_BAREMETAL_NO_RESIDENT
+#define YGHV_BAREMETAL_NO_RESIDENT 0
+#endif
 
 npt_mgr_t g_npt;
 uint64_t g_npt_test_pa;
@@ -69,6 +72,24 @@ void yghv_trace(const char *msg) {
     buf[msg_len] = '\r';
     buf[msg_len + 1] = '\n';
     ZwWriteFile(g_trace_file, NULL, NULL, NULL, &iosb, buf, (ULONG)(msg_len + 2), NULL, NULL);
+}
+
+static void yghv_trace_u64(const char *label, uint64_t v) {
+    static const char hex[] = "0123456789abcdef";
+    char buf[64];
+    size_t n = 0;
+    int i;
+    while (label[n] && n < sizeof(buf) - 1) {
+        buf[n] = label[n];
+        n++;
+    }
+    buf[n++] = '=';
+    buf[n++] = '0';
+    buf[n++] = 'x';
+    for (i = 15; i >= 0; i--)
+        buf[n++] = hex[(v >> (i * 4)) & 0xF];
+    buf[n] = 0;
+    yghv_trace(buf);
 }
 
 static void yghv_trace_close(void) {
@@ -186,6 +207,8 @@ static NTSTATUS yghv_r1_npt_unit_test(void) {
 
     entry = npt_read_entry(&g_npt, test_pa);
     trans = npt_translate(&g_npt, test_pa);
+    yghv_trace_u64("r1 test_pa", test_pa);
+    yghv_trace_u64("r1 trans", trans);
     LOG_ERROR("r1 unit: large entry=0x%llx trans=0x%llx", entry, trans);
     if (trans != test_pa) {
         LOG_ERROR("r1 unit: large identity FAILED");
@@ -760,9 +783,11 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
     }
 
-    sv = npt_init(&g_npt, 0x400000000ULL);
+    sv = npt_init(&g_npt, 0);
+    if (!sv)
+        sv = yghv_npt_map_ram(&g_npt);
     if (sv) {
-        LOG_ERROR("npt_init failed 0x%x", sv);
+        LOG_ERROR("npt_init/map_ram failed 0x%x", sv);
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;
@@ -809,11 +834,50 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     LOG_ERROR("NPT enabled for %u cores: pml4=0x%llx", online, g_npt.pml4_pa);
     yghv_trace("npt set ok");
 
+#if YGHV_BAREMETAL_NO_RESIDENT
+    /* Bare-metal smoke: this host hard-freezes on the first VMRUN, so validate
+       only non-resident paths (r1 NPT API, hook boundary, hook install/remove)
+       and hand off to the control device. */
+    sv = yghv_r1_npt_unit_test();
+    if (!sv)
+        sv = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+    if (!sv)
+        sv = yghv_hook_boundary_test();
+    if (!sv)
+        sv = yghv_hook_test();
+    if (sv) {
+        LOG_ERROR("bare-metal smoke: non-resident tests failed 0x%x", sv);
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        yghv_trace_close();
+        KeRevertToUserAffinityThread();
+        return sv;
+    }
+    sv = yghv_control_device_init(d);
+    if (sv) {
+        LOG_ERROR("bare-metal smoke: control device init failed 0x%x", sv);
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        yghv_trace_close();
+        KeRevertToUserAffinityThread();
+        return sv;
+    }
+    LOG_ERROR("bare-metal smoke: non-resident tests PASS, control device ready");
+    KeRevertToUserAffinityThread();
+    return STATUS_SUCCESS;
+#endif
+
 #if !YGHV_R1_SKIP_NPT_TEST
     /* Single-core NPT permission test first. */
     npt_test_buf = MmAllocateContiguousMemory(
         HV_LARGE_PAGE_SIZE * 2,
-        (PHYSICAL_ADDRESS){ .QuadPart = 0x400000000ULL });
+        (PHYSICAL_ADDRESS){ .QuadPart = 0x1000000000ULL });
     if (!npt_test_buf) {
         LOG_ERROR("npt_test_buf allocation failed");
         npt_cleanup(&g_npt);

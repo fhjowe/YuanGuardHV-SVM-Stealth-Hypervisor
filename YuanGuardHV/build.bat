@@ -48,6 +48,7 @@ set "INCLUDES=%INCLUDES% /I"%HV_DIR%\pool""
 set "CFLAGS=/nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-"
 set "CFLAGS=%CFLAGS% -Wno-microsoft -Wno-unknown-pragmas -Wno-ignored-attributes -Wno-visibility -Wno-pragma-pack"
 set "CFLAGS=%CFLAGS% /D_KERNEL_MODE /D_AMD64_ /DNTDDI_VERSION=0x0A000005 /DYGHV_DEBUG_LOG"
+if "%YGHV_BAREMETAL_NO_RESIDENT%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_BAREMETAL_NO_RESIDENT=1"
 
 set "LINKS=/nologo /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /MACHINE:X64"
 set "LINKS=%LINKS% /OPT:NOREF,NOICF"
