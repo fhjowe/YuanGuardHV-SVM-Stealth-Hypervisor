@@ -390,3 +390,12 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 偏差（简报代码无法直接编译）：`ntddk.h` 不声明 `PsLookupProcessByProcessId`，在 `protect.c` 增加该 API 的 `NTKERNELAPI` 前向声明；其余按简报逐字实现。
 - 验证：`cmd /c build.bat`（`D:\yuanguard\YuanGuardHV`）→ `Build SUCCESS`，签名成功；sys SHA256 `8298dd0ca4dd7acc6179e6e374542744b4ab0dd0ed2757b778ce2abaafd8afa0`。R1 测试宏未改动（`YGHV_R1_SKIP_NPT_TEST=0`、`YGHV_R1_NPT_UNIT_TEST=1`）。
 - 提交：`git commit -m "feat: protect 模块骨架（目标状态/页表遍历/NPT arm-disarm）"`。
+
+### 9.24 Phase 3 Task 1 审查修复（2026-08-11）
+
+- 审查发现的 3 处问题已按结论修复，仅改 `YuanGuardHV/hv/protect.c`：
+  - `yghv_protect_arm_page`：先调用 `npt_split_2mb_to_4kb(&g_npt, p->gpa)`，失败直接返回；成功后再 `npt_set_page_perm(..., NPT_PERM_PRESENT)`，避免整个 2MB 大页被只读。
+  - `yghv_protect_set_target`：先释放旧目标引用并清空 `process/cr3/pid`，再 `PsLookupProcessByProcessId`；CR3 先读入局部变量，非零才提交，CR3==0 时释放新进程引用并返回 `STATUS_INVALID_PARAMETER`，不触碰 `g_protect` 字段。
+  - `yghv_protect_remove_page`：armed 页 disarm 失败时返回该状态并保留页表项，不删除；`yghv_protect_stop` 遍历 disarm，任一失败记录首个错误并返回 `STATUS_UNSUCCESSFUL`（`g_protect.active` 保持 TRUE），全部成功才置 FALSE。
+- 验证：`cmd /c build.bat`（`D:\yuanguard\YuanGuardHV`）→ `Build SUCCESS`，签名成功；sys SHA256 `B2760FFCBFBD10FC5A9686F0C85DBAAD1CF4BA333179B20DD15B5C63436D3764`。仅预存 WDK intrinsic 警告与 `YGHV_DEBUG_LOG` 重定义警告，`protect.c` 无新增警告。
+- 提交：`git commit -m "fix: protect 模块审查问题（2MB 拆分/目标回滚/disarm 失败处理）"`（仅 protect.c；docs/报告不提交）。
