@@ -732,7 +732,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 15)
+    if (step > 16)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -1072,6 +1072,55 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         yghv_trace("bm os seamless done");
         if (st15 == STATUS_TIMEOUT)
             return st15;
+        return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    }
+
+    if (step == 16) {
+        ULONG i;
+        ULONG j;
+        ULONG bm_cores = g_vcpu_count;
+        HANDLE threads[SVM_MAX_CORES] = { 0 };
+        LARGE_INTEGER timeout;
+        NTSTATUS st16 = STATUS_SUCCESS;
+
+        yghv_trace("bm os seamless all start");
+        g_os_guest_test_active = 1;
+        g_os_guest_counter = 0;
+        timeout.QuadPart = -120LL * 10000000LL;
+        for (i = 0; i < bm_cores; i++) {
+            KeInitializeEvent(&g_os_guest_done_events[i], NotificationEvent, FALSE);
+            st16 = PsCreateSystemThread(&threads[i], THREAD_ALL_ACCESS, NULL,
+                                        NULL, NULL,
+                                        yghv_os_guest_seamless_thread,
+                                        (PVOID)(uintptr_t)i);
+            if (!NT_SUCCESS(st16)) {
+                LOG_ERROR("bm step 16: thread core %u failed 0x%x", i, st16);
+                break;
+            }
+        }
+        if (!NT_SUCCESS(st16)) {
+            g_os_guest_test_active = 0;
+            for (j = 0; j < bm_cores; j++)
+                if (threads[j]) ZwClose(threads[j]);
+            return st16;
+        }
+        for (i = 0; i < bm_cores; i++) {
+            st16 = KeWaitForSingleObject(&g_os_guest_done_events[i], Executive,
+                                         KernelMode, FALSE, &timeout);
+            if (st16 == STATUS_TIMEOUT)
+                break;
+        }
+        for (i = 0; i < bm_cores; i++)
+            if (threads[i]) ZwClose(threads[i]);
+        g_os_guest_test_active = 0;
+        for (i = 0; i < bm_cores; i++) {
+            if (!g_vcpus[i]) continue;
+            yghv_trace_u64("os seamless exits", g_vcpus[i]->resident_exits);
+        }
+        yghv_trace_u64("os guest counter", g_os_guest_counter);
+        yghv_trace("bm os seamless all done");
+        if (st16 == STATUS_TIMEOUT)
+            return st16;
         return g_os_guest_counter > 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
     }
 
