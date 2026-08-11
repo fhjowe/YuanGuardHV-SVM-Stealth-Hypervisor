@@ -265,6 +265,7 @@ static NTSTATUS yghv_protect_test(void) {
     uint64_t buf_pa, buf_va;
     uint64_t entry_after;
     svm_vcpu_t *v;
+    NTSTATUS st;
     int ok = 1;
 
     /* Phase B: policy matrix (synthetic) */
@@ -275,18 +276,34 @@ static NTSTATUS yghv_protect_test(void) {
     if (!ok) return STATUS_UNSUCCESSFUL;
 
     /* Phase C: real write trap, target = System (current process) */
-    yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+    st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect test: set_target FAILED 0x%x", st);
+        g_protect.cr3 = 0;   /* don't leave the synthetic policy CR3 behind */
+        return st;
+    }
     buf = MmAllocateContiguousMemory(HV_PAGE_SIZE,
         (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
-    if (!buf) return STATUS_INSUFFICIENT_RESOURCES;
+    if (!buf) {
+        yghv_protect_cleanup();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     RtlZeroMemory(buf, HV_PAGE_SIZE);
     buf_va = (uint64_t)buf;
     buf_pa = MmGetPhysicalAddress(buf).QuadPart;
-    if (yghv_protect_add_page(buf_va) ||
-        yghv_protect_start()) {
-        LOG_ERROR("protect test: setup FAILED");
+    st = yghv_protect_add_page(buf_va);
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect test: setup FAILED 0x%x", st);
         MmFreeContiguousMemory(buf);
-        return STATUS_UNSUCCESSFUL;
+        return st;
+    }
+    st = yghv_protect_start();
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect test: setup FAILED 0x%x", st);
+        yghv_protect_stop();
+        yghv_protect_remove_page(buf_va);
+        MmFreeContiguousMemory(buf);
+        return st;
     }
     entry_after = npt_read_entry(&g_npt, buf_pa);
     if (entry_after & NPT_PERM_WRITABLE) {
@@ -317,8 +334,19 @@ static NTSTATUS yghv_protect_test(void) {
         ok = 0;
     }
     LOG_ERROR("protect test: real write %s", ok ? "PASS" : "FAIL");
-    yghv_protect_stop();
-    yghv_protect_remove_page(buf_va);
+    st = yghv_protect_stop();
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect test: stop FAILED 0x%x", st);
+        yghv_protect_remove_page(buf_va);
+        MmFreeContiguousMemory(buf);
+        return st;
+    }
+    st = yghv_protect_remove_page(buf_va);
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("protect test: remove_page FAILED 0x%x", st);
+        MmFreeContiguousMemory(buf);
+        return st;
+    }
     MmFreeContiguousMemory(buf);
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
@@ -542,6 +570,9 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 
     if (!NT_SUCCESS(yghv_protect_test())) {
         LOG_ERROR("protect test failed");
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        yghv_protect_cleanup();
         npt_cleanup(&g_npt);
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
