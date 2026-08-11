@@ -1,6 +1,6 @@
 # Phase 3 进程保护设计（YuanGuardHV）
 
-> 状态：草案，等待用户审阅
+> 状态：已确认（修订版：终止/句柄保护改为补丁 stub + VMMCALL 决策）
 > 日期：2026-08-11
 > 基线：v26（commit 36a719a）
 > 关联文档：`docs/YUANMOD_HANDOFF_CURRENT.md`、`docs/TASKS.md`、`docs/SESSION_20260811.md`
@@ -60,7 +60,8 @@ YuanGuardHV 是 AMD-V SVM/NPT 隐形 Hypervisor，目标是替代原 YuanGuard �
 - `yghv_protect_target_t`：目标 `PID`、`EPROCESS*`、目标 `CR3`、启用标志（内存/终止/句柄）。
 - 受保护页表：`{GPA, 目标进程 VA, 标志}`。
 - `ADD_PAGE` 时按目标 CR3 遍历 guest 页表，把目标进程 VA 翻译为 GPA；目标 VA 当前无映射则命令失败。
-- 决策接口：`is_target_cr3()`、`on_npf_write()`、`on_exec_trap()`、`arm()/disarm()`。
+- 决策接口：`is_target_cr3()`、`on_npf_write()`、`on_hook_query()`、`install_hook()/remove_hook()`、`arm()/disarm()`。
+- 保存被 hook 函数开头 16 字节原值，trampoline 用原字节执行被 hook 函数本体。
 
 ### 4.2 `control_plane.h` / `vmmcall.c`
 
@@ -74,14 +75,15 @@ YuanGuardHV 是 AMD-V SVM/NPT 隐形 Hypervisor，目标是替代原 YuanGuard �
 | `START_PROTECT` | 进入常驻保护 |
 | `STOP_PROTECT` | 停止保护，恢复全部页 |
 | `GET_STATE` | 查询目标/页数/保护状态 |
+| `HOOK_QUERY` | trampoline 调用：上报函数 ID，由 Hypervisor 决定放行/拒绝 |
 
 ### 4.3 `vmexit.c` NPF 分支扩展
 
 - 受保护页写 NPF → 调 `on_npf_write()`。
-- 执行陷阱 NPF（EXEC）→ 调 `on_exec_trap()`。
+- 被 hook 函数页写 NPF → 按内存写保护策略处理（防篡改补丁）。
+- `HOOK_QUERY` VMMCALL → 调 `on_hook_query()` 决定放行/拒绝。
 - 保留现有 `g_npt_test_active` 测试路径和早期 NPF 路径。
 - 新增 `SVM_EXIT_EXCEPTION_DB` 分支，用于单步重放后重新加锁。
-- 新增 `INTERCEPT_RET` 分支，用于执行陷阱放行后重新加锁。
 
 ### 4.4 常驻模式
 
@@ -99,12 +101,16 @@ YuanGuardHV 是 AMD-V SVM/NPT 隐形 Hypervisor，目标是替代原 YuanGuard �
    - ring0 写：放行（单步重放后重新加锁）+ 节流记录。
 4. 每次放行都重新加锁，保护持续。
 
-### 5.2 执行陷阱（终止/句柄）
+### 5.2 补丁 stub（终止/句柄）
 
-1. 函数入口页 NPT 设 `NX=1`，任何进程调用都会在入口触发 NPF（EXEC）。
-2. 目标进程调用：清 NX、开 `INTERCEPT_RET`，函数执行；RET 到达时在 VMEXIT 重新设 NX、关 RET 拦截。
-3. 非目标调用：不执行原函数，读 `[rsp]` 拿返回地址，设 `RAX=STATUS_ACCESS_DENIED`、`RIP=返回地址`，记录事件。
-4. 嵌套子函数调用：RET 拦截配合调用深度计数，避免子函数 RET 提前重新加锁；计数异常有上限兜底。
+AMD SVM 没有近返回 `RET` 拦截，因此终止/句柄保护采用补丁 stub + VMMCALL 决策：
+
+1. 定位 `PspTerminateProcess` / `ObpCreateHandle` 后，保存函数开头 16 字节，把开头改为 `E9 rel32` 跳转到驱动内 trampoline。
+2. trampoline 以 `HOOK_QUERY` VMMCALL（带认证 cookie）向 Hypervisor 上报函数 ID；决策：
+   - 目标进程调用 → `RAX=0`，trampoline 执行保存的原字节，再跳回 原函数+patch 长度，函数正常执行。
+   - 非目标调用 → `RAX=STATUS_ACCESS_DENIED`，trampoline 直接返回，调用方收到拒绝。
+3. 函数页 NPT 设 `writable=0` 防篡改：任何进程改写函数开头都触发 NPF，按内存写保护策略处理。
+4. 卸载时恢复原字节并恢复页可写。
 
 ### 5.3 控制命令流
 
@@ -114,8 +120,9 @@ YuanGuardHV 是 AMD-V SVM/NPT 隐形 Hypervisor，目标是替代原 YuanGuard �
 
 - 配置失败回滚：`SET_TARGET/ADD_PAGE/START_PROTECT` 任一步失败，恢复已改 NPT 页并返回错误，不留半状态。
 - 单步重放：#DB 重新加锁失败时强制恢复只读并记录，带最大重试次数，防止无限 NPF/#DB 循环。
-- 执行陷阱：RET 深度计数异常有上限兜底强制重新加锁。
-- 拒绝路径只改 `RAX/RIP`，不碰栈。
+- 补丁 stub：patch 前校验函数页可写、patch 长度足够，保存原字节；patch 失败则禁用对应功能。
+- `HOOK_QUERY` 认证失败按拒绝处理，trampoline 不执行原字节。
+- 卸载恢复原字节前校验哈希，被外部篡改也恢复保存的原字节并记录。
 - 函数定位：`PspTerminateProcess` / `ObpCreateHandle` 是未导出函数，按当前 VM 镜像（19045.2965）模式定位；找不到则只禁用该功能并记录。
 - 目标退出/PID 复用：按 `EPROCESS` 指针校验；目标退出自动解除保护并恢复页权限。
 - 日志节流：ring0 放行记录和拒绝事件限速。
@@ -149,7 +156,8 @@ YuanGuardHV 是 AMD-V SVM/NPT 隐形 Hypervisor，目标是替代原 YuanGuard �
 
 ## 9. 风险与开放项
 
-- 执行陷阱的 RET 深度计数是最高风险点，需在 VM 中反复验证。
+- 补丁 stub 会修改内核代码字节，存在被完整性检测发现的风险；NPT 写保护与后续隐形可降低。
+- stub 方案无法阻止攻击者直接调用函数原始实现（inline hook 通病），后续可用影子 NPT 加强。
 - `PspTerminateProcess` / `ObpCreateHandle` 地址定位依赖镜像版本，后续需要更稳的定位策略。
 - 目标自身写保护的单步重放会产生额外 VMEXIT，性能影响需实测。
 - ring0 内存写只能记录放行；真正的静默拒绝需要影子页/COW，属后续阶段。
