@@ -19,6 +19,7 @@ YuanGuardHV/kd_cmd.txt
 YuanGuardHV/kd_ctl_err.txt
 YuanGuardHV/kd_ctl_in.txt
 YuanGuardHV/kd_ctl_out.txt
+YuanGuardHV/logs_archive/
 
 # clang-cl 在仓库根生成的中间汇编
 /svm_trampoline.asm
