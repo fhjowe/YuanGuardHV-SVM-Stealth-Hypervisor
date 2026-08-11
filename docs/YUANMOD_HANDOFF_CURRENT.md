@@ -399,3 +399,10 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - `yghv_protect_remove_page`：armed 页 disarm 失败时返回该状态并保留页表项，不删除；`yghv_protect_stop` 遍历 disarm，任一失败记录首个错误并返回 `STATUS_UNSUCCESSFUL`（`g_protect.active` 保持 TRUE），全部成功才置 FALSE。
 - 验证：`cmd /c build.bat`（`D:\yuanguard\YuanGuardHV`）→ `Build SUCCESS`，签名成功；sys SHA256 `B2760FFCBFBD10FC5A9686F0C85DBAAD1CF4BA333179B20DD15B5C63436D3764`。仅预存 WDK intrinsic 警告与 `YGHV_DEBUG_LOG` 重定义警告，`protect.c` 无新增警告。
 - 提交：`git commit -m "fix: protect 模块审查问题（2MB 拆分/目标回滚/disarm 失败处理）"`（仅 protect.c；docs/报告不提交）。
+
+### 9.25 Phase 3 Task 1 复查修复：protect start 回滚一致性（2026-08-11）
+
+- 发现：`yghv_protect_start` 在 arm 失败回滚时忽略 `yghv_protect_stop()` 返回值；若回滚期间 disarm 失败，会返回失败但 `g_protect.active` 仍为 FALSE，与仍有页面处于 armed 状态不一致。
+- 修复（仅改 `YuanGuardHV/hv/protect.c`）：arm 失败时保存 `yghv_protect_stop()` 的返回值。若全部 armed 页（含失败页 `armed == 1` 的情况）disarm 成功，则 `g_protect.active` 为 FALSE 并返回原始 arm 失败状态；若任一 disarm 失败，则记录回滚失败、将 `g_protect.active` 置为 TRUE（仍有页面受保护），并返回 `STATUS_UNSUCCESSFUL`。
+- 验证：`cmd /c build.bat`（`D:\yuanguard\YuanGuardHV`）→ `Build SUCCESS`，签名成功；sys SHA256 `C57DF990C99D42EE28B469CC5441FA8C9E418A148032DCF6C19CCEE8793AC7BE`（`Get-FileHash`）。仅预存 WDK intrinsic 警告与 `YGHV_DEBUG_LOG` 重定义警告，`protect.c` 无新增警告。
+- 提交：`git commit -m "fix: protect start 回滚状态一致性"`（仅 protect.c；docs/报告不提交）。
