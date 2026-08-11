@@ -661,3 +661,18 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 常驻观察：selftest/exit-test 后保持常驻约 90 秒，系统始终响应；`sc stop` 干净回 `STOPPED`。
 - 结论：**完整产品流程（常驻模式 + IOCTL 控制设备 + 目标生命周期 + 干净卸载）已在本机实机通过**，裸机不再只是冒烟/有界测试。
 - 下一步候选：小时级实机长跑；真实目标进程接入（Java/Minecraft 通过 IOCTL）；R1 私有页剔除/NPT 自剔除/默认 NX 在本机启用验证。
+
+### 9.41 真实目标进程接入：Java/JNI IOCTL 客户端（2026-08-11）
+
+- 用户选择方向 2：真实目标进程接入。本机有 JDK 21（Zulu，`D:\DevTools\zulu21`）。
+- 新增 `YuanGuardHV\tools\yghv_client\`（未改驱动内核）：
+  - `YghvCtl.java`：Java 命令行客户端，命令 `state / set-target / add-page / remove-page / start / stop / list-java / protect <pid> [maxPages]`。
+  - `native\yghv_ctl_jni.c`：JNI 桥封装 `CreateFile/DeviceIoControl`（IOCTL 与 `control_ioctl.h` 对齐），`enumeratePages` 用 `VirtualQueryEx` 枚举目标进程已提交页，优先 `MEM_IMAGE` 可执行映像页（上限 64，匹配 `YGHV_PROTECT_MAX_PAGES`）。
+  - `build_jni.bat / build.bat / run.bat / test\Sleepy.java / README.md / .gitignore`（构建产物忽略）。
+- 实机验证（v54 默认版加载，真实 Java 进程 PID=13240）：
+  - `protect 13240 64`：set-target OK，枚举 64 页，add-page 成功 37 页（`0x7FF680AF0000...` 可执行映像页），start OK，`state: active=1 pid=13240 page_count=39`。
+  - 10 秒后 state 仍 `active=1 pid=13240 page_count=39`（目标存活期保护保持）。
+  - 强杀 PID 13240 后轮询，state 自动变 `active=0 pid=0 page_count=0`（**真实 Java 目标退出自动 disarm 生效**）。
+  - `run.bat list-java` 能列出 java 进程；与 PowerShell `yghv_ctl.ps1 state` 交叉核对一致；`sc stop` 干净卸载。
+- 边界（已写入 README）：当前架构下真实进程代码仍跑 native，NPT/vmmcall 不会真正拦截它的写；本步交付的是真实目标接入的配置/页表通道与 Java 层基座。真实拦截需 OS-as-guest 里程碑。
+- 残余：Minecraft/Forge 实机接入未测；`protect` 目前按枚举页批量 add（部分页因 PTE 非 present 翻译失败属预期）；后续可加驱动侧“按目标 CR3 的合成写测试”验证 NPF 决策。

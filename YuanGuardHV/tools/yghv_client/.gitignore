@@ -1,0 +1,5 @@
+*.class
+native/*.dll
+native/*.lib
+native/*.exp
+native/*.obj
