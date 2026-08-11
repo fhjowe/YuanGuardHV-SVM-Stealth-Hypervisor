@@ -890,3 +890,14 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - `vmexit.c`：`g_os_resident_mode=TRUE` 时未知 VMEXIT 日志后继续（不再停机）。
 - step17：创建常驻线程后 DriverEntry 返回 RUNNING；**不可卸载**，验证后重启清除。
 - 构建：step17 v71 SHA256 `CAC5B3ADC5F8ABBCBC200C27FB591753D3318734B1838BA3019D1601204FDD7D`。
+
+### 9.57 step17a 冻结修复：GIF 隔离 + 存活日志（2026-08-12）
+
+- 首次 step17a 实机硬冻结（无 dump，00:18 重启），无法定位现场。
+- 修复一（`svm_trampoline.S`）：host 分发期间**保持 GIF=0**（去掉分发前 `stgi`），
+  时钟中断不会落在专用 host 栈上；stop 路径才 `stgi` 再进 C 收尾。
+- 修复二（`main.c`）：新增 `yghv_resident_alive_thread`（core0 每 5 秒写并 flush
+  `resident alive Ns`），冻结后可从 `C:\Windows\yghv_progress.log` 看存活时长。
+- 构建：step17 v72 SHA256 `C67C50C5BC2DF7E61D6E79C2BCD95E1F1FF7413758D23356D5A1B4F78707110A`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v72_step17.sys`。
+- 待验证：实机或 VM（建议 VM，崩了只崩 VM）。

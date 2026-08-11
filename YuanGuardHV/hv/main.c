@@ -18,6 +18,9 @@
 #define YGHV_BAREMETAL_STEP 0
 #endif
 
+NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
+                                        PIO_STATUS_BLOCK IoStatusBlock);
+
 npt_mgr_t g_npt;
 uint64_t g_npt_test_pa;
 volatile int g_npt_test_active;
@@ -84,6 +87,12 @@ void yghv_trace(const char *msg) {
     buf[msg_len] = '\r';
     buf[msg_len + 1] = '\n';
     ZwWriteFile(g_trace_file, NULL, NULL, NULL, &iosb, buf, (ULONG)(msg_len + 2), NULL, NULL);
+}
+
+static void yghv_trace_flush(void) {
+    IO_STATUS_BLOCK iosb;
+    if (g_trace_file)
+        ZwFlushBuffersFile(g_trace_file, &iosb);
 }
 
 void yghv_trace_u64(const char *label, uint64_t v) {
@@ -762,6 +771,21 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     }
 }
 
+static VOID yghv_resident_alive_thread(PVOID ctx) {
+    LARGE_INTEGER delay;
+    ULONG seconds = 0;
+    (void)ctx;
+
+    KeSetSystemAffinityThread((KAFFINITY)1);
+    delay.QuadPart = -5LL * 10000000LL;
+    for (;;) {
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        seconds += 5;
+        yghv_trace_u64("resident alive", seconds);
+        yghv_trace_flush();
+    }
+}
+
 static NTSTATUS yghv_baremetal_step_test(int step) {
     svm_vcpu_t *v = svm_core_get_vcpu(0);
     void *npf_page = NULL;
@@ -1165,6 +1189,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (step == 17) {
         HANDLE thread;
+        HANDLE alive;
         NTSTATUS st17;
 
         yghv_trace("bm os resident start");
@@ -1179,9 +1204,18 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             g_os_resident_mode = FALSE;
             return st17;
         }
+        st17 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st17)) {
+            LOG_ERROR("bm step 17: alive thread create failed 0x%x", st17);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            return st17;
+        }
         KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
                               KernelMode, FALSE, NULL);
         ZwClose(thread);
+        ZwClose(alive);
         yghv_trace("bm os resident running");
         return STATUS_SUCCESS;
     }

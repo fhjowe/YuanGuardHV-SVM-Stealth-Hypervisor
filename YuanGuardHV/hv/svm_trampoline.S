@@ -366,8 +366,9 @@ os_enter_exit:
     mov     qword ptr [rdi + 0x78 + 0x48], rsi
     pop     rsi
     mov     qword ptr [rdi + 0x78 + 0x40], rsi
-    stgi
 
+    # Keep GIF=0 while running the host dispatch so a clock interrupt can
+    # never be serviced on the dedicated host stack.
     mov     rcx, rdi                           # rcx = vcpu
     call    svm_dispatch_exit
     test    eax, eax
@@ -375,6 +376,7 @@ os_enter_exit:
     jmp     os_enter_resume
 
 svm_os_guest_host_done:
+    stgi
     # Windows kernel APIs must run on the current thread's real stack;
     # restore it before jumping to the C cleanup path.
     mov     rax, qword ptr [rsp + 8]            # vcpu
