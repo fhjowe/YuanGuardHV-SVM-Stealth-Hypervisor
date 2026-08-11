@@ -52,6 +52,34 @@ svm_trampoline_test_prot_write_resume:
     jmp svm_trampoline_test_prot_write
 svm_trampoline_test_prot_write_end:
 
+# --- Resident hook guest: call hooked dummy, capture stub result ---
+    .globl svm_trampoline_test_hook_guest
+    .globl svm_trampoline_test_hook_guest_end
+svm_trampoline_test_hook_guest:
+    call    rsi
+    mov     rdx, rax
+    mov     rax, 2                  # YGHV_CMD_STOP_INTERNAL
+    vmmcall
+svm_trampoline_test_hook_guest_end:
+
+# --- Resident workload guest: protected write + hooked call + heartbeat ---
+    .globl svm_trampoline_test_resident_guest
+    .globl svm_trampoline_test_resident_guest_end
+svm_trampoline_test_resident_guest:
+    test    rdi, rdi
+    jz      1f
+    mov     qword ptr [rdi], 0x1234
+1:
+    test    rsi, rsi
+    jz      2f
+    call    rsi
+    mov     rdx, rax
+2:
+    mov     rax, 1                  # YGHV_CMD_HEARTBEAT
+    vmmcall
+    jmp     svm_trampoline_test_resident_guest
+svm_trampoline_test_resident_guest_end:
+
 # ============================================================
 # uint64_t svm_vmrun_trampoline(svm_vcpu_t *vcpu)
 #   RCX = vcpu pointer

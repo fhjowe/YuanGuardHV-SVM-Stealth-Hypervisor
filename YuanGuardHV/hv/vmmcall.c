@@ -20,9 +20,19 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
 
     case YGHV_CMD_HEARTBEAT: {
         if (g_protect.active) {
+            if (yghv_protect_is_target_cr3(vcpu->vmcb->state.cr3)) {
+                vcpu->regs.rdi = g_protect.page_count
+                    ? g_protect.pages[0].target_va : 0;
+                vcpu->regs.rsi = g_protect_hooks[0].installed
+                    ? g_protect_hooks[0].func_va : 0;
+            } else {
+                vcpu->regs.rdi = 0;
+                vcpu->regs.rsi = 0;
+            }
             if ((vcpu->resident_exits % 10000ULL) == 0)
-                LOG_ERROR("heartbeat protect exits=%llu core=%u",
-                    vcpu->resident_exits, vcpu->resident_index);
+                LOG_ERROR("heartbeat protect exits=%llu core=%u page=0x%llx hook=0x%llx last=0x%llx",
+                    vcpu->resident_exits, vcpu->resident_index,
+                    vcpu->regs.rdi, vcpu->regs.rsi, vcpu->regs.rdx);
             vcpu->regs.rax = YGHV_STATUS_OK;
             return 0;
         }

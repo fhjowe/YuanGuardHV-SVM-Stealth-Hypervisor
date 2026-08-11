@@ -10,11 +10,13 @@
 
 #define YGHV_R1_SKIP_NPT_TEST 0
 #define YGHV_R1_NPT_UNIT_TEST 1
+#define YGHV_RESIDENT_WORKLOAD_TEST 1
 
 npt_mgr_t g_npt;
 uint64_t g_npt_test_pa;
 volatile int g_npt_test_active;
 void *g_guest_code_page = NULL;
+void *g_resident_workload_page = NULL;
 uint64_t g_guest_hb_va = 0;
 uint64_t g_guest_npt_va = 0;
 HANDLE g_trace_file = NULL;
@@ -28,6 +30,10 @@ extern const uint8_t svm_trampoline_test_npt_guest_end[];
 extern const uint8_t svm_trampoline_test_prot_write[];
 extern const uint8_t svm_trampoline_test_prot_write_resume[];
 extern const uint8_t svm_trampoline_test_prot_write_end[];
+extern const uint8_t svm_trampoline_test_hook_guest[];
+extern const uint8_t svm_trampoline_test_hook_guest_end[];
+extern const uint8_t svm_trampoline_test_resident_guest[];
+extern const uint8_t svm_trampoline_test_resident_guest_end[];
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD DriverUnload;
@@ -451,6 +457,72 @@ static NTSTATUS yghv_hook_test(void) {
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+static NTSTATUS yghv_hook_resident_test(void) {
+    uint64_t dummy = (uint64_t)yghv_hook_test_dummy;
+    uint64_t real_cr3;
+    svm_vcpu_t *v;
+    NTSTATUS st;
+    int ok = 1;
+
+    st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("hook resident test: set_target FAILED 0x%x", st);
+        return st;
+    }
+    if (yghv_protect_install_hook(0, dummy)) {
+        LOG_ERROR("hook resident test: install FAILED");
+        return STATUS_UNSUCCESSFUL;
+    }
+    real_cr3 = g_protect.cr3;
+
+    v = svm_core_get_vcpu(0);
+    v->regs.rsi = dummy;
+    v->regs.rcx = g_vmmcall_auth_cookie;
+    v->vmcb->state.cr3 = real_cr3;
+    v->vmcb->state.rip = (uint64_t)svm_trampoline_test_hook_guest;
+    v->vmcb->state.rax = 0;
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
+        LOG_ERROR("hook resident test: npt restore FAILED");
+        yghv_protect_remove_hook(0);
+        return STATUS_UNSUCCESSFUL;
+    }
+    svm_core_enter_resident_current(0);
+    LOG_ERROR("hook resident test: allow rdx=0x%llx", v->regs.rdx);
+    if (v->regs.rdx != 0)
+        ok = 0;
+
+    /* Deny: keep guest CR3 valid, shift g_protect.cr3 out of match. */
+    g_protect.cr3 = real_cr3 + 0x1000;
+    v->regs.rsi = dummy;
+    v->regs.rcx = g_vmmcall_auth_cookie;
+    v->vmcb->state.cr3 = real_cr3;
+    v->vmcb->state.rip = (uint64_t)svm_trampoline_test_hook_guest;
+    v->vmcb->state.rax = 0;
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
+        LOG_ERROR("hook resident test: npt restore #2 FAILED");
+        g_protect.cr3 = real_cr3;
+        yghv_protect_remove_hook(0);
+        return STATUS_UNSUCCESSFUL;
+    }
+    svm_core_enter_resident_current(0);
+    LOG_ERROR("hook resident test: deny rdx=0x%llx", v->regs.rdx);
+    if (v->regs.rdx != 0xC0000022ULL)
+        ok = 0;
+    g_protect.cr3 = real_cr3;
+
+    st = yghv_protect_remove_hook(0);
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("hook resident test: remove FAILED 0x%x", st);
+        ok = 0;
+    }
+    LOG_ERROR("hook resident test: %s", ok ? "PASS" : "FAIL");
+    return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+
 static NTSTATUS yghv_make_guest_code_executable(void) {
     uint64_t pa = MmGetPhysicalAddress(g_guest_code_page).QuadPart;
     NTSTATUS st = npt_split_2mb_to_4kb(&g_npt, pa);
@@ -475,8 +547,10 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_protect_cleanup();
     if (g_guest_code_page)
-        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+    if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
     g_guest_code_page = NULL;
+    if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
+    g_resident_workload_page = NULL;
     npt_cleanup(&g_npt);
     svm_core_cleanup();
     KeRevertToUserAffinityThread();
@@ -697,6 +771,19 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         return STATUS_UNSUCCESSFUL;
     }
 
+    if (!NT_SUCCESS(yghv_hook_resident_test())) {
+        LOG_ERROR("protect hook resident test failed");
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        KeRevertToUserAffinityThread();
+        return STATUS_UNSUCCESSFUL;
+    }
+
     /* Reset CPU0 to the heartbeat guest for the multi-core resident test. */
     svm_core_prepare_vcpu_other(0);
     yghv_trace("cpu0 reset");
@@ -737,12 +824,43 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     g_guest_code_page = NULL;
     yghv_trace_close();
 
+#if YGHV_RESIDENT_WORKLOAD_TEST
+    g_resident_workload_page = MmAllocateContiguousMemory(
+        HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (!g_resident_workload_page) {
+        LOG_ERROR("resident workload: page alloc failed");
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        KeRevertToUserAffinityThread();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    RtlZeroMemory(g_resident_workload_page, HV_PAGE_SIZE);
+    sv = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+    if (!sv)
+        sv = yghv_protect_add_page((uint64_t)g_resident_workload_page);
+    if (!sv)
+        sv = yghv_protect_install_hook(0, (uint64_t)yghv_hook_test_dummy);
+    if (sv) {
+        LOG_ERROR("resident workload: setup failed 0x%x", sv);
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
+        g_resident_workload_page = NULL;
+        KeRevertToUserAffinityThread();
+        return sv;
+    }
+#endif
+
     sv = yghv_protect_start();
     if (sv) {
         LOG_ERROR("persistent protect start failed 0x%x", sv);
         yghv_protect_cleanup();
         npt_cleanup(&g_npt);
         svm_core_cleanup();
+        if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
+        g_resident_workload_page = NULL;
         if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
         npt_test_buf = NULL;
         g_npt_test_active = 0;
@@ -756,13 +874,29 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
+#if YGHV_RESIDENT_WORKLOAD_TEST
+        if (i == 0) {
+            g_vcpus[i]->vmcb->state.rip =
+                (uint64_t)svm_trampoline_test_resident_guest;
+            g_vcpus[i]->regs.rdi = (uint64_t)g_resident_workload_page;
+            g_vcpus[i]->regs.rsi = (uint64_t)yghv_hook_test_dummy;
+        } else {
+            g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
+            g_vcpus[i]->regs.rdi = 0;
+            g_vcpus[i]->regs.rsi = 0;
+        }
+        g_vcpus[i]->vmcb->state.cr3 = g_protect.cr3;
+#else
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
+#endif
         sv = svm_core_set_npt(i, g_npt.pml4_pa);
         if (sv) {
             LOG_ERROR("persistent vcpu prepare core %u failed 0x%x", i, sv);
             yghv_protect_cleanup();
             npt_cleanup(&g_npt);
             svm_core_cleanup();
+            if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
+            g_resident_workload_page = NULL;
             if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
             npt_test_buf = NULL;
             g_npt_test_active = 0;
@@ -784,6 +918,8 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         yghv_protect_cleanup();
         npt_cleanup(&g_npt);
         svm_core_cleanup();
+        if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);
+        g_resident_workload_page = NULL;
         if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
         npt_test_buf = NULL;
         g_npt_test_active = 0;
