@@ -15,6 +15,7 @@
 npt_mgr_t g_npt;
 uint64_t g_npt_test_pa;
 volatile int g_npt_test_active;
+volatile BOOLEAN g_persistent_mode = FALSE;
 void *g_guest_code_page = NULL;
 void *g_resident_workload_page = NULL;
 uint64_t g_guest_hb_va = 0;
@@ -936,6 +937,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         return (NTSTATUS)sv;
     }
     svm_core_wait_remote_ready(online);
+    g_persistent_mode = TRUE;
     LOG_ERROR("persistent protect mode active: %u cores", online);
     KeRevertToUserAffinityThread();
     return STATUS_SUCCESS;

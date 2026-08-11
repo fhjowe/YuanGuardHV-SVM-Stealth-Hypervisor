@@ -90,6 +90,9 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
     uint64_t cr3;
     NTSTATUS st;
 
+    if (pid == 0)
+        return STATUS_INVALID_PARAMETER;
+
     ExAcquireFastMutex(&g_protect_lock);
     if (g_protect.process) {
         ObDereferenceObject(g_protect.process);
@@ -103,6 +106,11 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect set_target: lookup pid %u failed 0x%x", pid, st);
         return st;
+    }
+    if (PsGetProcessId(proc) != (HANDLE)(ULONG_PTR)pid) {
+        ObDereferenceObject(proc);
+        LOG_ERROR("protect set_target: pid mismatch %u", pid);
+        return STATUS_INVALID_PARAMETER;
     }
 
     /* KPROCESS.DirectoryTableBase on 19045 is at offset 0x028. */
@@ -359,6 +367,50 @@ void yghv_protect_get_heartbeat(uint64_t *page_va, uint64_t *hook_va) {
     if (hook_va)
         *hook_va = g_protect_hooks[0].installed ? g_protect_hooks[0].func_va : 0;
     ExReleaseFastMutex(&g_protect_lock);
+}
+
+BOOLEAN yghv_protect_check_target_exited(void) {
+    PEPROCESS proc;
+    uint32_t pid;
+    LARGE_INTEGER timeout;
+    NTSTATUS st;
+
+    ExAcquireFastMutex(&g_protect_lock);
+    proc = g_protect.process;
+    pid = g_protect.pid;
+    ExReleaseFastMutex(&g_protect_lock);
+    if (!proc)
+        return FALSE;
+    timeout.QuadPart = 0;
+    st = KeWaitForSingleObject(proc, Executive, KernelMode, FALSE, &timeout);
+    if (st != STATUS_SUCCESS)
+        return FALSE;
+    return yghv_protect_on_target_exit(pid);
+}
+
+BOOLEAN yghv_protect_on_target_exit(ULONG pid) {
+    BOOLEAN handled = FALSE;
+    uint32_t i;
+
+    ExAcquireFastMutex(&g_protect_lock);
+    if (g_protect.process && g_protect.pid == pid) {
+        NTSTATUS st = yghv_protect_stop_locked();
+        if (st)
+            LOG_ERROR("protect target exit: stop failed 0x%x", st);
+        for (i = 0; i < YGHV_PROTECT_MAX_HOOKS; i++) {
+            if (g_protect_hooks[i].installed)
+                yghv_protect_remove_hook_locked(i);
+        }
+        g_protect.page_count = 0;
+        ObDereferenceObject(g_protect.process);
+        g_protect.process = NULL;
+        g_protect.pid = 0;
+        g_protect.cr3 = 0;
+        handled = TRUE;
+        LOG_ERROR("protect target exited: auto disarm, pid cleared");
+    }
+    ExReleaseFastMutex(&g_protect_lock);
+    return handled;
 }
 
 static uint8_t *g_hook_stub_pages[YGHV_PROTECT_MAX_HOOKS];

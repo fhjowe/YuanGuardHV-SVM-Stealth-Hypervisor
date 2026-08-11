@@ -65,6 +65,8 @@ yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa);
 void yghv_protect_rearm(svm_vcpu_t *vcpu);
 void yghv_protect_get_state(ULONG *active, ULONG *pid, ULONG *page_count);
 void yghv_protect_get_heartbeat(uint64_t *page_va, uint64_t *hook_va);
+BOOLEAN yghv_protect_check_target_exited(void);
+BOOLEAN yghv_protect_on_target_exit(ULONG pid);
 
 extern yghv_protect_state_t g_protect;
 extern yghv_protect_hook_t g_protect_hooks[YGHV_PROTECT_MAX_HOOKS];

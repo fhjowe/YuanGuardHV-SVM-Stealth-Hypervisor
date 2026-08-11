@@ -12,6 +12,7 @@
 #define YGHV_HEARTBEAT_TEST_LIMIT    10000ULL
 
 uint64_t g_vmmcall_auth_cookie;
+extern volatile BOOLEAN g_persistent_mode;
 
 int vmmcall_dispatch(svm_vcpu_t *vcpu) {
     uint64_t cmd = vcpu->regs.rax;
@@ -22,7 +23,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         ULONG active;
         uint64_t page_va = 0, hook_va = 0;
         yghv_protect_get_state(&active, NULL, NULL);
-        if (active) {
+        if (active || g_persistent_mode) {
             if (yghv_protect_is_target_cr3(vcpu->vmcb->state.cr3)) {
                 yghv_protect_get_heartbeat(&page_va, &hook_va);
                 vcpu->regs.rdi = page_va;
@@ -31,6 +32,8 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
                 vcpu->regs.rdi = 0;
                 vcpu->regs.rsi = 0;
             }
+            if ((vcpu->resident_exits % 10000ULL) == 0)
+                yghv_protect_check_target_exited();
             if ((vcpu->resident_exits % 10000ULL) == 0)
                 LOG_ERROR("heartbeat protect exits=%llu core=%u page=0x%llx hook=0x%llx last=0x%llx",
                     vcpu->resident_exits, vcpu->resident_index,

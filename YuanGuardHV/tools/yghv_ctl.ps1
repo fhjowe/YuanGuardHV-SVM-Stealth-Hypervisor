@@ -10,6 +10,7 @@ Commands:
   start
   stop
   selftest
+  exit-test
 #>
 param(
     [Parameter(Position = 0)][string]$Command = 'state',
@@ -194,6 +195,51 @@ try {
                 Write-Host 'selftest: PASS'
             } finally {
                 $gc.Free()
+            }
+        }
+        'exit-test' {
+            $child = Start-Process -FilePath 'cmd.exe' `
+                -ArgumentList '/c ping -n 3 127.0.0.1 >nul' `
+                -PassThru -WindowStyle Hidden
+            try {
+                $childPid = $child.Id
+                Write-Host ("exit-test: child pid={0}" -f $childPid)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x800)) `
+                    -InBytes ([BitConverter]::GetBytes([uint32]$childPid)) | Out-Null
+                Write-Host 'exit-test: set-target OK'
+
+                $st = Read-YghvState
+                if ($st.pid -ne $childPid) {
+                    throw ("exit-test: target not set (pid={0})" -f $st.pid)
+                }
+
+                $deadline = (Get-Date).AddSeconds(20)
+                while ((Get-Date) -lt $deadline) {
+                    $child.Refresh()
+                    if ($child.HasExited) { break }
+                    Start-Sleep -Milliseconds 200
+                }
+                if (-not $child.HasExited) {
+                    throw 'exit-test: child did not exit in time'
+                }
+
+                $deadline = (Get-Date).AddSeconds(10)
+                do {
+                    Start-Sleep -Milliseconds 250
+                    $st = Read-YghvState
+                } while (($st.active -ne 0 -or $st.pid -ne 0) -and
+                    (Get-Date) -lt $deadline)
+                if ($st.active -ne 0 -or $st.pid -ne 0) {
+                    throw ("exit-test: auto disarm not observed (active={0} pid={1} page_count={2})" -f
+                        $st.active, $st.pid, $st.pageCount)
+                }
+                Write-Host ("exit-test: PASS (active=0 pid=0 page_count={0})" -f
+                    $st.pageCount)
+            } finally {
+                if (-not $child.HasExited) {
+                    Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
+                }
+                $child.Dispose()
             }
         }
         default {
