@@ -67,12 +67,19 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     case SVM_EXIT_EXCEPTION_DB:
         if (vcpu->rearm_gpa) {
             yghv_protect_page_t *pp = yghv_protect_find_page(vcpu->rearm_gpa);
-            if (pp)
-                yghv_protect_arm_page(pp);
+            if (pp) {
+                int st = yghv_protect_arm_page(pp);
+                if (st)
+                    LOG_ERROR("protect: re-arm failed gpa=0x%llx st=0x%x",
+                        pp->gpa, st);
+            }
             vcpu->rearm_gpa = 0;
             vcpu->vmcb->state.rflags &= ~0x100ULL;
             return 0;
         }
+        /* Guest-visible #DB (INT1, TF, HW breakpoints): re-inject, no error code */
+        vcpu->vmcb->control.event_injection =
+            SVM_EVENTINJ_VALID | SVM_EVENTINJ_TYPE_EXC | 0x01;
         return 0;
 
     /* NPF = fault-like, no RIP advance — instruction re-executes */
@@ -86,18 +93,29 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
             static uint64_t ring0_logged = 0;
             if (yghv_protect_is_target_cr3(vcpu->vmcb->state.cr3) ||
                 vcpu->vmcb->state.cpl == 0) {
+                int st;
                 /* target process or ring0: allow one write, re-arm after #DB */
-                yghv_protect_disarm_page(pp);
+                st = yghv_protect_disarm_page(pp);
+                if (st) {
+                    LOG_ERROR("protect: disarm failed gpa=0x%llx st=0x%x",
+                        pp->gpa, st);
+                    return 0;
+                }
                 vcpu->rearm_gpa = pp->gpa;
                 vcpu->vmcb->state.rflags |= 0x100ULL;  /* TF */
                 if (vcpu->vmcb->state.cpl == 0 && ring0_logged++ < 32)
                     LOG_ERROR("protect: ring0 write allowed gpa=0x%llx", pp->gpa);
                 return 0;
             }
-            /* foreign user-mode write: inject #PF with write error code */
+            /* foreign user-mode write: inject #PF with accurate error code */
+            if (info1 & NPF_INFO1_PRESENT) pf_ec |= (1ULL << 0);
+            if (info1 & NPF_INFO1_WRITE)   pf_ec |= (1ULL << 1);
+            if (info1 & NPF_INFO1_USER)    pf_ec |= (1ULL << 2);
+            if (info1 & NPF_INFO1_RSVD)    pf_ec |= (1ULL << 3);
+            if (info1 & NPF_INFO1_EXEC)    pf_ec |= (1ULL << 4);
             vcpu->vmcb->control.event_injection =
                 SVM_EVENTINJ_VALID | SVM_EVENTINJ_TYPE_EXC |
-                SVM_EVENTINJ_ERROR_VALID | 0x0E | (2ULL << 32);
+                SVM_EVENTINJ_ERROR_VALID | 0x0E | (pf_ec << 32);
             LOG_ERROR("protect: foreign write denied gpa=0x%llx cr3=0x%llx",
                 pp->gpa, vcpu->vmcb->state.cr3);
             return 0;
