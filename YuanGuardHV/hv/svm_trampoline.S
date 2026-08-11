@@ -364,7 +364,7 @@ os_enter_exit:
     mov     qword ptr [rdi + 0x78 + 0x40], rsi
     stgi
 
-    mov     ecx, edi                           # rcx = vcpu
+    mov     rcx, rdi                           # rcx = vcpu
     call    svm_dispatch_exit
     test    eax, eax
     jnz     svm_os_guest_host_done

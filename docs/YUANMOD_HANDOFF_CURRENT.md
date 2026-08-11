@@ -775,3 +775,17 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 构建：step12 v64 SHA256 `70D071622DF524FAC6603C8C9587BBB6D2195C593B74E68B5555277AE739072C`，
   归档 `D:\aaaaaavm\yuanguard_hv_v64_step12.sys`。
 - 现状：四次崩溃均有 dump/反汇编级根因并已修；v64 未加载。
+
+### 9.48 OS-as-Guest Phase A：第五次崩溃（0x139）与 vcpu 指针截断修复（2026-08-11）
+
+- v64 实机再试蓝屏：**0x139 KERNEL_SECURITY_CHECK_FAILURE，Arg1=4**（线程栈指针不在
+  合法栈范围），异常源 `yuanguard_hv+0x56b1` = `svm_dispatch_exit` 入口
+  `mov (%rcx),%rax` 读取 vcpu 指针时 #PF。
+- 根因（反汇编实锤）：trampoline 调用 `svm_dispatch_exit` 前用了
+  **`mov ecx, edi`（32 位）**，把 64 位 vcpu 指针截断成低 32 位 → 无效地址读 →
+  #PF；异常在专用 host 栈上分发 → Windows 安全检查 0x139。
+- 修复（`svm_trampoline.S`）：`mov ecx, edi` → `mov rcx, rdi`，
+  objdump 确认 `movq %rdi,%rcx`。
+- 构建：step12 v65 SHA256 `6C5DCA647334463D0A63FFDEEB598C824F3EA882C640465A8D875D587E1505B0`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v65_step12.sys`。
+- 现状：五次崩溃均有 dump/反汇编级根因并已修；v65 未加载。
