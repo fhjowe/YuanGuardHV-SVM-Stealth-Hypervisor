@@ -23,6 +23,9 @@ YuanGuardHV/kd_ctl_out.txt
 # clang-cl 在仓库根生成的中间汇编
 /svm_trampoline.asm
 
+# subagent-driven-development scratch
+.superpowers/
+
 # IDE / OS noise
 .vs/
 .idea/
