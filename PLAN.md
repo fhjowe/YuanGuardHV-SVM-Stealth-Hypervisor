@@ -190,8 +190,8 @@ D:\yuanguard\
 - [ ] `control_plane.h`: 命令 ID 枚举定义
 
 ### 1.7–1.10 基础保护功能 [P1]
-- [ ] NPT 句柄保护 (PP-001) — `ObpCreateHandle` Execute Trap
-- [ ] 进程终止保护 (PP-002) — TerminateProcess 路径拦截
+- [x] NPT 句柄保护 (PP-001) — 一版完成：补丁 stub + VMMCALL 决策（AMD 无 RET 拦截，故非 Execute Trap）
+- [x] 进程终止保护 (PP-002) — 一版完成：`ZwTerminateProcess` stub + VMMCALL 决策
 - [ ] JVM DLL 完整性扫描 — NPT 直读 + SHA-256 对比
 - [ ] 句柄枚举 — PspCidTable NPT 遍历
 
@@ -315,7 +315,8 @@ openspec/changes/yuanguard-hypervisor/
 - [x] 多核 DPC（每核系统线程，双核 10000 轮心跳验证通过）
 - [ ] 安全地基（NPT 最小权限/VMMCALL 认证）
 - [ ] 隐形（loader_stealth 未编译、CPUID 隐身死代码）
-- [ ] 保护功能与 Java 层（均未开始）
+- [x] 保护功能一版（内存写/终止/句柄）完成并合并 main
+- [ ] 真实目标进程接入（IOCTL/Java 层）、隐形、JVM 完整性扫描（下一阶段）
 
 ---
 

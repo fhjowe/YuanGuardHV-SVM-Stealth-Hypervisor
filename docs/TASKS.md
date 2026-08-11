@@ -44,7 +44,8 @@
 
 ## 2. 后续 Phase（未开始）
 
-- [ ] Phase 3 隐形、保护功能、Java 层
+- [x] Phase 3 第一版进程保护（v27-v31，已完成并合并 main）
+- [ ] Phase 3 隐形、真实目标接入、Java 层（下一阶段）
 - [ ] `tests/`、`mod/`、`vm/` 目录补齐
 - [ ] 仓库卫生清理（`hv/common/*.bak`、`reference_*` 迁移、历史日志归档）
 - [ ] 宿主稳定性处理：拔除/禁用 USB WiFi 设备或重装其驱动，确认 VMware 可稳定运行
@@ -54,13 +55,14 @@
 - [ ] 后续调试通道：换机/KVM，或裸机验证（testsigning、min_drv 加载链、崩溃转储分析）
 - [ ] 验证串口管道假设：`Windows 10` VM 稳定运行中（`vhv.enable=TRUE`/USB 开/无调试管道），对照旧 VM 差异（`yuanhv_debug` 管道），决定下一步是否重建调试 VM
 
-## 3. 当前阶段结论（2026-08-10 晚）
+## 3. 当前阶段结论（2026-08-11）
 
 - [x] Phase 2a：SVM init + VMRUN 单核（10000 轮 VMMCALL 心跳）
 - [x] Phase 2b：NPT identity-map + NPF（16GB 映射 + 权限缺页注入）
 - [x] Phase 2c：多核 DPC（每核系统线程，双核 10000 轮心跳验证通过）
 - [ ] Phase 2d：物理机验证（未做）
-- [ ] Phase 3+：隐形/保护/Java 层（未开始）
+- [x] Phase 3 第一版保护：内存页写保护（v27）、终止保护（v28）、句柄保护（v29）、常驻模式（v30/v31）
+- [ ] Phase 3 隐形、真实目标接入、Java 层（下一阶段）
 - [ ] R1 安全地基（代码已部分实现，VMware 嵌套环境阻塞验证）
 - [x] v22 稳定基线恢复（v7 路径 + 认证注入，双核心跳与卸载重载通过）
 - [x] R1 第一步：NPT translate/perm-range/split 安全单测（v25 验证通过）
@@ -71,5 +73,7 @@
 - [x] Phase 3 第一版终止保护（v28，stub+VMMCALL 决策 VM 验证通过）
 - [x] Phase 3 第一版句柄保护（v29，双 hook 测试 VM 验证通过）
 - [x] Phase 3 常驻保护模式（v30，全核线程化 + 干净卸载 VM 验证通过）
+- [x] Phase 3 最终修复（v31，TLB 刷新 + rearm 全页重锁 + 二次写测试 VM 验证通过）
+- [x] Phase 3 一版合并回 main（快进到 `bf67ebc`，分支已删）
 - [ ] 下一阶段：真实目标进程接入（IOCTL/Java 层配置通道）
 - [ ] 下一阶段：常驻模式接入真实受保护页/真实 hook，补 NPT 共享状态加锁与目标进程生命周期

@@ -16,7 +16,8 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | Phase 2b NPT identity-map + NPF | 完成：16GB identity map + NPF 权限注入验证通过 |
 | Phase 2c 多核 DPC | 完成：每核系统线程，双核 10000 轮心跳稳定 |
 | Phase 2d 物理机验证 | 未完成 |
-| Phase 3+ 隐形/保护/Java 层 | 未开始 |
+| Phase 3 保护一版（v27-v31） | 完成：内存写/终止/句柄/常驻全部 VM 验证，已合并 main（`bf67ebc`） |
+| Phase 3 隐形/Java/真实目标接入 | 未开始（下一阶段） |
 | git 版本控制 | 本次初始化完成 |
 | 构建基线 | 成功，见第 5 节 |
 | VM+KD 调试通道 | 可用：官方镜像 VM + 串口命名管道 |
