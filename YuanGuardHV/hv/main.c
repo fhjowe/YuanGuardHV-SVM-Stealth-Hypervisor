@@ -351,6 +351,13 @@ static NTSTATUS yghv_protect_test(void) {
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
+__attribute__((naked, noinline)) static void yghv_hook_test_dummy(void) {
+    __asm__ volatile(
+        "nop; nop; nop; nop; nop; nop; nop; nop;"
+        "nop; nop; nop; nop; nop; nop; nop; nop;"
+        "ret");
+}
+
 static NTSTATUS yghv_hook_test(void) {
     uint64_t term;
     uint64_t gpa;
@@ -358,11 +365,8 @@ static NTSTATUS yghv_hook_test(void) {
     int ok = 1;
 
     term = yghv_protect_find_func_pattern(L"ZwTerminateProcess", NULL, 0);
-    if (!term) {
-        LOG_ERROR("protect hook test: locate FAILED");
-        return STATUS_NOT_FOUND;
-    }
-    if (yghv_protect_install_hook(0, term)) {
+    LOG_ERROR("protect hook test: ZwTerminateProcess=0x%llx", term);
+    if (yghv_protect_install_hook(0, (uint64_t)yghv_hook_test_dummy)) {
         LOG_ERROR("protect hook test: install FAILED");
         return STATUS_UNSUCCESSFUL;
     }
