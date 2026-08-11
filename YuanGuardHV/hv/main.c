@@ -728,9 +728,9 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         KeRevertToUserAffinityThread();
         return (NTSTATUS)sv;
     }
+    KeIpiGenericCall(svm_core_ipi_prepare_vcpu, 0);
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
-        svm_core_prepare_vcpu_other(i);
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
         sv = svm_core_set_npt(i, g_npt.pml4_pa);
@@ -751,6 +751,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     sv = svm_core_start_persistent_residents(online);
     if (sv) {
         LOG_ERROR("persistent residents start failed 0x%x", sv);
+        svm_core_wait_remote_ready(online);
         svm_core_stop_all_residents();
         svm_core_wait_all_stopped(online);
         yghv_protect_cleanup();

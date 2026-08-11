@@ -531,12 +531,13 @@ int svm_core_enter_resident_current(uint32_t index) {
     svm_vcpu_t *vcpu = svm_core_get_vcpu(index);
     if (!vcpu) return STATUS_NOT_FOUND;
 
-    if (vcpu->resident_state == SVM_RESIDENT_STOPPING) {
+    LONG old = InterlockedCompareExchange(
+        (volatile LONG *)&vcpu->resident_state, SVM_RESIDENT_ACTIVE, SVM_RESIDENT_OFF);
+    if (old == SVM_RESIDENT_STOPPING) {
         vcpu->resident_state = SVM_RESIDENT_STOPPED;
         return 0;
     }
 
-    vcpu->resident_state = SVM_RESIDENT_ACTIVE;
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
 
     while (vcpu->resident_state == SVM_RESIDENT_ACTIVE) {
@@ -628,8 +629,9 @@ ULONG_PTR svm_core_ipi_set_npt(ULONG_PTR arg) {
 void svm_core_stop_all_residents(void) {
     ULONG i;
     for (i = 0; i < SVM_MAX_CORES; i++) {
-        if (g_vcpus[i] && g_vcpus[i]->resident_state == SVM_RESIDENT_ACTIVE) {
-            g_vcpus[i]->resident_state = SVM_RESIDENT_STOPPING;
+        if (g_vcpus[i]) {
+            InterlockedExchange((volatile LONG *)&g_vcpus[i]->resident_state,
+                                SVM_RESIDENT_STOPPING);
             LOG_INFO("Core %u marked STOPPING", i);
         }
     }
