@@ -113,6 +113,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | `YuanGuardHV/hv/{protect.c,main.c,svm_core.c,common/svm_vcpu.h,common/protect.h}` | Phase 3 下一步 Task E：hook 加固（页/指令边界校验 + 跨核 rendezvous）v38 | 构建 SUCCESS + VM 验证通过（boundary + rendezvous + selftest/exit-test） |
 | 2026-08-11 | `YuanGuardHV/hv/{control_device.c,vmmcall.c,main.c,common/control_plane.h}` | Phase 3 下一步 Task F：控制面安全（CPL/CR3）v39 | 构建 SUCCESS + VM 验证通过（selftest/exit-test 回归，无 unauthorized 拒绝） |
 | 2026-08-11 | `YuanGuardHV/hv/{svm_core.c,svm_trampoline.S,main.c}` | Phase 3 下一步 Task G：隐形基础（CPUID 隐身）v40 | 构建 SUCCESS + VM 验证通过（cpuid stealth PASS） |
+| 2026-08-11 | `YuanGuardHV/hv/{vmexit.c,svm_trampoline.S,main.c}` | Phase 3 下一步 Task G 扩展：resident guest 隐身矩阵（leaf1 hypervisor bit）v41 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -556,6 +557,9 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - `svm_trampoline.S` 新增 `svm_trampoline_test_cpuid_guest`：依次执行 `cpuid 0x40000000 / 0x80000001 / 0x8000000A`，结果存入 r8-r13（cookie 先存 r15 防 cpuid 清 rcx），最后 STOP_INTERNAL。
   - `main.c` 新增 `yghv_cpuid_stealth_test()`：CPU0 resident 跑该 guest，断言 r8-r11 全 0、r12 的 SVM bit 被清、r13 为 0，失败走现有回滚。
 - 范围：只覆盖合成 resident guest 的 CPUID 隐身路径；整机级隐形（内存特征/MSR 时序/真实 OS 拦截）与 R1（裸机/KVM）为后续项。
+- v41 扩展（用户确认）：`svm_emulate_cpuid` 增加 `cpuid 1` ECX 清 bit31（hypervisor present）；cpuid guest 增加 leaf 1 结果存 r14；`yghv_cpuid_stealth_test()` 断言矩阵扩展，VM 回归验证。
+- v41 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；SHA256 `349C32A95528B87F8449F3759F4ECF22B1F149A596C245EF59F34E32DFD25D7A`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v41.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v41.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
+- v41 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD `cpuid stealth test: leaf1_ecx=0x7ef83203 hyper=0x0/0x0/0x0/0x0 svm_ecx=0xc003f9 svm_leaf_eax=0x0` → `PASS`（leaf1 bit31 已清）；boundary/rendezvous 仍 PASS；卸载回 `STOPPED`，无蓝屏。
 - 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v40 SHA256 `5578A00FDC271A77084973CA668EC5B93698E413C84DE56A48D99CEDABC03F91`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v40.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v40.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
 - 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD `cpuid stealth test: hyper=0x0/0x0/0x0/0x0 svm_ecx=0xc003f9 svm_leaf_eax=0x0` → `PASS`（0x40000000 段清 0、0x80000001 SVM bit 清、0x8000000A 清 0）；boundary/rendezvous 仍 PASS；卸载回 `STOPPED`，无蓝屏。
 - 结论：隐形基础完成（resident guest 的 CPUID 拦截隐身路径可用）。整机级隐形、R1（裸机/KVM）、Java 层、真实系统 hook 为后续项。
