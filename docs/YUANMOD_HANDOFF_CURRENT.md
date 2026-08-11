@@ -379,3 +379,14 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   - `KeWaitForSingleObject` 不能直接等线程 HANDLE，改为 `ObReferenceObjectByHandle` 获取 `PETHREAD` 再等待。
   - ntddk 下 `PsThreadType` 是 `POBJECT_TYPE *`，需传 `*PsThreadType`，否则返回 `0xC0000024`。
 - 验证通过（2026-08-10）：v7（SHA256 `f6c1a89c7d5a8622c7d0d402bd4c47cbc6bbcc0b6973f27c8c66ac3a66478b2a`）在 2 核 VM 上每核心跳跑满 10000，无 `ObReferenceObjectByHandle` 错误、无蓝屏；随后两轮“卸载 -> 再启动”均不重启通过，KD 日志均完整。
+
+### 9.23 Phase 3 Task 1：protect 模块骨架（2026-08-11）
+
+- 实现（按 `docs/superpowers/plans/2026-08-11-phase3-protection.md` 的 Task 1 简报）：
+  - 新增 `YuanGuardHV/hv/common/protect.h`：保护状态/页表项/hook 结构、目标状态、页表遍历、NPT arm/disarm、hook 接口声明。
+  - 新增 `YuanGuardHV/hv/protect.c`：`yghv_protect_guest_va_to_pa`、init/cleanup/set_target/add/remove/find/arm/disarm/start/stop。
+  - `YuanGuardHV/hv/common/svm_defs.h`：新增 `SVM_EXIT_EXCEPTION_DB`。
+  - `YuanGuardHV/build.bat`：`protect.c` 加入编译循环与链接列表。
+- 偏差（简报代码无法直接编译）：`ntddk.h` 不声明 `PsLookupProcessByProcessId`，在 `protect.c` 增加该 API 的 `NTKERNELAPI` 前向声明；其余按简报逐字实现。
+- 验证：`cmd /c build.bat`（`D:\yuanguard\YuanGuardHV`）→ `Build SUCCESS`，签名成功；sys SHA256 `8298dd0ca4dd7acc6179e6e374542744b4ab0dd0ed2757b778ce2abaafd8afa0`。R1 测试宏未改动（`YGHV_R1_SKIP_NPT_TEST=0`、`YGHV_R1_NPT_UNIT_TEST=1`）。
+- 提交：`git commit -m "feat: protect 模块骨架（目标状态/页表遍历/NPT arm-disarm）"`。
