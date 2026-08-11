@@ -12,7 +12,18 @@
 #define YGHV_HEARTBEAT_TEST_LIMIT    10000ULL
 
 uint64_t g_vmmcall_auth_cookie;
+uint64_t g_control_cr3;
 extern volatile BOOLEAN g_persistent_mode;
+
+static int yghv_vmmcall_authorized(svm_vcpu_t *vcpu) {
+    if (vcpu->regs.rcx != g_vmmcall_auth_cookie)
+        return 0;
+    if (vcpu->vmcb->state.cpl != 0)
+        return 0;
+    if (g_control_cr3 && vcpu->vmcb->state.cr3 != g_control_cr3)
+        return 0;
+    return 1;
+}
 
 int vmmcall_dispatch(svm_vcpu_t *vcpu) {
     uint64_t cmd = vcpu->regs.rax;
@@ -52,7 +63,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
     }
 
     case YGHV_CMD_STOP_INTERNAL:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             LOG_ERROR("Unauthorized STOP_INTERNAL from core %u", vcpu->resident_index);
             vcpu->regs.rax = YGHV_STATUS_ERROR;
             return 0;
@@ -63,7 +74,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         return 1;
 
     case YGHV_CMD_SHUTDOWN:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             LOG_ERROR("Unauthorized SHUTDOWN from core %u", vcpu->resident_index);
             vcpu->regs.rax = YGHV_STATUS_ERROR;
             return 0;
@@ -84,7 +95,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         return 0;
 
     case YGHV_CMD_SET_TARGET:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
@@ -92,7 +103,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         return 0;
 
     case YGHV_CMD_ADD_PAGE:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
@@ -100,7 +111,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         return 0;
 
     case YGHV_CMD_REMOVE_PAGE:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
@@ -108,7 +119,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         return 0;
 
     case YGHV_CMD_START_PROTECT:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
@@ -116,7 +127,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         return 0;
 
     case YGHV_CMD_STOP_PROTECT: {
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
@@ -126,7 +137,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
     }
 
     case YGHV_CMD_GET_STATE:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
@@ -140,7 +151,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         return 0;
 
     case YGHV_CMD_HOOK_QUERY:
-        if (vcpu->regs.rcx != g_vmmcall_auth_cookie) {
+        if (!yghv_vmmcall_authorized(vcpu)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }

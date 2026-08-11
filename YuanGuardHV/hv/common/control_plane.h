@@ -26,5 +26,6 @@
 #define YGHV_STATUS_INVALID     3ULL
 
 extern uint64_t g_vmmcall_auth_cookie;
+extern uint64_t g_control_cr3;
 
 #endif

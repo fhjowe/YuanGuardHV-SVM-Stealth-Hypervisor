@@ -4,7 +4,14 @@
 #include "protect.h"
 #include "debug.h"
 
+NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
+
 static PDEVICE_OBJECT g_yghv_device = NULL;
+
+typedef struct {
+    PEPROCESS owner_process;
+    uint64_t owner_cr3;
+} yghv_ctl_ctx_t;
 
 static NTSTATUS yghv_control_complete(PIRP irp, NTSTATUS status, ULONG info) {
     irp->IoStatus.Status = status;
@@ -23,6 +30,52 @@ static NTSTATUS yghv_control_dispatch_open(PDEVICE_OBJECT dev, PIRP irp) {
     return yghv_control_complete(irp, STATUS_SUCCESS, 0);
 }
 
+static NTSTATUS yghv_control_dispatch_create(PDEVICE_OBJECT dev, PIRP irp) {
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    PEPROCESS proc = IoGetRequestorProcess(irp);
+    yghv_ctl_ctx_t *ctx;
+    (void)dev;
+
+    if (!proc) {
+        LOG_ERROR("control device: create has no requestor process");
+        return yghv_control_complete(irp, STATUS_ACCESS_DENIED, 0);
+    }
+    ctx = (yghv_ctl_ctx_t *)ExAllocatePoolWithTag(
+        NonPagedPool, sizeof(*ctx), YGHV_TAG);
+    if (!ctx)
+        return yghv_control_complete(irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+    ctx->owner_process = proc;
+    ctx->owner_cr3 = *(volatile uint64_t *)((uint8_t *)proc + 0x028);
+    ObReferenceObject(proc);
+    stack->FileObject->FsContext = ctx;
+    return yghv_control_complete(irp, STATUS_SUCCESS, 0);
+}
+
+static NTSTATUS yghv_control_dispatch_cleanup(PDEVICE_OBJECT dev, PIRP irp) {
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    yghv_ctl_ctx_t *ctx = (yghv_ctl_ctx_t *)stack->FileObject->FsContext;
+    (void)dev;
+
+    if (ctx) {
+        stack->FileObject->FsContext = NULL;
+        ObDereferenceObject(ctx->owner_process);
+        ExFreePoolWithTag(ctx, YGHV_TAG);
+    }
+    return yghv_control_complete(irp, STATUS_SUCCESS, 0);
+}
+
+static BOOLEAN yghv_control_ioctl_authorized(PIRP irp) {
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    yghv_ctl_ctx_t *ctx = (yghv_ctl_ctx_t *)stack->FileObject->FsContext;
+    PEPROCESS proc = IoGetRequestorProcess(irp);
+    uint64_t cr3;
+
+    if (!ctx || !proc || proc != ctx->owner_process)
+        return FALSE;
+    cr3 = *(volatile uint64_t *)((uint8_t *)proc + 0x028);
+    return ctx->owner_cr3 != 0 && cr3 == ctx->owner_cr3;
+}
+
 static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
     IO_STACK_LOCATION *stack;
     ULONG code, in_len, out_len;
@@ -32,6 +85,10 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
     (void)dev;
 
     stack = IoGetCurrentIrpStackLocation(irp);
+    if (!yghv_control_ioctl_authorized(irp)) {
+        LOG_ERROR("control device: unauthorized caller rejected");
+        return yghv_control_complete(irp, STATUS_ACCESS_DENIED, 0);
+    }
     code = stack->Parameters.DeviceIoControl.IoControlCode;
     in_len = stack->Parameters.DeviceIoControl.InputBufferLength;
     out_len = stack->Parameters.DeviceIoControl.OutputBufferLength;
@@ -119,8 +176,9 @@ NTSTATUS yghv_control_device_init(PDRIVER_OBJECT driver) {
 
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++)
         driver->MajorFunction[i] = yghv_control_dispatch_default;
-    driver->MajorFunction[IRP_MJ_CREATE] = yghv_control_dispatch_open;
+    driver->MajorFunction[IRP_MJ_CREATE] = yghv_control_dispatch_create;
     driver->MajorFunction[IRP_MJ_CLOSE] = yghv_control_dispatch_open;
+    driver->MajorFunction[IRP_MJ_CLEANUP] = yghv_control_dispatch_cleanup;
     driver->MajorFunction[IRP_MJ_DEVICE_CONTROL] = yghv_control_dispatch_ioctl;
 
     dev->Flags |= DO_BUFFERED_IO;

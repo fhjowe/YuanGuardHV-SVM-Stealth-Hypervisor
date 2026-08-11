@@ -696,6 +696,8 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
     LOG_INFO("svm_core_init ok");
     yghv_trace("svm_core_init ok");
+    g_control_cr3 = g_vcpus[0]->vmcb->state.cr3;
+    LOG_ERROR("control cr3=0x%llx", g_control_cr3);
 
     online = KeQueryActiveProcessorCount(NULL);
     if (online > SVM_MAX_CORES) online = SVM_MAX_CORES;
