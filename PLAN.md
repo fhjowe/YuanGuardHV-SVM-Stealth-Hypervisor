@@ -1,5 +1,11 @@
 # YuanGuardHV — 项目初始化与实施计划
 
+## 0. 进度更新（2026-08-11）
+
+- 已完成并合入 main：v32 IOCTL 配置通道、v33 常驻真实保护与 hook stub allow/deny、v34 NPT 共享状态加锁、v37 目标进程生命周期、v38 hook 加固、v39 控制面 CPL/CR3、v40/v41 隐形基础 CPUID、v42 仓库整理（详见 `docs/YUANMOD_HANDOFF_CURRENT.md`）。
+- 定档：常驻模式为合成 resident guest 测试基架；真实系统 hook、整机级隐形、Java 层、R1 私有页/NPT 自剔除/默认 NX、MSR/IO 隐身仍未做（后四项需裸机/KVM）。
+- 后续：实机验证（裸机/KVM）→ Java 层 → 整机级隐形立项 → tests/mod/vm 目录补齐。
+
 ## 项目概述
 
 基于 AMD-V SVM/NPT 的隐形 Hypervisor，替代原 YuanGuard 内核驱动架构，将进程保护逻辑提升至 VMX Root 层。

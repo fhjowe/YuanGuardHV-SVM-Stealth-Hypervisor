@@ -115,6 +115,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | 2026-08-11 | `YuanGuardHV/hv/{svm_core.c,svm_trampoline.S,main.c}` | Phase 3 下一步 Task G：隐形基础（CPUID 隐身）v40 | 构建 SUCCESS + VM 验证通过（cpuid stealth PASS） |
 | 2026-08-11 | `YuanGuardHV/hv/{vmexit.c,svm_trampoline.S,main.c}` | Phase 3 下一步 Task G 扩展：resident guest 隐身矩阵（leaf1 hypervisor bit）v41 | 构建 SUCCESS + VM 验证通过 |
 | 2026-08-11 | 仓库整理（git mv 参考文档/lib、logs_archive、.gitignore）+ `hv/{svm_core.c,vmexit.c,svm_trampoline.S,main.c}` | Phase 3 Task G 收窄 v42：CPUID 隐身矩阵 + 仓库整理（MSR/IO 隐身留裸机/KVM） | 构建 SUCCESS + VM 验证通过 |
+| 2026-08-11 | `docs/NEXT_WINDOW_PROMPT.md`、`docs/SESSION_20260811.md`、`PLAN.md` | 文档同步到 v42 状态（用户指示） | 进度快照/会话记录/计划状态已更新 |
 | 2026-08-09 | `D:\vmware\Windows 11 x64*`（38 文件） | 用户确认删除 Win11 VM；因环境策略拦截 `Remove-Item`，改用 `Move-Item` 移入 `D:\vmware\_win11_trash` | 原路径 0 个匹配文件 |
 | 2026-08-09 | `%APPDATA%\VMware\inventory.vmls` | 备份为 `.bak-20260809` 后移除 Win11 条目，仅保留 Windows 10 x64 | 清单读取核对通过 |
 | 2026-08-09 | 系统 WiFi 适配器 `WLAN` | 按用户要求禁用（`Disable-NetAdapter`） | 状态 Disabled |
@@ -563,6 +564,13 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - v42 最终构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；最终 SHA256 `EDBD04C9845BC1C65897E7168163D318C782D68ECF6518182F253B02D6962214`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v42.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v42.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。待 VM 重测（CPUID 矩阵 + 仓库整理回归）。
 - v42 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD `cpuid stealth test: leaf1_ecx=0x7ef83203 hyper=0x0/0x0/0x0/0x0 svm_ecx=0xc003f9 svm_leaf_eax=0x0` → `PASS`；boundary/rendezvous 仍 PASS；卸载回 `STOPPED`，无蓝屏。
 - 仓库整理完成：`docs/reference/` 收纳参考文档；`reference/SymbolicAccessKM.lib`；`YuanGuardHV/logs_archive/` 收纳历史日志与中间 asm（gitignore）；`.gitignore` 已补。
+
+### 9.35 文档同步（2026-08-11，用户指示）
+
+- 更新 `docs/NEXT_WINDOW_PROMPT.md`：进度快照改为 v32-v42 状态，补充 yghv_ctl.ps1、logs_archive、MSRPM/IOPM 嵌套限制与 PsSetCreateProcessNotifyRoutine 雷区，下一步改为“实机验证 → Java 层 → 整机级隐形 → tests/mod/vm”。
+- 追加 `docs/SESSION_20260811.md` 第 7 节：v32-v42 会话摘要与提交哈希。
+- `PLAN.md` 顶部新增“0. 进度更新（2026-08-11）”状态块。
+- 下一步：实机（裸机/KVM）测试，需用户确认 testsigning 与物理机环境后执行。
 - v41 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；SHA256 `349C32A95528B87F8449F3759F4ECF22B1F149A596C245EF59F34E32DFD25D7A`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v41.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v41.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
 - v41 验证（2026-08-11，VM 双核）：`sc start` RUNNING；`selftest: PASS`；`exit-test: PASS`；KD `cpuid stealth test: leaf1_ecx=0x7ef83203 hyper=0x0/0x0/0x0/0x0 svm_ecx=0xc003f9 svm_leaf_eax=0x0` → `PASS`（leaf1 bit31 已清）；boundary/rendezvous 仍 PASS；卸载回 `STOPPED`，无蓝屏。
 - 构建：`cmd /c build.bat` → `Build SUCCESS`，签名成功；v40 SHA256 `5578A00FDC271A77084973CA668EC5B93698E413C84DE56A48D99CEDABC03F91`（`Get-FileHash D:\aaaaaavm\yuanguard_hv_v40.sys`），已复制 `D:\aaaaaavm\yuanguard_hv_v40.sys`；仅预存 WDK intrinsic/`YGHV_DEBUG_LOG` 重定义告警，无新增告警。
