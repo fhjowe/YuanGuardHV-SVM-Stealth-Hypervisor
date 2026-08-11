@@ -161,6 +161,7 @@ typedef signed int         int32_t;
 #define SVM_EXIT_CR14_WRITE       0x1E
 #define SVM_EXIT_CR15_WRITE       0x1F
 #define SVM_EXIT_EXCEPTION_BASE   0x40
+#define SVM_EXIT_EXCEPTION_DB     (SVM_EXIT_EXCEPTION_BASE + 1)  /* #DB, vector 1 */
 #define SVM_EXIT_EXCEPTION_UD     0x46
 #define SVM_EXIT_INTR             0x60
 #define SVM_EXIT_NMI              0x61
