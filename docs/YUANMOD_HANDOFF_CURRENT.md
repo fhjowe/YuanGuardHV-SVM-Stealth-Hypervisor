@@ -901,3 +901,25 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 构建：step17 v72 SHA256 `C67C50C5BC2DF7E61D6E79C2BCD95E1F1FF7413758D23356D5A1B4F78707110A`，
   归档 `D:\aaaaaavm\yuanguard_hv_v72_step17.sys`。
 - 待验证：实机或 VM（建议 VM，崩了只崩 VM）。
+
+### 9.58 step18 自旋常驻实机冻结：变量隔离证据（2026-08-12）
+
+- step17a（阻塞常驻，IF=1）v71/v72/v73 实机均 <5 秒整机硬冻结，无 dump；
+  看门狗也无法落盘（系统级挂死）。
+- step18（自旋常驻，IF=1，guest 为无限 CPUID/RDTSC 循环，不阻塞不切线程）
+  v74 实机加载（C 盘哈希 `7B9D63D6...` 已核对）：进度日志完整写到
+  `bm os resident spin running → bm done`，但 **没有 `resident alive=5`** →
+  常驻开始后 5 秒内整机冻结；无 minidump（自旋 guest 持续退出，心跳不断，
+  看门狗不会触发）。
+- 结论（变量分离）：**排除了“guest 内调度器/上下文切换”**；冻结主因收敛为
+  **IF=1 下物理中断在 guest 模式投递 / guest 模式 APIC 交互**，与 v52 之前
+  合成 resident 冻结同类，且与 AMD 56683 errata 1363（持续 APIC 访问流可致
+  系统挂起/复位）高度吻合。
+- 下一步实验 step19：step18 基础上**加回 INTR/NMI 拦截**（ISR 在宿主态执行，
+  v52 思路），验证“guest 中断投递是冻结根因”；若 step19 存活，再做宿主收中断
+  + 事件注入回 guest 的正规方案。若仍冻结，判定平台级限制，转 VM/换机。
+- 环境备注：`C:\Windows\yghv_progress.log` 现为同步落盘（每次 trace 即 flush），
+  硬冻结后可保留最后里程碑；VM 已停止；live KD 无法连接（guest 未开实时调试）。
+- 归档：`D:\aaaaaavm\yuanguard_hv_v74_step18.sys`（SHA256
+  `7B9D63D6AD9CAE708ADDE8004167ABD5889BEDB3F041DC4524CF3304B97DE320`）。
+- 提交：`a037044`（step18 + trace 落盘 + alive/看门狗）。
