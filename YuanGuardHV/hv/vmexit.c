@@ -19,6 +19,7 @@ extern uint64_t g_npt_test_pa;
 extern volatile int g_npt_test_active;
 extern volatile LONG g_os_guest_test_active;
 extern volatile BOOLEAN g_os_resident_mode;
+extern volatile ULONG64 g_os_resident_exits;
 
 #define YGHV_OS_GUEST_EXIT_LIMIT 10000ULL
 
@@ -43,6 +44,8 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     if (g_os_guest_test_active &&
         vcpu->resident_exits >= YGHV_OS_GUEST_EXIT_LIMIT)
         return 1;
+    if (g_os_resident_mode)
+        g_os_resident_exits++;
 
     switch (exitcode) {
 
