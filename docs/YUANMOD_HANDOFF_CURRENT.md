@@ -1494,3 +1494,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   guest_stack** 的行为改动；已改为仅在 `YGHV_R1_EXCLUDE_PRIVATE` 下
   设置 RSP，默认路径恢复原行为（与已验证稳定版一致）。R1 门控版仍
   存在 deny 机器级停机（见 9.108-9.110），保持门控。
+
+### 9.112 2026-08-13 控制面提权校验 + VMMCALL 进程绑定实现
+
+- 控制设备：`yghv_control_ioctl_authorized` 在原有 owner/CR3 绑定之上
+  增加 `SeSinglePrivilegeCheck(SE_DEBUG_PRIVILEGE, UserMode)`，控制端
+  必须是启用了 SeDebug 的提权客户端（Java/CLI 需以管理员并启用
+  SeDebug 运行）。
+- VMMCALL 进程绑定：
+  - SET_TARGET：必须把目标设为自己（`PsLookupProcessByProcessId` +
+    EPROCESS DirectoryTableBase 与调用者 CR3 比对），不能替别的进程
+    设目标；
+  - ADD_PAGE/REMOVE_PAGE：调用者 CR3 必须是当前受保护目标
+    （`yghv_protect_is_target_cr3`），页面操作锁死在目标进程。
+- 构建：默认版 SHA256
+  `70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_cpcr_20260813.sys`，已复制
+  `C:\yuanguard_hv.sys`。
+- 实机验证：服务 RUNNING，默认流程完整到 `all stopped`，无回归。

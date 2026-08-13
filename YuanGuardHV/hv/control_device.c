@@ -72,6 +72,16 @@ static BOOLEAN yghv_control_ioctl_authorized(PIRP irp) {
 
     if (!ctx || !proc || proc != ctx->owner_process)
         return FALSE;
+    /* P0 hardening: the controlling client must run with SeDebug enabled
+       (elevated debugger-style client), not just any process that opened
+       the device. */
+    {
+        LUID dbg_luid = RtlConvertLongToLuid(SE_DEBUG_PRIVILEGE);
+        if (!SeSinglePrivilegeCheck(dbg_luid, UserMode)) {
+            LOG_ERROR("control device: caller lacks SeDebugPrivilege");
+            return FALSE;
+        }
+    }
     cr3 = *(volatile uint64_t *)((uint8_t *)proc + 0x028);
     return ctx->owner_cr3 != 0 && cr3 == ctx->owner_cr3;
 }

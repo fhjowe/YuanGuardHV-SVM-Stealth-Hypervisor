@@ -6,6 +6,10 @@
 #include "protect.h"
 #include "debug.h"
 
+NTKERNELAPI NTSTATUS PsLookupProcessByProcessId(
+    _In_ HANDLE ProcessId,
+    _Outptr_ PEPROCESS *Process);
+
 #define YUANGUARD_VERSION 0x00010000
 
 #define YGHV_HEARTBEAT_LOG_INTERVAL  1000ULL
@@ -42,6 +46,18 @@ static int yghv_vmmcall_authorized(svm_vcpu_t *vcpu, uint64_t cmd) {
             return 0;
         return 1;
     }
+}
+
+static BOOLEAN yghv_vmmcall_target_matches_cr3(uint32_t pid, uint64_t cr3) {
+    PEPROCESS p = NULL;
+    uint64_t base;
+
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(
+            (HANDLE)(ULONG_PTR)pid, &p)))
+        return FALSE;
+    base = *(volatile uint64_t *)((uint8_t *)p + 0x028) & ~0xFFFULL;
+    ObDereferenceObject(p);
+    return base && base == (cr3 & ~0xFFFULL);
 }
 
 int vmmcall_dispatch(svm_vcpu_t *vcpu) {
@@ -119,11 +135,22 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
-        vcpu->regs.rax = (uint64_t)yghv_protect_set_target((uint32_t)vcpu->regs.rdx);
+        /* Only a process may install itself as the protected target. */
+        if (!yghv_vmmcall_target_matches_cr3(
+                (uint32_t)vcpu->regs.rdx, vcpu->vmcb->state.cr3)) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        vcpu->regs.rax =
+            (uint64_t)yghv_protect_set_target((uint32_t)vcpu->regs.rdx);
         return 0;
 
     case YGHV_CMD_ADD_PAGE:
         if (!yghv_vmmcall_authorized(vcpu, YGHV_CMD_ADD_PAGE)) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        if (!yghv_protect_is_target_cr3(vcpu->vmcb->state.cr3)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
@@ -132,6 +159,10 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
 
     case YGHV_CMD_REMOVE_PAGE:
         if (!yghv_vmmcall_authorized(vcpu, YGHV_CMD_REMOVE_PAGE)) {
+            vcpu->regs.rax = YGHV_STATUS_DENIED;
+            return 0;
+        }
+        if (!yghv_protect_is_target_cr3(vcpu->vmcb->state.cr3)) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
