@@ -7,7 +7,7 @@
 
 AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱动，把 Minecraft/Forge 进程保护逻辑放到虚拟化层。
 
-## 2. 当前进度快照（2026-08-11，本次会话完整记录见 `docs/SESSION_20260811.md`）
+## 2. 当前进度快照（2026-08-13，详见 9.84-9.131）
 
 | 里程碑 | 状态 |
 |---|---|
@@ -15,19 +15,20 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 | Phase 2a SVM init + VMRUN 单核 | 完成：10000 轮 VMMCALL 心跳稳定 |
 | Phase 2b NPT identity-map + NPF | 完成：16GB identity map + NPF 权限注入验证通过 |
 | Phase 2c 多核 DPC | 完成：每核系统线程，双核 10000 轮心跳稳定 |
-| Phase 2d 物理机验证 | 未完成 |
+| Phase 2d 物理机验证 | 完成：实机回归（9.40/9.126） |
 | Phase 3 保护一版（v27-v31） | 完成：内存写/终止/句柄/常驻全部 VM 验证，已合并 main（`bf67ebc`） |
-| Phase 3 隐形/Java/真实目标接入 | 未开始（下一阶段） |
+| Phase 3 隐形/Java/真实目标接入 | Java/真实目标接入完成（9.41/9.114/9.130）；隐形剩余 |
 | git 版本控制 | 本次初始化完成 |
 | 构建基线 | 成功，见第 5 节 |
-| VM+KD 调试通道 | 可用：官方镜像 VM + 串口命名管道 |
+| VM+KD 调试通道 | 不可用：VMware 嵌套限制，转裸机/KVM（9.6/9.7） |
 | 不重启反复测试 | 完成：`DriverUnload` + `unload_driver.ps1` 两轮验证 |
 | v22 基线复验（压缩会话后） | 完成：加载→双核心跳 10000→卸载→不重启重载→双核心跳 10000，全部通过 |
 | R1 NPT API 单测（v23） | 进行中：代码已实现并构建，待 VM 加载验证 |
 | R1 NPT API 单测（v25） | 完成：translate/perm-range/split 全部 PASS，双核心跳通过 |
 | R1 NPF 注入测试（v26） | 完成：权限剔除→NPF→恢复映射→重执行→双核心跳通过 |
 
-注意：`hv/` 代码在 2026-07-31 之后已更新（`svm_core.c` 中原来的 `#if 0` stub 已不存在，`main.c` 改为直接 `svm_core_init()` + inline NPT，新增 `test_step1..6.c` 等），7/30 的 `TECHNICAL_REVIEW.md` 结论需要逐项复核后再采用。
+注意：7/30 的 `TECHNICAL_REVIEW.md` 已于 9.132 删除，P0 复核结论以
+`TASKS.md` 第 1 节为准。
 
 ## 3. 环境清单
 
@@ -2015,3 +2016,20 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   Java/JNI 客户端标记完成，并把剩余项收窄为 R1、MSR/IO/整机级隐形、
   真实系统 hook。
 - 收尾：服务 STOPPED、C 盘稳定默认版 `70888311...` 不变；提交文档。
+
+### 9.132 2026-08-13 文档清理与任务清单勾选（用户批准）
+
+- 用户批准后执行文档清理：删除 `PLAN.md`、`YuanGuardHV/HANDOFF.md`、
+  `YuanGuardHV/TECHNICAL_REVIEW.md`、`docs/NEXT_WINDOW_PROMPT.md`、
+  `docs/SESSION_20260811.md`、`docs/reference/reference_design.md`、
+  `docs/reference/reference_tasks.md` 与 4 个 OS-as-guest 计划文档。
+- 保留：`docs/YUANMOD_HANDOFF_CURRENT.md`、
+  `docs/YUANMOD_NEXT_WINDOW_PROMPT.md`、`docs/TASKS.md`、
+  `docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md`、Phase 3
+  计划/规范与 `reference/` 参考代码。
+- `TASKS.md` 更新：YGHV-007/008 标完成；YGHV-006/009/010 保持原状态；
+  Phase 2d 标完成；代码快照更新为 2026-08-13；火绒冲突与串口管道假设
+  按已有记录勾选；v33-v42 拆为“已完成/剩余”。
+- 交接文档顶部快照与 `YUANMOD_NEXT_WINDOW_PROMPT.md` 同步到清理后的
+  文档结构。
+- 收尾：`git rm` 删除并提交；工作区保持干净。

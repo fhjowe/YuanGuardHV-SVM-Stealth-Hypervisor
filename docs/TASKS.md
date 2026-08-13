@@ -25,6 +25,9 @@
 > 2026-08-13 9.131 收尾整理：构建与 Java/JNI 忽略产物已清理，
 > NEXT_WINDOW_PROMPT/TASKS 同步到 HEAD `a5f354e`/9.130。
 
+> 2026-08-13 9.132 文档清理：删除旧快照/停线计划，勾选当前进度；详见
+> `YUANMOD_HANDOFF_CURRENT.md` 9.132。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）
@@ -39,7 +42,7 @@
 - [x] 可运行环境最小冒烟：VMMCALL 心跳（10000 轮稳定）
 - [x] 不重启反复测试：`DriverUnload` + `unload_driver.ps1`（NtUnloadDriver），启动/卸载/再启动验证
 
-## 1. P0 复核（TECHNICAL_REVIEW.md 2026-07-30，需对照 7/31 后代码）
+## 1. P0 复核（7/30 技术复核结论，已由后续进度更新）
 
 | ID | 标题 | 复核结果 |
 |---|---|---|
@@ -49,21 +52,22 @@
 | YGHV-004 | VMEXIT 不推进 RIP / 返回值写错 | 已复核：VMMCALL/STOP_INTERNAL 正常返回 |
 | YGHV-005 | cleanup 分配释放不匹配 / 无条件清 SVME | 部分完成：NPT 泄漏与 DriverUnload 已修；EFER.SVME 裸机恢复待复核 |
 | YGHV-006 | NPT 全物理 RWX | 待处理：16GB identity 仍是 RWX，未做权限收紧 |
-| YGHV-007 | VMMCALL 无认证 | 待处理：尚无调用方认证 |
-| YGHV-008 | NPT 权限 API 假成功 | 部分完成：2MB large-page perm 已实现；`range/translate` 仍 stub |
+| YGHV-007 | VMMCALL 无认证 | 已完成：VMMCALL 认证分层/控制面 SeDebug/目标绑定（9.103、9.112-9.113） |
+| YGHV-008 | NPT 权限 API 假成功 | 已完成：perm/range/translate/split 已实现并单测 PASS（v25/9.22-9.24） |
 | YGHV-009 | NPF event injection VALID 位 | 部分完成：NPF 恢复映射路径已验证；向 Guest 注入 #PF 未验证 |
 | YGHV-010 | ASID/TLB/PAT 未初始化 | 部分完成：`g_pat`/ASID/TLB 已配置；多 ASID 管理未做 |
 
-### 1.5 实际代码核对（2026-08-10 晚）
+### 1.5 实际代码核对（2026-08-13 更新）
 
-- 正式构建只编译链接 `main.c svm_core.c npt_core.c vmexit.c vmmcall.c svm_trampoline.S`；`multi_core.c`、`loader_stealth.c`、`pool/*`、`test_*`、`min_drv.c` 均不进入 `yuanguard_hv.sys`。
-- `main.c` 当前只初始化 CPU0 + 单 VCPU + NPT/NPF 测试；`multi_core.c` 和 `svm_core_ipi_*` 存在但未被调用，多核未接线。
-- `svm_prepare_vcpu` 只开启 `INTERCEPT_VMRUN | INTERCEPT_VMMCALL`；`vmexit.c` 的 CPUID/MSR/CR handler 存在但当前不可达（拦截未开启）。
-- `vmmcall.c` 只实现 `HEARTBEAT/STOP_INTERNAL/VERSION/STATS`；`PROTECT_HANDLE/UNPROTECT/SCAN_PROCESS/READ_MEMORY/GET_CONFIG/SET_CONFIG/SHUTDOWN` 仅枚举，未实现。
-- NPT 单页 2MB 权限已实现并验证；`npt_set_page_perm_range` 仍假成功，`npt_translate` 返回 0，无 `npt_split_2mb_to_4kb`。
-- `loader_stealth.c` 未编译未调用；`stealth.c` 不存在；CPUID 隐身 handler 是死代码。
-- （2026-08-10 晚快照）`tests/`、`mod/` 目录不存在；Java/JNI 客户端
-  已在后续 9.41/9.114/9.130 完成。
+- 正式构建编译链接 `main.c svm_core.c npt_core.c vmexit.c vmmcall.c
+  multi_core.c protect.c control_device.c loader_stealth.c
+  svm_trampoline.S`；`pool/*`、`test_*`、`min_drv.c` 不进入正式驱动。
+- 多核 resident、NPT/NPF、保护/hook 控制面、Java/JNI 客户端均已接入
+  并实机回归（9.40/9.114/9.126/9.130）。
+- NPT perm/range/translate/split 已实现并单测 PASS（v25/9.22-9.24）。
+- `loader_stealth` 已接线（`YGHV_LOADER_STEALTH` 门控默认 0），kd
+  `!driver` 复核待内核调试会话。
+- `tests/`、`mod/`、`vm/` 目录尚未补齐。
 
 ## 2. 后续 Phase（未开始）
 
@@ -73,18 +77,20 @@
 - [ ] `tests/`、`mod/`、`vm/` 目录补齐
 - [ ] 仓库卫生清理（`hv/common/*.bak`、`reference_*` 迁移、历史日志归档）
 - [ ] 宿主稳定性处理：拔除/禁用 USB WiFi 设备或重装其驱动，确认 VMware 可稳定运行
-- [ ] 处理火绒安全驱动冲突：程序化禁用被火绒自我保护拦截（`Access denied`/`1052`），需用户在托盘“退出火绒”或关闭自我保护后重试；备选：关闭 `vhv.enable` / 升级 VMware
+- [x] 处理火绒安全驱动冲突：已关闭/卸载，复核 `HipsDaemon`、
+  `hrdevmon`、`sysdiag` 均不存在（9.19）
 - [ ] 宿主稳定性根因处理：重装/回退 VMware（17.5.2）、Windows 内存诊断、BIOS/AMD 芯片组更新
 - [x] 本地完全重装 VMware 17.6.4（默认路径，跳过 Networking）——安装成功但无法解决 VM 启动崩溃
 - [ ] 后续调试通道：换机/KVM，或裸机验证（testsigning、min_drv 加载链、崩溃转储分析）
-- [ ] 验证串口管道假设：`Windows 10` VM 稳定运行中（`vhv.enable=TRUE`/USB 开/无调试管道），对照旧 VM 差异（`yuanhv_debug` 管道），决定下一步是否重建调试 VM
+- [x] 验证串口管道假设：VM+KD 路径已判定不可用，后续转裸机/KVM
+  （9.6/9.7）
 
 ## 3. 当前阶段结论（2026-08-11）
 
 - [x] Phase 2a：SVM init + VMRUN 单核（10000 轮 VMMCALL 心跳）
 - [x] Phase 2b：NPT identity-map + NPF（16GB 映射 + 权限缺页注入）
 - [x] Phase 2c：多核 DPC（每核系统线程，双核 10000 轮心跳验证通过）
-- [ ] Phase 2d：物理机验证（未做）
+- [x] Phase 2d：物理机验证（9.40/9.126 实机回归 PASS）
 - [x] Phase 3 第一版保护：内存页写保护（v27）、终止保护（v28）、句柄保护（v29）、常驻模式（v30/v31）
 - [x] Phase 3 真实目标接入与 Java/JNI 客户端（9.41/9.114/9.130）
 - [ ] Phase 3 隐形（MSR/IO/整机级）
@@ -102,4 +108,8 @@
 - [x] Phase 3 一版合并回 main（快进到 `bf67ebc`，分支已删）
 - [x] 真实目标进程接入与 Java/JNI 客户端（IOCTL 配置通道 v32、
   9.41/9.114/9.130）
-- [ ] 下一阶段：常驻模式接入真实受保护页/真实 hook + NPT 共享状态加锁 + 目标进程生命周期 + hook 加固 + 控制面 CPL/CR3 + 隐形基础 CPUID + 仓库整理（v33-v42 已实现并 VM 验证通过）；裸机逐步逼近 v51 Step1-7 全 PASS，常驻（非停止 VMRUN）在宿主 2 核即冻结（判定平台兼容问题，需换机/KVM/VM）；剩余 R1、MSR/IO 隐身、整机级隐形、真实系统 hook
+- [x] 常驻模式真实受保护页/真实 hook + NPT 共享状态加锁 + 目标进程
+  生命周期 + hook 加固 + 控制面 CPL/CR3 + 隐形基础 CPUID（v33-v42，
+  VM/实机验证）
+- [ ] 剩余：真实系统 hook 锁序/ERROR_NO_SYSTEM_RESOURCES 修复（换平台）、
+  R1、MSR/IO/整机级隐形、tests/mod/vm

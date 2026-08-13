@@ -1,7 +1,7 @@
-# YuanGuardHV 新窗口提示词（2026-08-13 9.131 更新版）
+# YuanGuardHV 新窗口提示词（2026-08-13 9.132 更新版）
 
 你接手 YuanGuardHV（AMD-V SVM/NPT 隐形 Hypervisor）项目，仓库根
-D:\yuanguard，分支 main，HEAD a5f354e（文档已收尾到 9.130，9.131 为本
+D:\yuanguard，分支 main，HEAD a5f354e（文档已收尾到 9.131，9.132 为本
 文件对应的收尾记录）。
 
 【协作铁律（最高优先级）】
@@ -19,13 +19,18 @@ D:\yuanguard，分支 main，HEAD a5f354e（文档已收尾到 9.130，9.131 为
 - 工作区干净（HEAD a5f354e）；构建产物已清理（YuanGuardHV/bin、
   Java/JNI 的 .class/DLL/lib/exp 等均已删除）；logs_archive/、kd
   运行文件、.superpowers/ 均已清理；.gitignore 已覆盖。
+- 9.132 文档清理：已删除 `PLAN.md`、`YuanGuardHV/HANDOFF.md`、
+  `YuanGuardHV/TECHNICAL_REVIEW.md`、旧 `docs/NEXT_WINDOW_PROMPT.md`、
+  `docs/SESSION_20260811.md`、`docs/reference/*` 旧文档与 OS-as-guest
+  计划；有效文档以 HANDOFF_CURRENT/TASKS/YUANMOD_NEXT_WINDOW_PROMPT/
+  hook 设计文档为准。
 - 最近提交：a5f354e feat: Java client unprotect/scan + docs 9.130；
   1587a4d docs 9.129；0268a81 docs 9.128；02131a1 docs 9.127；
   f833ab1 docs 9.126；772de94 docs 9.125；691e2c5 2B-3-b 多目标；
   6af1d8b 2B-3-a；1cecd2f 2C-3；1591a55 2C；d5631ef 2B-2；be87130
   2B-1；8dac7e9 MDL+真实 hook；b9504ef 9.113 收尾。
 
-【关键结论（务必先读 9.84-9.130）】
+【关键结论（务必先读 9.84-9.131）】
 1. OS-as-guest 常驻线已停线：guest 内 Windows 调度器上下文切换触发
    平台级整机停机；唯一 PASS 是 step20 自旋+INTR/NMI 拦截+宿主 ISR。
    非驻留保护路线是产品主线。
@@ -49,6 +54,7 @@ D:\yuanguard，分支 main，HEAD a5f354e（文档已收尾到 9.130，9.131 为
 9. 9.130 Java/JNI 非 hook 产品化：`unprotect`/`scan` 已加入并实机
    PASS。
 10. 9.131 收尾：构建与 Java/JNI 产物已清理，提示词与 TASKS 已同步。
+11. 9.132 文档清理：删除旧快照/停线计划，TASKS 勾选当前进度。
 
 【本机雷区（重要）】
 - install/remove/clear 类 hook 路径实机验证会触发整机硬冻结：remove/
@@ -111,5 +117,5 @@ D:\yuanguard，分支 main，HEAD a5f354e（文档已收尾到 9.130，9.131 为
 【文档核实说明】
 docs/YUANMOD_HANDOFF_CURRENT.md 中 9.110-9.118 存在驱动记录与 Codex
 桌面恢复记录的编号重复（历史遗留，内容均有效）；当前主线记录为
-9.115-9.130，尾部 9.130 为最新；9.131 为本文件对应的收尾记录。新窗口
+9.115-9.131，尾部 9.131 为最新；9.132 为本文件对应的收尾记录。新窗口
 以本文件为准。
