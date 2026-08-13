@@ -1708,3 +1708,41 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
   `70888311...`，服务 STOPPED；本轮提交驱动、`control_ioctl.h`、客户端
   源码与交接文档。
+
+### 9.115 2026-08-13 Codex 项目/会话正式恢复 + 状态文件保护
+
+- 修复桌面脚本：进程判断改为只认 `ChatGPT.exe`（OpenAI.Codex 路径）与 `codex.exe`（WindowsApps/resources 路径），避免误判 `D:\mcmodwork\codex-patched\codex.exe`。
+- `restore-codex-projects.cmd` 改为先运行 `kill-codex.ps1`，再执行 `-Apply -Protect`；新增 `unprotect-codex.cmd` 用于解除只读。
+- 正式恢复已执行：backup `C:\Users\Administrator\.codex\backups\windows-sidebar-recovery-20260813-194000`；local-projects=4、assignments=12、orders=4、mode=project、session_index=32 行。
+- `.codex-global-state.json` 已临时设为只读，防止 Codex 启动时覆盖；项目显示后运行 `unprotect-codex.cmd` 解除。
+
+### 9.116 2026-08-13 修复只读文件导致的恢复报错
+
+- 用户运行恢复时报 `[WinError 5] 拒绝访问: .codex-global-state.json.windows-recovery.tmp -> .codex-global-state.json`；原因是上一步恢复后状态文件被设为只读，恢复核心原子替换时被系统拒绝。
+- 修复：`restore-codex-projects.ps1` 在正式恢复前先解除 `.codex-global-state.json` 只读，恢复完成后再按 `-Protect` 决定是否重新加锁。
+- 已重新执行正式恢复：backup `C:\Users\Administrator\.codex\backups\windows-sidebar-recovery-20260813-194307`，状态正常，文件再次处于只读保护。
+- 用户下一步：完全退出 Codex 后重开；项目显示后运行 `unprotect-codex.cmd` 解除只读。
+
+### 9.117 2026-08-13 主进程内存空项目修复（CDP 注入）
+
+- 根因：磁盘 `.codex-global-state.json` 已正确，但 Codex 主进程内存中的 `local-projects` 仍为空，导致侧边栏显示“没有项目”；只改磁盘不刷新运行中的主进程。
+- 修复：通过 Codex 调试端口（127.0.0.1:9229）调用应用自身 RPC `add-workspace-root-option`，把 `D:\mcmodwork`、`D:\yuanguard` 注入运行中的主进程。
+- 结果：侧边栏已显示 `yuanguard`、`mcmodwork` 及对应会话；主进程 `get-global-state` 返回两个项目。
+- 磁盘状态仍为只读保护，重启后也会读取正确状态；确认显示正常后运行桌面 `unprotect-codex.cmd` 解除。
+
+### 9.118 2026-08-13 2B-2 锁序优化实机失败回退（保留 9.117 基线）
+
+- 尝试：为修复 `clear`/remove 的 `hook_count=1` 残留，把 install/remove/
+  clear 的 `svm_core_pause_residents_for_patch` 从持锁内部移到取锁之前，
+  新增 `g_hook_patch_active` 补丁互斥（`yghv_protect_patch_begin/end`），
+  locked 函数不再自行 pause/resume。
+- 实机结果：新构建启动自测 PASS、服务 RUNNING；但控制面
+  `install-hook ZwOpenProcess`（后台存活进程）触发整机硬冻结
+  （19:19:18 Event 6008 意外关机，无 minidump），与 9.117 已验证版本
+  相同流程两次通过形成对照，判定锁序改动在本机不稳定。
+- 决定：回退 `protect.c` 至 9.117 提交基线（`d5631ef`），`clear` 的
+  `hook_count=1` 残留与 remove 全核心 pause 锁序问题保留为已知限制，
+  不再本机硬啃；如需继续建议换平台或硬件调试器。
+- 当前状态：C 盘恢复稳定默认版 `70888311...`，服务 STOPPED；工作区
+  `protect.c` 已回退，无锁序实验代码残留。docs 中 9.115-9.117 Codex
+  恢复记录为用户工作区已有内容，保留未动。
