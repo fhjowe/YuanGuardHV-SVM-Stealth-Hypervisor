@@ -1913,3 +1913,20 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   无回归。
 - 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
   `70888311...`，服务 STOPPED；工作区干净，HEAD `772de94`。
+
+### 9.127 2026-08-13 进度保存 + 仓库清理 + 新窗口交接
+
+- 仓库清理（用户授权）：删除未跟踪/忽略的构建产物与临时文件
+  （YuanGuardHV/bin、logs_archive、kd_cmd/kd_ctl_*.txt/log、
+  svm_trampoline.asm、.superpowers/、YghvCtl.class、Sleepy.class、
+  native/yghv_ctl_jni.dll/exp/lib）；`.gitignore` 覆盖项不变；
+  `reference/` 等被跟踪参考代码保留；归档目录 `D:\aaaaaavm` 不受影响。
+- 文档核实：`docs/YUANMOD_HANDOFF_CURRENT.md` 主线记录到 9.126，
+  9.110-9.118 存在驱动与 Codex 桌面恢复记录编号重复（历史遗留，
+  内容有效，不重排）；工作区干净，HEAD `f833ab1`。
+- 新增 `docs/YUANMOD_NEXT_WINDOW_PROMPT.md`：完整新窗口提示词，包含
+  铁律、当前状态、关键结论、本机雷区、归档清单、下一步建议、常用命令
+  与文档编号说明。
+- 本机状态：服务 STOPPED，`C:\yuanguard_hv.sys` = 稳定默认版
+  `70888311...`；hook 路径实验已停（9.125），非 hook 路径回归已 PASS
+  （9.126）。
