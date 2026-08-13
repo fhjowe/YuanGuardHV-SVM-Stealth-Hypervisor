@@ -13,6 +13,11 @@
 > 实机 `state/selftest/exit-test/list-java/protect` 全部 PASS（详见
 > `YUANMOD_HANDOFF_CURRENT.md` 9.114）。
 
+> 2026-08-13 9.128 最新默认版非 hook 路径回归 PASS：查询/配置/
+> selftest/exit-test/服务脚本全部通过；C 盘恢复稳定默认版
+> `70888311...`，服务 STOPPED（详见 `YUANMOD_HANDOFF_CURRENT.md`
+> 9.128）。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）

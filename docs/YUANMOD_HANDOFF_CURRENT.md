@@ -1929,4 +1929,32 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   与文档编号说明。
 - 本机状态：服务 STOPPED，`C:\yuanguard_hv.sys` = 稳定默认版
   `70888311...`；hook 路径实验已停（9.125），非 hook 路径回归已 PASS
-  （9.126）。
+  （9.126/9.128）。
+
+### 9.128 2026-08-13 最新默认版非 hook 路径回归（PASS）
+
+- 基线：HEAD `02131a1`（9.127），工作区干净；`C:\yuanguard_hv.sys`
+  稳定默认版 `70888311...`，服务 STOPPED。
+- 构建最新默认版（无门控，SHA256
+  `7B19EF022B8944BB3055AF91D2C14FBA21D25145D4A2441F5862F386BEDDB5A0`），
+  复制到 C 盘，`sc start` RUNNING。
+- 只读查询 PASS：`state active=1 pid=4 page_count=2`；`target`（旧 API）
+  显示全局 hook_count=1；`list-targets` 每槽 hooks=0（hooks 全局表，
+  该差异为当前设计语义，非回归）；`list-pages` 2 页 armed=1；
+  `list-hooks` id=0 installed=1 patch_len=12；`config` 默认
+  `auto_disarm=1 deny_status=0xC0000022`。
+- config 回归 PASS：`auto-disarm 0` 在保护 active 时按设计返回
+  Access Denied（strict deny + active 拒设）；先 `stop` 后
+  `auto-disarm 0→1`、`deny-status 0xC0000005→0xC0000022` 设置/恢复，
+  最终恢复默认；`start` 后 2 页重新 armed。
+- `selftest` PASS：pid=2632，baseline page_count=2，set-target/add-page/
+  list-pages/start/user write-read/remove 全部通过；`exit-test` PASS：
+  child pid=6988，退出后槽自动清理。
+- 服务脚本 PASS：`set-auto-start`/`unset-auto-start` 注册表 Start 2↔3；
+  `sc stop/start` 后 `state active=1 page_count=2`，默认保护恢复。
+- 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
+  `70888311...`，服务 STOPPED；本轮未执行 install-hook/remove-hook/
+  clear，无冻结。
+- 下一步不变：hook 路径（锁序/ERROR_BUSY/真实多目标语义）换平台或
+  硬件调试器；loader_stealth 的 kd `!driver` 复核待内核调试会话；
+  R1/NPT 权限收紧待裸机/KVM。
