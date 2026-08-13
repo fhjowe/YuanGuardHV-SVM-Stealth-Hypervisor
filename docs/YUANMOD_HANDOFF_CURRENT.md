@@ -1512,3 +1512,18 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   归档 `D:\aaaaaavm\yuanguard_hv_default_cpcr_20260813.sys`，已复制
   `C:\yuanguard_hv.sys`。
 - 实机验证：服务 RUNNING，默认流程完整到 `all stopped`，无回归。
+
+### 9.113 2026-08-13 阶段收尾：下一窗口交接摘要
+
+- 提交：`b762594`（HEAD，main）；工作区干净。机器已停驱动（服务
+  STOPPED），`C:\yuanguard_hv.sys` = 稳定默认版
+  `70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B`
+  （归档 `D:\aaaaaavm\yuanguard_hv_default_cpcr_20260813.sys`）。
+- 当前结论：OS-as-guest 常驻线停线（平台级停机，见 9.84-9.102）；R1
+  私有页剔除门控关闭（`YGHV_R1_EXCLUDE_PRIVATE=0`，deny 机器级停机见
+  9.108-9.110）；非驻留保护路线稳定。已完成 P0：VMMCALL 认证分层 +
+  per-vcpu auth_key（9.111）、控制面 SeDebug + VMMCALL 进程绑定
+  （9.112）。
+- 待续：Java/CLI 客户端需管理员+SeDebug 验证 `protect/list-java`；
+  剩余 P0/P1（真实 hook 加固、多目标/配置 IOCTL、持久化防卸载、
+  loader_stealth 等）见 9.103 路线。
