@@ -1,7 +1,7 @@
-# YuanGuardHV 新窗口提示词（2026-08-13 9.129 更新版）
+# YuanGuardHV 新窗口提示词（2026-08-13 9.131 更新版）
 
 你接手 YuanGuardHV（AMD-V SVM/NPT 隐形 Hypervisor）项目，仓库根
-D:\yuanguard，分支 main，HEAD 0268a81（文档已收尾到 9.128，9.129 为本
+D:\yuanguard，分支 main，HEAD a5f354e（文档已收尾到 9.130，9.131 为本
 文件对应的收尾记录）。
 
 【协作铁律（最高优先级）】
@@ -16,15 +16,16 @@ D:\yuanguard，分支 main，HEAD 0268a81（文档已收尾到 9.128，9.129 为
   STOPPED；C:\yuanguard_hv.sys = 稳定默认版
   （SHA256 70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B，
   归档 D:\aaaaaavm\yuanguard_hv_default_cpcr_20260813.sys）。
-- 工作区干净（HEAD 0268a81）；9.128 回归构建产物保留在
-  YuanGuardHV/bin（忽略文件，未清理）；logs_archive/、kd 运行文件、
-  .superpowers/、Java/JNI 产物均已清理；.gitignore 已覆盖。
-- 最近提交：0268a81 docs 9.128；02131a1 docs 9.127；f833ab1 docs
-  9.126；772de94 docs 9.125；691e2c5 2B-3-b 多目标；6af1d8b 2B-3-a；
-  1cecd2f 2C-3；1591a55 2C；d5631ef 2B-2；be87130 2B-1；8dac7e9
-  MDL+真实 hook；b9504ef 9.113 收尾。
+- 工作区干净（HEAD a5f354e）；构建产物已清理（YuanGuardHV/bin、
+  Java/JNI 的 .class/DLL/lib/exp 等均已删除）；logs_archive/、kd
+  运行文件、.superpowers/ 均已清理；.gitignore 已覆盖。
+- 最近提交：a5f354e feat: Java client unprotect/scan + docs 9.130；
+  1587a4d docs 9.129；0268a81 docs 9.128；02131a1 docs 9.127；
+  f833ab1 docs 9.126；772de94 docs 9.125；691e2c5 2B-3-b 多目标；
+  6af1d8b 2B-3-a；1cecd2f 2C-3；1591a55 2C；d5631ef 2B-2；be87130
+  2B-1；8dac7e9 MDL+真实 hook；b9504ef 9.113 收尾。
 
-【关键结论（务必先读 9.84-9.128）】
+【关键结论（务必先读 9.84-9.130）】
 1. OS-as-guest 常驻线已停线：guest 内 Windows 调度器上下文切换触发
    平台级整机停机；唯一 PASS 是 step20 自旋+INTR/NMI 拦截+宿主 ISR。
    非驻留保护路线是产品主线。
@@ -45,6 +46,9 @@ D:\yuanguard，分支 main，HEAD 0268a81（文档已收尾到 9.128，9.129 为
    STATUS_INSUFFICIENT_RESOURCES 的 Win32 映射，不是 ERROR_BUSY；
    锁序死锁与 0x5AA 修复方案见
    docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md。
+9. 9.130 Java/JNI 非 hook 产品化：`unprotect`/`scan` 已加入并实机
+   PASS。
+10. 9.131 收尾：构建与 Java/JNI 产物已清理，提示词与 TASKS 已同步。
 
 【本机雷区（重要）】
 - install/remove/clear 类 hook 路径实机验证会触发整机硬冻结：remove/
@@ -107,5 +111,5 @@ D:\yuanguard，分支 main，HEAD 0268a81（文档已收尾到 9.128，9.129 为
 【文档核实说明】
 docs/YUANMOD_HANDOFF_CURRENT.md 中 9.110-9.118 存在驱动记录与 Codex
 桌面恢复记录的编号重复（历史遗留，内容均有效）；当前主线记录为
-9.115-9.128，尾部 9.128 为最新；9.129 为本文件对应的收尾记录。新窗口
+9.115-9.130，尾部 9.130 为最新；9.131 为本文件对应的收尾记录。新窗口
 以本文件为准。

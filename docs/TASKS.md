@@ -22,6 +22,9 @@
 > `scan`，实机回归通过；C 盘恢复稳定默认版 `70888311...`，服务
 > STOPPED（详见 `YUANMOD_HANDOFF_CURRENT.md` 9.130）。
 
+> 2026-08-13 9.131 收尾整理：构建与 Java/JNI 忽略产物已清理，
+> NEXT_WINDOW_PROMPT/TASKS 同步到 HEAD `a5f354e`/9.130。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）
@@ -59,12 +62,14 @@
 - `vmmcall.c` 只实现 `HEARTBEAT/STOP_INTERNAL/VERSION/STATS`；`PROTECT_HANDLE/UNPROTECT/SCAN_PROCESS/READ_MEMORY/GET_CONFIG/SET_CONFIG/SHUTDOWN` 仅枚举，未实现。
 - NPT 单页 2MB 权限已实现并验证；`npt_set_page_perm_range` 仍假成功，`npt_translate` 返回 0，无 `npt_split_2mb_to_4kb`。
 - `loader_stealth.c` 未编译未调用；`stealth.c` 不存在；CPUID 隐身 handler 是死代码。
-- `tests/`、`mod/`、Java 层均不存在。
+- （2026-08-10 晚快照）`tests/`、`mod/` 目录不存在；Java/JNI 客户端
+  已在后续 9.41/9.114/9.130 完成。
 
 ## 2. 后续 Phase（未开始）
 
 - [x] Phase 3 第一版进程保护（v27-v31，已完成并合并 main）
-- [ ] Phase 3 隐形、真实目标接入、Java 层（下一阶段）
+- [x] Phase 3 真实目标接入与 Java/JNI 客户端（9.41/9.114/9.130）
+- [ ] Phase 3 隐形（MSR/IO/整机级）
 - [ ] `tests/`、`mod/`、`vm/` 目录补齐
 - [ ] 仓库卫生清理（`hv/common/*.bak`、`reference_*` 迁移、历史日志归档）
 - [ ] 宿主稳定性处理：拔除/禁用 USB WiFi 设备或重装其驱动，确认 VMware 可稳定运行
@@ -81,7 +86,8 @@
 - [x] Phase 2c：多核 DPC（每核系统线程，双核 10000 轮心跳验证通过）
 - [ ] Phase 2d：物理机验证（未做）
 - [x] Phase 3 第一版保护：内存页写保护（v27）、终止保护（v28）、句柄保护（v29）、常驻模式（v30/v31）
-- [ ] Phase 3 隐形、真实目标接入、Java 层（下一阶段）
+- [x] Phase 3 真实目标接入与 Java/JNI 客户端（9.41/9.114/9.130）
+- [ ] Phase 3 隐形（MSR/IO/整机级）
 - [ ] R1 安全地基（代码已部分实现，VMware 嵌套环境阻塞验证）
 - [x] v22 稳定基线恢复（v7 路径 + 认证注入，双核心跳与卸载重载通过）
 - [x] R1 第一步：NPT translate/perm-range/split 安全单测（v25 验证通过）
@@ -94,5 +100,6 @@
 - [x] Phase 3 常驻保护模式（v30，全核线程化 + 干净卸载 VM 验证通过）
 - [x] Phase 3 最终修复（v31，TLB 刷新 + rearm 全页重锁 + 二次写测试 VM 验证通过）
 - [x] Phase 3 一版合并回 main（快进到 `bf67ebc`，分支已删）
-- [ ] 下一阶段：真实目标进程接入（IOCTL 配置通道 v32 已实现并 VM 验证通过；Java 层未开始）
-- [ ] 下一阶段：常驻模式接入真实受保护页/真实 hook + NPT 共享状态加锁 + 目标进程生命周期 + hook 加固 + 控制面 CPL/CR3 + 隐形基础 CPUID + 仓库整理（v33-v42 已实现并 VM 验证通过）；裸机逐步逼近 v51 Step1-7 全 PASS，常驻（非停止 VMRUN）在宿主 2 核即冻结（判定平台兼容问题，需换机/KVM/VM）；剩余 R1、MSR/IO 隐身、整机级隐形、Java 层、真实系统 hook
+- [x] 真实目标进程接入与 Java/JNI 客户端（IOCTL 配置通道 v32、
+  9.41/9.114/9.130）
+- [ ] 下一阶段：常驻模式接入真实受保护页/真实 hook + NPT 共享状态加锁 + 目标进程生命周期 + hook 加固 + 控制面 CPL/CR3 + 隐形基础 CPUID + 仓库整理（v33-v42 已实现并 VM 验证通过）；裸机逐步逼近 v51 Step1-7 全 PASS，常驻（非停止 VMRUN）在宿主 2 核即冻结（判定平台兼容问题，需换机/KVM/VM）；剩余 R1、MSR/IO 隐身、整机级隐形、真实系统 hook

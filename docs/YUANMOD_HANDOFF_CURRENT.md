@@ -2003,3 +2003,15 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `70888311...`，服务 STOPPED；本轮无 hook 路径、无冻结。
 - 下一步不变：hook 路径换平台/kd；R1 与 loader_stealth 复核分别待
   裸机/KVM 与内核调试会话。
+
+### 9.131 2026-08-13 收尾整理：提示词/TASKS 同步 + 产物清理
+
+- 用户确认执行：同步 `docs/YUANMOD_NEXT_WINDOW_PROMPT.md` 到 HEAD
+  `a5f354e`/9.130；更新 `docs/TASKS.md` 中过期的“Java 层未开始”
+  条目；清理本轮生成的忽略产物。
+- 清理：`YuanGuardHV/bin` 与 Java/JNI 构建产物（`.class`、
+  DLL/lib/exp）已删除，`git status` 保持干净。
+- 文档：NEXT_WINDOW_PROMPT 改为 9.131 更新版；TASKS 将真实目标接入与
+  Java/JNI 客户端标记完成，并把剩余项收窄为 R1、MSR/IO/整机级隐形、
+  真实系统 hook。
+- 收尾：服务 STOPPED、C 盘稳定默认版 `70888311...` 不变；提交文档。
