@@ -12,8 +12,39 @@ NTKERNELAPI NTSTATUS MmCopyVirtualMemory(
     PEPROCESS TargetProcess, PVOID TargetAddress,
     SIZE_T BufferSize, KPROCESSOR_MODE PreviousMode,
     PSIZE_T NumberOfBytesCopied);
+NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
+                                        PIO_STATUS_BLOCK IoStatusBlock);
 
 static const uint64_t YGHV_PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
+
+static void yghv_hook_diag(const char *stage, NTSTATUS st) {
+    static const char hex[] = "0123456789abcdef";
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h;
+    char buf[96];
+    size_t n = 0;
+    int i;
+
+    RtlInitUnicodeString(&name, L"\\SystemRoot\\yghv_hook.log");
+    InitializeObjectAttributes(&oa, &name,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateFile(&h, FILE_APPEND_DATA, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0)))
+        return;
+    while (stage[n] && n < sizeof(buf) - 16)
+        buf[n++] = stage[n];
+    buf[n++] = ' '; buf[n++] = 's'; buf[n++] = 't'; buf[n++] = '=';
+    buf[n++] = '0'; buf[n++] = 'x';
+    for (i = 7; i >= 0; i--)
+        buf[n++] = hex[((uint32_t)st >> (i * 4)) & 0xF];
+    buf[n++] = '\r'; buf[n++] = '\n';
+    ZwWriteFile(h, NULL, NULL, NULL, &iosb, buf, (ULONG)n, NULL, NULL);
+    ZwFlushBuffersFile(h, &iosb);
+    ZwClose(h);
+}
 
 yghv_protect_state_t g_protect;
 yghv_protect_hook_t g_protect_hooks[YGHV_PROTECT_MAX_HOOKS];
@@ -1101,12 +1132,14 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (!wmap) {
         LOG_ERROR("protect hook %u: writable map of function page 0x%llx failed",
             hook_id, page_pa);
+        yghv_hook_diag("install:map", st);
         st = STATUS_UNSUCCESSFUL;
         goto fail;
     }
     st = svm_core_pause_residents_for_patch();
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect hook %u: patch rendezvous failed 0x%x", hook_id, st);
+        yghv_hook_diag("install:pause", st);
         goto fail;
     }
     RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), patch,
@@ -1119,12 +1152,14 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (st) {
         LOG_ERROR("protect hook %u: split function page failed 0x%x",
             hook_id, st);
+        yghv_hook_diag("install:split", st);
         goto fail;
     }
     st = npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT);
     if (st) {
         LOG_ERROR("protect hook %u: set function page perm failed 0x%x",
             hook_id, st);
+        yghv_hook_diag("install:perm", st);
         goto fail;
     }
 
@@ -1133,12 +1168,14 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect hook %u: add function page failed 0x%x",
             hook_id, st);
+        yghv_hook_diag("install:addpage", st);
         goto fail;
     }
     pp = yghv_protect_find_page_locked(page_pa);
     if (!pp) {
         LOG_ERROR("protect hook %u: function page missing from table",
             hook_id);
+        yghv_hook_diag("install:missing", st);
         yghv_protect_remove_page_for_locked(&g_protect.targets[0], h->func_va);
         st = STATUS_UNSUCCESSFUL;
         goto fail;
@@ -1147,6 +1184,7 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (st) {
         LOG_ERROR("protect hook %u: arm function page failed 0x%x",
             hook_id, st);
+        yghv_hook_diag("install:arm", st);
         yghv_protect_remove_page_for_locked(&g_protect.targets[0], h->func_va);
         goto fail;
     }
@@ -1157,6 +1195,7 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     return STATUS_SUCCESS;
 
 fail:
+    yghv_hook_diag("install:fail", st);
     npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
     if (wmap) {
         RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), h->original,
@@ -1198,6 +1237,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
         LOG_ERROR(
             "protect remove hook %u: writable map of function page 0x%llx failed",
             hook_id, page_pa);
+        yghv_hook_diag("remove:map", st);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -1206,6 +1246,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect remove hook %u: remove_page failed 0x%x",
             hook_id, st);
+        yghv_hook_diag("remove:removepage", st);
         yghv_protect_unmap_writable_page(wmdl, wmap);
         return st;
     }
@@ -1214,6 +1255,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect remove hook %u: patch rendezvous failed 0x%x",
             hook_id, st);
+        yghv_hook_diag("remove:pause", st);
         yghv_protect_unmap_writable_page(wmdl, wmap);
         return st;
     }

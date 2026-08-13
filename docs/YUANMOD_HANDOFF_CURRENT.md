@@ -1877,3 +1877,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 收尾：`sc stop yuanguard`，C 盘恢复稳定默认版 `70888311...`，服务
   STOPPED；提交 6 个文件（control_ioctl.h、protect.h、control_device.c、
   protect.c、YghvCtl.java、yghv_ctl.ps1）+ 交接文档。
+
+### 9.125 2026-08-13 BUSY 诊断与 clear 硬冻结复现（本机停止 hook 路径实验）
+
+- 澄清：9.124 记录的 `g_hook_patch_active` 补丁互斥其实不存在——9.118
+  锁序实验回退时 `patch_begin/patch_end` 一并回退，当前 install/remove
+  仍是旧锁序（持 `g_protect_lock` 内全核心 pause）。`ERROR_BUSY (0x5AA)`
+  的真实来源未定位，代码中无 `STATUS_DEVICE_BUSY` 返回点。
+- 诊断加装：`protect.c` 新增 `yghv_hook_diag`，install/remove 各失败
+  stage（map/pause/split/perm/addpage/missing/arm/removepage/fail）落盘
+  `C:\Windows\yghv_hook.log`。诊断版 SHA256
+  `48824837BF11E205A92EAEF56B3D6364A88D496B8936C29DCA5AC07DDD645836`
+  （归档 `D:\aaaaaavm\yuanguard_hv_hook_diag_20260813.sys`）。
+- 重现尝试：并发 install（后台+前台）未复现 BUSY（双 hook 安装成功）；
+  随后 `clear`（含 remove_hook 的持锁全核心 pause）触发整机硬冻结
+  （21:05:39 Event 6008，无 minidump），复现 9.118 已记录的 pause/锁序
+  死锁风险。诊断日志未留下失败 stage（冻结发生在 pause 等待期间）。
+- 结论：本机不再进行 install/remove/clear 类 hook 路径实机验证，该族
+  问题留待换平台或硬件调试器；`ERROR_BUSY` 保持低频残余风险记录。
+- 收尾：`C:\yuanguard_hv.sys` 恢复稳定默认版 `70888311...`，服务
+  STOPPED；提交 protect.c 诊断代码与交接文档。
