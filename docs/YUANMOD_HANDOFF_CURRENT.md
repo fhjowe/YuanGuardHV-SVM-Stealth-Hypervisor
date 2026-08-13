@@ -1897,3 +1897,19 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   问题留待换平台或硬件调试器；`ERROR_BUSY` 保持低频残余风险记录。
 - 收尾：`C:\yuanguard_hv.sys` 恢复稳定默认版 `70888311...`，服务
   STOPPED；提交 protect.c 诊断代码与交接文档。
+
+### 9.126 2026-08-13 非 hook 路径综合回归（最新多目标+诊断版 PASS）
+
+- 回归版本：`48824837BF11E205A92EAEF56B3D6364A88D496B8936C29DCA5AC07DDD645836`
+  （即多目标 + hook 诊断默认构建，归档
+  `D:\aaaaaavm\yuanguard_hv_hook_diag_20260813.sys`）。
+- 实机清单全部 PASS：`state/list-targets/list-pages/config` 读取；
+  `config` stop 后 `auto-disarm 0/1` 与 `deny-status` 设置/恢复；
+  `selftest`（多目标语义，含 list-pages 校验）；`exit-test`（child 槽
+  auto cleared）；`set-auto-start/unset-auto-start`（Start 2↔3）；服务
+  RUNNING 稳定，无冻结。
+- 该轮刻意避开 hook 安装/移除与 `clear`（本机 pause 死锁已知风险，
+  见 9.118/9.125），确认查询/配置/页保护/服务命令在最新多目标代码上
+  无回归。
+- 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
+  `70888311...`，服务 STOPPED；工作区干净，HEAD `772de94`。
