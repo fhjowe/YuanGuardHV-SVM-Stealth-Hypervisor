@@ -19,6 +19,7 @@ public class YghvCtl {
     private static native long openHandle();
     private static native void closeHandle(long handle);
     private static native int lastError();
+    private static native int enableSeDebug();
     private static native int ioctl(long handle, int fn, byte[] in, byte[] out);
     private static native long[] enumeratePages(int pid, int maxPages);
 
@@ -40,6 +41,10 @@ public class YghvCtl {
     }
 
     private static void open() {
+        int err = enableSeDebug();
+        if (err != 0) {
+            fail("enable SeDebugPrivilege", err);
+        }
         handle = openHandle();
         if (handle == 0) {
             fail("CreateFile", lastError());

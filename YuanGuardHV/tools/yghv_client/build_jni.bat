@@ -16,7 +16,7 @@ if not exist "%CLANG%" (
 
 "%CLANG%" /nologo /O2 /LD /D_JNI_IMPLEMENTATION_ ^
     /I"%JAVA_HOME%\include" /I"%JAVA_HOME%\include\win32" ^
-    native\yghv_ctl_jni.c /Fe:native\yghv_ctl_jni.dll /link kernel32.lib
+    native\yghv_ctl_jni.c /Fe:native\yghv_ctl_jni.dll /link kernel32.lib advapi32.lib
 if errorlevel 1 exit /b 1
 
 echo [YuanGuardHV] JNI client built: %CD%\native\yghv_ctl_jni.dll

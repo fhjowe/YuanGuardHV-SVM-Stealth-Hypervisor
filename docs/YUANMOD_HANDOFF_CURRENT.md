@@ -1527,3 +1527,36 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 待续：Java/CLI 客户端需管理员+SeDebug 验证 `protect/list-java`；
   剩余 P0/P1（真实 hook 加固、多目标/配置 IOCTL、持久化防卸载、
   loader_stealth 等）见 9.103 路线。
+
+### 9.114 2026-08-13 Java/CLI 客户端 SeDebug 显式启用 + 实机回归 PASS
+
+- 背景：9.112 控制面新增
+  `SeSinglePrivilegeCheck(SE_DEBUG_PRIVILEGE, UserMode)` 后，CLI/Java
+  客户端均未显式启用 SeDebugPrivilege，管理员默认也不自动启用，
+  `protect/selftest/exit-test` 可能 ACCESS_DENIED。
+- 实现（用户已确认第一阶段，仅改客户端，驱动未改动）：
+  - `tools\yghv_ctl.ps1`：新增
+    `YghvPrivilege.EnableSeDebugPrivilege()`（OpenProcessToken +
+    LookupPrivilegeValue + AdjustTokenPrivileges，
+    TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY，SE_PRIVILEGE_ENABLED），打开
+    设备前调用，失败即报错退出；
+  - `tools\yghv_client\native\yghv_ctl_jni.c`：新增
+    `Java_YghvCtl_enableSeDebug`（同逻辑，返回 Win32 错误码）；
+  - `tools\yghv_client\build_jni.bat`：link 补 `advapi32.lib`；
+  - `tools\yghv_client\YghvCtl.java`：`open()` 先调 `enableSeDebug()`，
+    失败即退出。
+- 实机回归（稳定默认版 `70888311...`，`sc start yuanguard` → RUNNING）：
+  - PowerShell `state` PASS；`selftest` PASS（set-target/add-page/start/
+    写读/stop/remove 全链路）；`exit-test` PASS（子进程退出后 auto
+    disarm 到 0）；
+  - Java `state`/`list-java` PASS；
+  - Java `protect 10704 64` PASS（枚举 512 页、add 64 页封顶、start，
+    state active=1 page_count=64）；终止 Sleepy 后 auto disarm 到
+    active=0 pid=0 page_count=0 PASS；
+  - `sc stop yuanguard`：正常卸载 STOPPED。
+- 发现（记录待办，本次不修改）：驱动启动自测后 `g_protect.page_count`
+  残留 2 页（稳定默认版可复现：`state` 观察到 3→2 后稳定在 2；selftest
+  set-target 清空后不再回来）。疑似 hook 自测/rendezvous 的 remove 路径
+  在持久 resident 下未完全清理，下一窗口定位（与本次客户端改动无关）。
+- 构建说明：JNI DLL/.class 均在 .gitignore，不入库，仅源码入库；C 盘
+  驱动未改动，仍为 `70888311...`。

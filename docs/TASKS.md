@@ -9,6 +9,10 @@
 > v102 全异常 + HLT 拦截阴性），判定平台级限制。非驻留保护路线保持稳定。
 > 详见 `YUANMOD_HANDOFF_CURRENT.md` 9.84-9.102。
 
+> 2026-08-13 客户端回归：CLI/Java 客户端已显式启用 SeDebugPrivilege，
+> 实机 `state/selftest/exit-test/list-java/protect` 全部 PASS（详见
+> `YUANMOD_HANDOFF_CURRENT.md` 9.114）。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）

@@ -11,6 +11,38 @@ static DWORD ioctl_code(int fn) {
 static int collect_committed_pages(HANDLE proc, jlong *pages, int max_pages,
                                    int want_image);
 
+JNIEXPORT jint JNICALL
+Java_YghvCtl_enableSeDebug(JNIEnv *env, jclass cls) {
+    HANDLE token = NULL;
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    DWORD err;
+    (void)env;
+    (void)cls;
+
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return (jint)GetLastError();
+
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!LookupPrivilegeValue(NULL, "SeDebugPrivilege", &luid)) {
+        err = GetLastError();
+        CloseHandle(token);
+        return (jint)err;
+    }
+    tp.Privileges[0].Luid = luid;
+
+    if (!AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL)) {
+        err = GetLastError();
+        CloseHandle(token);
+        return (jint)err;
+    }
+    err = GetLastError();  /* ERROR_NOT_ALL_ASSIGNED if the privilege is absent */
+    CloseHandle(token);
+    return (jint)err;
+}
+
 JNIEXPORT jlong JNICALL
 Java_YghvCtl_openHandle(JNIEnv *env, jclass cls) {
     HANDLE h = CreateFileW(YGHV_DEVICE, GENERIC_READ | GENERIC_WRITE,

@@ -64,7 +64,82 @@ public static class YghvCtlNative
     public const uint FILE_SHARE_WRITE = 0x2;
     public const uint OPEN_EXISTING = 3;
 }
+
+public static class YghvPrivilege
+{
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Luid
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TokenPrivileges
+    {
+        public uint PrivilegeCount;
+        public Luid Luid;
+        public uint Attributes;
+    }
+
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(
+        IntPtr processHandle,
+        uint desiredAccess,
+        out IntPtr tokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool LookupPrivilegeValue(
+        string systemName,
+        string name,
+        out Luid luid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool AdjustTokenPrivileges(
+        IntPtr tokenHandle,
+        bool disableAllPrivileges,
+        ref TokenPrivileges newState,
+        uint bufferLength,
+        IntPtr previousState,
+        IntPtr returnLength);
+
+    public static bool EnableSeDebugPrivilege()
+    {
+        IntPtr token;
+        if (!OpenProcessToken(GetCurrentProcess(), 0x0028, out token))
+            return false;
+        try
+        {
+            Luid luid;
+            if (!LookupPrivilegeValue(null, "SeDebugPrivilege", out luid))
+                return false;
+
+            TokenPrivileges tp = new TokenPrivileges();
+            tp.PrivilegeCount = 1;
+            tp.Luid = luid;
+            tp.Attributes = 0x2; /* SE_PRIVILEGE_ENABLED */
+
+            if (!AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero))
+                return false;
+            return Marshal.GetLastWin32Error() == 0;
+        }
+        finally
+        {
+            CloseHandle(token);
+        }
+    }
+}
 '@
+
+if (-not [YghvPrivilege]::EnableSeDebugPrivilege()) {
+    throw 'Unable to enable SeDebugPrivilege. Run this script from an elevated PowerShell session.'
+}
 
 $devicePath = '\\.\YuanGuardHV'
 $handle = [YghvCtlNative]::CreateFile(
