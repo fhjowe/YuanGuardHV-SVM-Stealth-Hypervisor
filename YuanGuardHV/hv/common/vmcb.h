@@ -32,7 +32,7 @@ typedef struct {
     uint64_t exitintinfo;            /* +0x88 */
     uint64_t np_enable;              /* +0x90: NP_ENABLE bit 0 */
     uint64_t avic_apic_bar;          /* +0x98 */
-    uint64_t _pad_0A0;               /* +0xA0 */
+    uint64_t ghcb_gpa;               /* +0xA0 */
 
     uint64_t event_injection;        /* +0xA8 */
     uint64_t ncr3;                   /* +0xB0 */
@@ -43,14 +43,23 @@ typedef struct {
     uint64_t next_rip;               /* +0xC8: nRIP */
     uint8_t  byte_fetched;           /* +0xD0: number of bytes fetched */
     uint8_t  instruction_bytes[15];  /* +0xD1: fetched instruction bytes */
-    uint8_t  _pad_0E0[0x320];        /* +0xE0..+0x3FF */
+    uint64_t avic_backing_page;      /* +0xE0 */
+    uint64_t _reserved_0E8;          /* +0xE8 */
+    uint64_t avic_logical_id;        /* +0xF0 */
+    uint64_t avic_physical_id;       /* +0xF8 */
+    uint8_t  _pad_100[0x300];        /* +0x100..+0x3FF */
 } vmcb_control_t;
 
 _Static_assert(sizeof(vmcb_control_t) == 0x400, "VMCB control area size");
 _Static_assert(offsetof(vmcb_control_t, exitcode) == 0x70, "VMCB exitcode offset");
 _Static_assert(offsetof(vmcb_control_t, exitinfo1) == 0x78, "VMCB exitinfo1 offset");
 _Static_assert(offsetof(vmcb_control_t, exitinfo2) == 0x80, "VMCB exitinfo2 offset");
+_Static_assert(offsetof(vmcb_control_t, avic_apic_bar) == 0x98, "VMCB AVIC APIC BAR offset");
+_Static_assert(offsetof(vmcb_control_t, event_injection) == 0xA8, "VMCB event injection offset");
 _Static_assert(offsetof(vmcb_control_t, np_enable) == 0x90, "VMCB np_enable offset");
+_Static_assert(offsetof(vmcb_control_t, avic_backing_page) == 0xE0, "VMCB AVIC backing page offset");
+_Static_assert(offsetof(vmcb_control_t, avic_logical_id) == 0xF0, "VMCB AVIC logical ID offset");
+_Static_assert(offsetof(vmcb_control_t, avic_physical_id) == 0xF8, "VMCB AVIC physical ID offset");
 _Static_assert(offsetof(vmcb_control_t, next_rip) == 0xC8, "VMCB nRIP offset");
 _Static_assert(offsetof(vmcb_control_t, vmcb_clean_bits) == 0xC0, "VMCB clean bits offset");
 _Static_assert(offsetof(vmcb_control_t, guest_asid) == 0x58, "VMCB ASID offset");

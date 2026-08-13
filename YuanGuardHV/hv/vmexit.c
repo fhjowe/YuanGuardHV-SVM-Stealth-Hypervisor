@@ -5,6 +5,9 @@
 #include "protect.h"
 #include "debug.h"
 
+void yghv_trace(const char *msg);
+void yghv_trace_u64(const char *label, uint64_t value);
+
 #define SVM_EVENTINJ_VALID        (1ULL << 31)
 #define SVM_EVENTINJ_TYPE_EXC     (3ULL << 8)
 #define SVM_EVENTINJ_ERROR_VALID  (1ULL << 11)
@@ -20,6 +23,25 @@ extern volatile int g_npt_test_active;
 extern volatile LONG g_os_guest_test_active;
 extern volatile BOOLEAN g_os_resident_mode;
 extern volatile ULONG64 g_os_resident_exits;
+extern volatile BOOLEAN g_os_guest_avic_timer_emu;
+extern volatile BOOLEAN g_v98_apic_shadow;
+extern volatile BOOLEAN g_v100_monitor_active;
+extern volatile BOOLEAN g_v101_gp_seen;
+extern volatile uint64_t g_v101_gp_exitcode;
+extern volatile uint64_t g_v101_gp_err;
+extern volatile uint64_t g_v101_gp_rip;
+extern volatile uint64_t g_v101_gp_rsp;
+extern volatile uint64_t g_v101_gp_cr3;
+extern volatile uint64_t g_v101_gp_gs_base;
+extern volatile BOOLEAN g_v102_catchall;
+extern void *g_v98_apic_shadow_va;
+extern void *g_v98_real_apic_va;
+extern volatile ULONG g_v98_last_tpr;
+extern volatile ULONG g_v98_last_icrl;
+extern volatile ULONG g_v98_last_icrh;
+extern volatile ULONG g_v98_last_lvtt;
+extern volatile ULONG g_v98_last_tmict;
+extern volatile ULONG g_v98_last_tdcr;
 
 #define YGHV_OS_GUEST_EXIT_LIMIT 10000ULL
 
@@ -37,15 +59,308 @@ static void svm_finish_exit(svm_vcpu_t *vcpu) {
     svm_writeback_gprs(vcpu);
 }
 
+static void yghv_v100_record(svm_vcpu_t *vcpu) {
+    uint64_t seq;
+    svm_v100_ring_entry_t *e;
+
+    if (!g_v100_monitor_active)
+        return;
+    seq = vcpu->v100_seq + 1;
+    vcpu->v100_seq = seq;
+    e = &vcpu->v100_ring[seq % YGHV_V100_RING_ENTRIES];
+    e->seq = seq;
+    e->exitcode = vcpu->vmcb->control.exitcode;
+    e->exitinfo1 = vcpu->vmcb->control.exitinfo1;
+    e->exitinfo2 = vcpu->vmcb->control.exitinfo2;
+    e->rip = vcpu->vmcb->state.rip;
+    e->cr3 = vcpu->vmcb->state.cr3;
+    e->rsp = vcpu->vmcb->state.rsp;
+    e->rflags = vcpu->vmcb->state.rflags;
+    e->cpl = vcpu->vmcb->state.cpl;
+}
+
+static BOOLEAN yghv_avic_trap_offset(uint32_t offset) {
+    switch (offset) {
+    case 0x20:   /* APIC ID */
+    case APIC_OFFSET_EOI:
+    case 0xC0:   /* remote read */
+    case APIC_OFFSET_LDR:
+    case APIC_OFFSET_DFR:
+    case APIC_OFFSET_SPIV:
+    case APIC_OFFSET_ESR:
+    case APIC_OFFSET_ICRL:
+    case APIC_OFFSET_LVTT:
+    case 0x330:  /* thermal LVT */
+    case 0x340:  /* performance counter LVT */
+    case 0x350:  /* LINT0 */
+    case 0x360:  /* LINT1 */
+    case 0x370:  /* error LVT */
+    case APIC_OFFSET_TMICT:
+    case APIC_OFFSET_TDCR:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static void yghv_avic_forward_trap_write(svm_vcpu_t *vcpu, uint32_t offset) {
+    uint32_t value;
+
+    if (!vcpu->avic_host_apic_va || offset >= HV_PAGE_SIZE)
+        return;
+    if (g_os_guest_avic_timer_emu &&
+        (offset == APIC_OFFSET_LVTT || offset == APIC_OFFSET_TMICT ||
+         offset == APIC_OFFSET_TDCR)) {
+        return;
+    }
+    if (offset != APIC_OFFSET_LDR && offset != APIC_OFFSET_DFR &&
+        offset != APIC_OFFSET_SPIV && offset != APIC_OFFSET_ESR &&
+        offset != APIC_OFFSET_LVTT && offset != APIC_OFFSET_TMICT &&
+        offset != APIC_OFFSET_TDCR &&
+        offset != 0x330 && offset != 0x340 &&
+        offset != 0x350 && offset != 0x360 && offset != 0x370) {
+        return;
+    }
+    value = *(volatile uint32_t *)((ULONG_PTR)vcpu->avic_backing_page + offset);
+    WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)vcpu->avic_host_apic_va + offset), value);
+}
+
+static int svm_handle_avic_unaccelerated(svm_vcpu_t *vcpu) {
+    uint64_t info1 = vcpu->vmcb->control.exitinfo1;
+    uint32_t offset = (uint32_t)((info1 >> 4) & 0xFF0);
+    BOOLEAN write = (info1 & AVIC_UNACCEL_ACCESS_WRITE_MASK) != 0;
+
+    vcpu->avic_noaccel_exits++;
+    if (vcpu->avic_noaccel_exits <= 8) {
+        LOG_ERROR("AVIC noaccel: exits=%llu offset=0x%x write=%u info1=0x%llx",
+            vcpu->avic_noaccel_exits, offset, write ? 1 : 0, info1);
+    }
+
+    if (write && yghv_avic_trap_offset(offset)) {
+        if (g_os_guest_avic_timer_emu &&
+            (offset == APIC_OFFSET_LVTT || offset == APIC_OFFSET_TMICT ||
+             offset == APIC_OFFSET_TDCR)) {
+            svm_avic_update_timer(vcpu, offset);
+            if (vcpu->avic_host_apic_va) {
+                WRITE_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)vcpu->avic_host_apic_va + APIC_OFFSET_TMICT), 0);
+                WRITE_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)vcpu->avic_host_apic_va + APIC_OFFSET_TDCR), 0);
+            }
+        } else {
+            yghv_avic_forward_trap_write(vcpu, offset);
+        }
+        return 0;
+    }
+
+    /* Fault-like access: instruction did not complete; skip it to avoid a loop. */
+    svm_finish_exit(vcpu);
+    return 0;
+}
+
+static int svm_handle_avic_incomplete_ipi(svm_vcpu_t *vcpu) {
+    uint64_t info1 = vcpu->vmcb->control.exitinfo1;
+
+    vcpu->avic_incomplete_ipi_exits++;
+    if (vcpu->avic_incomplete_ipi_exits <= 8) {
+        LOG_ERROR("AVIC incomplete IPI: exits=%llu info1=0x%llx info2=0x%llx",
+            vcpu->avic_incomplete_ipi_exits, info1,
+            vcpu->vmcb->control.exitinfo2);
+    }
+
+    if (vcpu->avic_host_apic_va) {
+        WRITE_REGISTER_ULONG(
+            (PULONG)((ULONG_PTR)vcpu->avic_host_apic_va + APIC_OFFSET_ICRH),
+            (uint32_t)(info1 >> 32));
+        WRITE_REGISTER_ULONG(
+            (PULONG)((ULONG_PTR)vcpu->avic_host_apic_va + APIC_OFFSET_ICRL),
+            (uint32_t)info1);
+    }
+    return 0;
+}
+
+static uint32_t yghv_avic_scan_pending_vector(svm_vcpu_t *vcpu) {
+    int group;
+
+    for (group = 7; group >= 0; group--) {
+        volatile uint32_t *irr =
+            (volatile uint32_t *)((ULONG_PTR)vcpu->avic_host_apic_va +
+                                  0x200 + 16 * group);
+        uint32_t bits = READ_REGISTER_ULONG((PULONG)irr);
+        int bit;
+
+        if (!bits)
+            continue;
+        for (bit = 31; bit >= 0; bit--) {
+            if (bits & (1U << bit))
+                return (uint32_t)(group * 32 + bit);
+        }
+    }
+    return 0;
+}
+
+static void yghv_avic_ring_doorbell(uint32_t apic_id) {
+    uint32_t low = apic_id;
+    uint32_t high = 0;
+    __asm__ volatile("wrmsr" : :
+        "c"(MSR_AMD64_SVM_AVIC_DOORBELL), "a"(low), "d"(high));
+}
+
+static VOID yghv_avic_timer_dpc(KDPC *dpc, PVOID context,
+                                PVOID arg1, PVOID arg2) {
+    svm_vcpu_t *vcpu = (svm_vcpu_t *)context;
+    ULONG vector = vcpu->avic_timer_vector;
+    volatile uint32_t *irr;
+
+    (void)dpc;
+    (void)arg1;
+    (void)arg2;
+
+    if (vector && vcpu->avic_backing_page) {
+        irr = (volatile uint32_t *)((ULONG_PTR)vcpu->avic_backing_page +
+                                    0x200 + 16 * (vector >> 5));
+        *irr |= (1U << (vector & 31));
+        yghv_avic_ring_doorbell(vcpu->avic_apic_id);
+    }
+
+    if (vcpu->avic_timer_armed) {
+        LARGE_INTEGER due;
+        due.QuadPart = -(LONGLONG)(vcpu->avic_timer_period_ms * 10000);
+        KeSetTimer(&vcpu->avic_timer, due, &vcpu->avic_timer_dpc);
+    }
+}
+
+int svm_avic_timer_init(svm_vcpu_t *vcpu) {
+    if (!vcpu)
+        return 0;
+    if (!vcpu->avic_timer_initialized) {
+        KeInitializeTimer(&vcpu->avic_timer);
+        KeInitializeDpc(&vcpu->avic_timer_dpc, yghv_avic_timer_dpc, vcpu);
+        vcpu->avic_timer_initialized = TRUE;
+    }
+    return 0;
+}
+
+int svm_avic_start_timer(svm_vcpu_t *vcpu, uint32_t vector, uint32_t period_ms) {
+    LARGE_INTEGER due;
+
+    if (!vcpu || !vcpu->avic_timer_initialized)
+        return 0;
+    vcpu->avic_timer_vector = vector & 0xFF;
+    vcpu->avic_timer_period_ms = period_ms ? period_ms : 10;
+    if (vcpu->avic_timer_armed)
+        return 0;
+
+    due.QuadPart = -(LONGLONG)(vcpu->avic_timer_period_ms * 10000);
+    vcpu->avic_timer_armed = TRUE;
+    KeSetTimer(&vcpu->avic_timer, due, &vcpu->avic_timer_dpc);
+    return 0;
+}
+
+int svm_avic_update_timer(svm_vcpu_t *vcpu, uint32_t offset) {
+    uint32_t tmict;
+    uint32_t lvtt;
+
+    if (!vcpu || !vcpu->avic_timer_initialized || !vcpu->avic_backing_page)
+        return 0;
+
+    tmict = *(volatile uint32_t *)((ULONG_PTR)vcpu->avic_backing_page +
+                                   APIC_OFFSET_TMICT);
+    lvtt = *(volatile uint32_t *)((ULONG_PTR)vcpu->avic_backing_page +
+                                  APIC_OFFSET_LVTT);
+    (void)offset;
+
+    if (tmict == 0) {
+        if (vcpu->avic_timer_armed) {
+            KeCancelTimer(&vcpu->avic_timer);
+            vcpu->avic_timer_armed = FALSE;
+        }
+        return 0;
+    }
+
+    return svm_avic_start_timer(vcpu, lvtt & 0xFF, 10);
+}
+
+int svm_avic_record_pending_intr(svm_vcpu_t *vcpu) {
+    uint32_t vector;
+    volatile uint32_t *irr;
+
+    if (!vcpu->avic_backing_page || !vcpu->avic_host_apic_va)
+        return 1;
+    vector = yghv_avic_scan_pending_vector(vcpu);
+    if (vector == 0)
+        return 0;
+
+    vcpu->avic_irr_injections++;
+    irr = (volatile uint32_t *)((ULONG_PTR)vcpu->avic_backing_page +
+                                0x200 + 16 * (vector >> 5));
+    *irr |= (1U << (vector & 31));
+    return 0;
+}
+
+static void yghv_v98_apic_scan_forward(void) {
+    ULONG val;
+
+    if (!g_v98_apic_shadow || !g_v98_apic_shadow_va || !g_v98_real_apic_va)
+        return;
+
+    val = *(volatile ULONG *)((ULONG_PTR)g_v98_apic_shadow_va + APIC_OFFSET_TPR);
+    if (val != g_v98_last_tpr) {
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TPR), val);
+        g_v98_last_tpr = val;
+    }
+
+    val = *(volatile ULONG *)((ULONG_PTR)g_v98_apic_shadow_va + APIC_OFFSET_ICRL);
+    if (val != g_v98_last_icrl) {
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRH),
+                             *(volatile ULONG *)((ULONG_PTR)g_v98_apic_shadow_va + APIC_OFFSET_ICRH));
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRL), val);
+        g_v98_last_icrl = val;
+        g_v98_last_icrh = *(volatile ULONG *)((ULONG_PTR)g_v98_apic_shadow_va + APIC_OFFSET_ICRH);
+    }
+
+    val = *(volatile ULONG *)((ULONG_PTR)g_v98_apic_shadow_va + APIC_OFFSET_LVTT);
+    if (val != g_v98_last_lvtt) {
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_LVTT), val);
+        g_v98_last_lvtt = val;
+    }
+    val = *(volatile ULONG *)((ULONG_PTR)g_v98_apic_shadow_va + APIC_OFFSET_TMICT);
+    if (val != g_v98_last_tmict) {
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TMICT), val);
+        g_v98_last_tmict = val;
+    }
+    val = *(volatile ULONG *)((ULONG_PTR)g_v98_apic_shadow_va + APIC_OFFSET_TDCR);
+    if (val != g_v98_last_tdcr) {
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TDCR), val);
+        g_v98_last_tdcr = val;
+    }
+}
+
 int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     uint64_t exitcode = vcpu->vmcb->control.exitcode;
 
+    yghv_v100_record(vcpu);
+    if (g_v102_catchall &&
+        (((exitcode >= SVM_EXIT_EXCEPTION_BASE) &&
+          (exitcode < SVM_EXIT_EXCEPTION_BASE + 32)) ||
+         (exitcode == SVM_EXIT_HLT))) {
+        g_v101_gp_exitcode = exitcode;
+        g_v101_gp_err = vcpu->vmcb->control.exitinfo1;
+        g_v101_gp_rip = vcpu->vmcb->state.rip;
+        g_v101_gp_rsp = vcpu->vmcb->state.rsp;
+        g_v101_gp_cr3 = vcpu->vmcb->state.cr3;
+        g_v101_gp_gs_base = vcpu->vmcb->state.gs_base;
+        g_v101_gp_seen = TRUE;
+        return 1;
+    }
     vcpu->resident_exits++;
     if (g_os_guest_test_active &&
         vcpu->resident_exits >= YGHV_OS_GUEST_EXIT_LIMIT)
         return 1;
     if (g_os_resident_mode)
         g_os_resident_exits++;
+
+    yghv_v98_apic_scan_forward();
 
     switch (exitcode) {
 
@@ -148,6 +463,12 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         return 0;
     }
 
+    case SVM_EXIT_AVIC_INCOMPLETE_IPI:
+        return svm_handle_avic_incomplete_ipi(vcpu);
+
+    case SVM_EXIT_AVIC_UNACCELERATED_ACCESS:
+        return svm_handle_avic_unaccelerated(vcpu);
+
     /* Interrupts — no RIP advance, guest interrupt handler will execute */
     case SVM_EXIT_INTR:
     case SVM_EXIT_NMI:
@@ -172,6 +493,21 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
 
     case SVM_EXIT_EXCEPTION_UD:
         LOG_ERROR("Guest #UD at RIP=0x%llx", vcpu->vmcb->state.rip);
+        return 1;
+
+    /* v101: guest fault vectors that precede the context-switch stack crash.
+       Capture the site and stop instead of letting Windows bugcheck/freeze. */
+    case SVM_EXIT_EXCEPTION_DF:
+    case SVM_EXIT_EXCEPTION_NP:
+    case SVM_EXIT_EXCEPTION_SS:
+    case SVM_EXIT_EXCEPTION_GP:
+        g_v101_gp_exitcode = exitcode;
+        g_v101_gp_err = vcpu->vmcb->control.exitinfo1;
+        g_v101_gp_rip = vcpu->vmcb->state.rip;
+        g_v101_gp_rsp = vcpu->vmcb->state.rsp;
+        g_v101_gp_cr3 = vcpu->vmcb->state.cr3;
+        g_v101_gp_gs_base = vcpu->vmcb->state.gs_base;
+        g_v101_gp_seen = TRUE;
         return 1;
 
     case SVM_EXIT_SHUTDOWN:
@@ -246,8 +582,18 @@ static uint64_t svm_host_read_msr(uint32_t msr) {
 static int svm_handle_msr(svm_vcpu_t *vcpu) {
     uint32_t msr = (uint32_t)vcpu->regs.rcx;
     uint64_t data;
+    BOOLEAN write = (vcpu->vmcb->control.exitinfo1 & 1) != 0;
 
     vcpu->resident_msr_exits++;
+
+    if (msr == MSR_VM_CR) {
+        if (write)
+            return 0; /* drop guest writes to VM_CR */
+        data = VM_CR_SVMDIS;
+        vcpu->regs.rax = (uint32_t)data;
+        vcpu->regs.rdx = (uint32_t)(data >> 32);
+        return 0;
+    }
 
     data = svm_host_read_msr(msr);
     vcpu->regs.rax = (uint32_t)data;

@@ -271,6 +271,16 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
     ctrl->msrpm_base_pa = vcpu->msrpm_pa;
     ctrl->iopm_base_pa = vcpu->iopm_pa;
 
+    /* v93: intercept VM_CR so the guest cannot observe SVM as enabled.
+       bhyve/illumos: Windows ignores CPUID SVM bits and reads 0xC0010114. */
+    {
+        uint8_t *msrpm = (uint8_t *)vcpu->msrpm;
+        uint32_t vmcr_delta = MSR_VM_CR - 0xC0010000u;
+        uint32_t vmcr_byte = (vmcr_delta / 4u) + 2u * 2048u;
+        uint32_t vmcr_bit = (vmcr_delta & 3u) * 2u;
+        msrpm[vmcr_byte] |= (uint8_t)(0x3u << vmcr_bit);
+    }
+
     /* NPT disabled for minimal test */
     ctrl->np_enable = 0;
     /* Guest ASID — ASID 0 reserved for host, use core_id+1 in real multi-core */

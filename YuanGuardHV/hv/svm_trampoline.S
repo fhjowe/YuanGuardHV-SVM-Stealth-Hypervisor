@@ -113,6 +113,36 @@ svm_trampoline_test_resident_guest:
     jmp     svm_trampoline_test_resident_guest
 svm_trampoline_test_resident_guest_end:
 
+# --- Minimal host EOI interrupt handler (step32) ---
+# Only acknowledges the physical APIC; the guest handles the virtual interrupt
+# delivered by AVIC. Preserves every register it touches.
+    .globl yghv_avic_eoi_isr
+yghv_avic_eoi_isr:
+    push    rax
+    push    rcx
+    push    rdx
+    push    rsi
+    push    rdi
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    mov     rax, qword ptr [rip + g_avic_eoi_apic_va]
+    test    rax, rax
+    jz      1f
+    mov     dword ptr [rax + 0xB0], 0        # physical APIC EOI
+1:
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdi
+    pop     rsi
+    pop     rdx
+    pop     rcx
+    pop     rax
+    iretq
+
 # ============================================================
 # uint64_t svm_vmrun_trampoline(svm_vcpu_t *vcpu)
 #   RCX = vcpu pointer
@@ -318,6 +348,8 @@ os_enter_resume:
     wrmsr
 
     mov     rax, qword ptr [rsp + 8]            # vcpu
+    mov     rdx, qword ptr [rax]                # vcpu->vmcb
+    mov     dword ptr [rdx + 0xC0], 0           # vmcb_clean_bits = 0 (v94)
     mov     r15, qword ptr [rax + 0x78 + 0x00]
     mov     r14, qword ptr [rax + 0x78 + 0x08]
     mov     r13, qword ptr [rax + 0x78 + 0x10]
@@ -367,13 +399,107 @@ os_enter_exit:
     pop     rsi
     mov     qword ptr [rdi + 0x78 + 0x40], rsi
 
-    # Keep GIF=0 while running the host dispatch so a clock interrupt can
-    # never be serviced on the dedicated host stack.
+    # Step29: for INTR exits, record the physical IRR into the vAPIC IRR, then
+    # fall through to the host ISR so Windows takes and EOIs the interrupt.
+    movzx   eax, byte ptr [rip + g_os_guest_avic_irr_inject]
+    test    al, al
+    jz      os_enter_check_step21
+    mov     rax, qword ptr [rdi]
+    mov     rax, qword ptr [rax + 0x70]      # control.exitcode
+    cmp     eax, 0x60                        # SVM_EXIT_INTR
+    je      os_enter_avic_irr
+    cmp     eax, 0x61                        # SVM_EXIT_NMI
+    jne     os_enter_check_step21
+    movzx   eax, byte ptr [rip + g_os_guest_avic_eoi_only]
+    test    al, al
+    jz      os_enter_check_step21
+    jmp     os_enter_inject_intr
+
+os_enter_avic_irr:
+    mov     rcx, rdi
+    call    svm_avic_record_pending_intr
+    test    eax, eax
+    jnz     svm_os_guest_host_done
+    movzx   eax, byte ptr [rip + g_os_guest_avic_eoi_only]
+    test    al, al
+    jz      os_enter_check_host_isr
+    lea     rax, [rip + g_avic_eoi_idtr]
+    lidt    fword ptr [rax]
+    stgi
+    hlt
+    clgi
+    lea     rax, [rip + g_avic_old_idtr]
+    lidt    fword ptr [rax]
+    jmp     os_enter_resume
+
+os_enter_check_step21:
+    # Step21: for INTR/NMI exits, re-inject the intercepted event into guest.
+    movzx   eax, byte ptr [rip + g_os_guest_inject_intr]
+    test    al, al
+    jz      os_enter_check_host_isr
+    mov     rax, qword ptr [rdi]
+    mov     rax, qword ptr [rax + 0x70]      # control.exitcode
+    cmp     eax, 0x60                        # SVM_EXIT_INTR
+    je      os_enter_inject_intr
+    cmp     eax, 0x61                        # SVM_EXIT_NMI
+    je      os_enter_inject_intr
+
+os_enter_check_host_isr:
+    # Default: keep GIF=0 while running the host dispatch so a clock
+    # interrupt can never be serviced on the dedicated host stack.
+    movzx   eax, byte ptr [rip + g_os_guest_host_isr]
+    test    al, al
+    jz      os_enter_dispatch_default
+
+    # Step20: for INTR/NMI exits, switch to the thread stack and enable GIF
+    # so Windows services the physical interrupt in host context (v52 path).
+    mov     rax, qword ptr [rdi]
+    mov     rax, qword ptr [rax + 0x70]      # control.exitcode
+    cmp     eax, 0x60                        # SVM_EXIT_INTR
+    je      os_enter_host_isr
+    cmp     eax, 0x61                        # SVM_EXIT_NMI
+    je      os_enter_host_isr
+
+os_enter_inject_intr:
+    mov     rax, qword ptr [rdi]
+    mov     rdx, qword ptr [rax + 0x88]      # control.exitintinfo
+    mov     qword ptr [rax + 0xA8], rdx      # control.event_injection
+    jmp     os_enter_dispatch_default
+
+os_enter_dispatch_default:
     mov     rcx, rdi                           # rcx = vcpu
     call    svm_dispatch_exit
     test    eax, eax
     jnz     svm_os_guest_host_done
     jmp     os_enter_resume
+
+os_enter_host_isr:
+    mov     rbx, rdi                           # vcpu in callee-saved reg
+    mov     rax, qword ptr [rbx]               # vmcb
+    movzx   ecx, byte ptr [rax + 0x4CB]        # state.cpl
+    test    cl, cl
+    jnz     os_enter_host_isr_old_stack
+    mov     rsp, qword ptr [rax + 0x5D8]       # guest current RSP (CPL0)
+    jmp     os_enter_host_isr_stgi
+os_enter_host_isr_old_stack:
+    mov     rsp, qword ptr [rbx + 0x40]        # host_rsp fallback
+os_enter_host_isr_stgi:
+    stgi
+    sub     rsp, 8                             # x64 call alignment
+    mov     rcx, rbx
+    call    svm_dispatch_exit
+    add     rsp, 8
+    clgi
+    test    eax, eax
+    jnz     os_enter_host_isr_done
+    mov     rsp, qword ptr [rbx + 0x38]        # host_stack_top
+    sub     rsp, 0x50                          # restore dedicated trampoline frame
+    jmp     os_enter_resume
+
+os_enter_host_isr_done:
+    mov     rcx, rbx
+    lea     rax, [rip + yghv_os_guest_host_done]
+    jmp     rax
 
 svm_os_guest_host_done:
     stgi

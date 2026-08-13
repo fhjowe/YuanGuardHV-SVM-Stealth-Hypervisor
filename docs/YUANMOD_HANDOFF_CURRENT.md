@@ -923,3 +923,421 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 归档：`D:\aaaaaavm\yuanguard_hv_v74_step18.sys`（SHA256
   `7B9D63D6AD9CAE708ADDE8004167ABD5889BEDB3F041DC4524CF3304B97DE320`）。
 - 提交：`a037044`（step18 + trace 落盘 + alive/看门狗）。
+
+### 9.84 2026-08-12 交接文档两次损坏恢复 + v93/v94 结果 + v95 决策
+
+- 14:28 / 14:38 两次发现 `docs/YUANMOD_HANDOFF_CURRENT.md` 被硬冻结写成全 NUL
+  （分别 157,210 / 125,661 字节，无任何非零字节）；已从 HEAD `06458a6`
+  （9.58 版，blob `fc1935c1`）恢复；9.59-9.83 未提交记录不可恢复，按会话摘要
+  重建核心结论，并同步备份到 `D:\aaaaaavm\yghv_handoff_backup_*.md`。
+- 9.59-9.83 重建要点：
+  - 唯一 PASS：step20 自旋常驻 + INTR/NMI 拦截 + 宿主 ISR（无 AVIC）。
+  - 阻塞变体 step22/23/24 硬冻结；AVIC 分支 step25/27/30/31 硬冻结、
+    step32 v90/v91 `0x101` 蓝屏、step33 v92 硬冻结。
+- v93（MSR_PROT + `VM_CR` 读返回 `VM_CR_SVMDIS`、写丢弃）step33 实机硬冻结：
+  SHA256 `404D6DF7...270D2AD`，14:32 重启，无 `resident alive`、无 dump。
+- v94（每次 VMRUN 前清 `[vcpu->vmcb + 0xC0]`）step33 实机硬冻结：SHA256
+  `E40C00E9...110D194A`，14:36 重启，无 `resident alive`、无 dump。
+- 结论：VM_CR 虚拟化与 VMCB clean bits 均未解冻；AVIC 分支连续失败。
+- v95 决策：用当前代码（含 v93/v94 改动）重测 **step23**（阻塞常驻 + host ISR，
+  无 AVIC），排除或确认“guest 上下文切换”为冻结根因。
+- v95 构建：SHA256 `9662EF540EA17437D82BEC079F83F94AB20F2C29294CAF7B881B1C531990C6F7`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v95_step23.sys`；已复制 `C:\yuanguard_hv.sys`。
+- v95 实机结果：step23（阻塞 + host ISR，无 AVIC）仍硬冻结，C 盘哈希已核对
+  `9662EF54...`，14:43:38 重启，日志到
+  `bm os resident block delay running → bm done`，无 `resident alive`、无 dump。
+  文档与 v95b 备份再次被硬冻结写成全 NUL，已从 git blob `af5282e5` 恢复。
+- 结论更新：v93（VM_CR）/ v94（clean bits）/ v95（无 AVIC 阻塞）全部未解冻；
+  唯一 PASS 仍是 step20（自旋 + INTR/NMI 拦截 + 宿主 ISR）。冻结触发点收敛到
+  “guest 模式内 Windows 调度/上下文切换”或“持续物理 APIC 访问流（errata 1363）”。
+- v96 提案（待用户确认）：在 step20 PASS 基线上，让 guest 自旋循环额外持续写
+  物理 APIC TPR（0xFEE00080）。若 v96 冻结 → APIC/1363 根因，转 xAPIC MMIO
+  虚拟化（NPT 剔除 APIC 页 + 宿主模拟）；若 v96 存活 → 根因在上下文切换本身，
+  转研究 guest 上下文切换的状态保存。
+- v96 已确认实现：新增 step96 入口（`bm step=0x60`），复用 step20 编排，guest
+  自旋循环每轮写物理 APIC TPR（`MmMapIoSpace` 0xFEE00000 + 0x80，写 0）。
+  构建 SHA256 `193CD493530E186CE72240456642737A1C98094B28666F23070927CBFA8BD9C4`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v96_step96.sys`，已复制 `C:\yuanguard_hv.sys`。
+- v96 实机结果：**PASS**，`resident alive` 持续到 45 秒（`0x2d`），服务 RUNNING、
+  机器全程响应。结论：**持续的物理 APIC TPR 写流单独不会冻结** step20 基线；
+  冻结触发点进一步收敛到 guest 模式内的 Windows 阻塞/空闲路径（调度器切换或
+  guest 内执行 HLT/MWAIT）。
+- v97 实现：新增 step97 入口（`bm step=0x17`），复用 step23（阻塞 + host ISR），
+  并拦截 guest `HLT/MWAIT/MWAIT_COND`（HLT=24 general1，MWAIT=43/44 general2），
+  让空闲指令走 VMEXIT + RIP 推进模拟，而不是在 guest 模式内真正 halt。
+- v96 延长观察：`resident alive` 到 140 秒（`0x8c`）仍 RUNNING、机器响应，暂未
+  手工卸载（OS-as-guest 常驻不可安全卸载，需重启清除）。
+- v97 构建：SHA256 `8D31D61E0F98AAF4EFE3262AE4699BF8EB87896F469AD414E7F775CA70F3FD73`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v97_step97.sys`；待重启后复制 `C:\yuanguard_hv.sys` 测试。
+- v97 实机结果：**FAIL**，C 盘哈希已核对 `8D31D61E...`，15:04:46 重启；日志停在
+  `bm os resident block delay start → os resident delay enter=1`，未到
+  `block delay running`，无 `resident alive`、无 dump。HLT/MWAIT 拦截未解冻，
+  且本次冻结点比 v95 更早。
+- 阶段结论：单核 OS-as-guest 常驻 + guest 内 Windows 调度器切换，在
+  AVIC / VM_CR / clean bits / TPR 写流 / HLT/MWAIT 拦截全部变量下均冻结；
+  剩余路径（xAPIC MMIO 拦截+宿主模拟、全核常驻、换平台）成本高且无收敛保证。
+  非驻留保护路线保持稳定，未受影响。
+- v98 实现（用户确认走 xAPIC MMIO 虚拟化）：新增 `npt_map_page`（GPA→任意 SPA
+  4KB 重映射）；step98 复用 step23，把 guest `0xFEE00000` 重映射到影子 APIC 页，
+  每次 VMEXIT 扫描影子页，仅 TPR/ICR/LVTT/TMICT/TDCR 变化时转发真实 APIC
+  （避免持续写流），EOI 留在影子页；NPT 变化后刷 TLB。
+  实现修正：原 TPR 门控方案会因 pending 中断在 VMRUN 后立刻重退出而死锁，
+  改为转发 TPR 到真实 APIC，让硬件按真实 TPR 决定 INTR 拦截。
+  构建 SHA256 `69E31E6DD874410A5A628D0BA8180410FDE85DAFA841DBA28B44F8524B7FA5E0`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v98_step98.sys`，已复制 `C:\yuanguard_hv.sys`。
+- v98 实机结果：**FAIL**，C 盘哈希已核对 `69E31E6D...`，15:14:54 重启；日志完整到
+  `v98 apic shadow armed=0xc7a2f000 → os resident delay enter=1 →
+  bm os resident block delay running → bm done`，无 `resident alive`、无 dump。
+  结论：guest APIC 访问重定向到影子页后，阻塞常驻仍冻结；xAPIC MMIO 虚拟化
+  单变量未能解冻，冻结触发点进一步收敛到 guest 模式内上下文切换本身。
+- v99 全核常驻（用户确认）：计划见
+  `docs/superpowers/plans/2026-08-12-os-as-guest-allcore-resident.md`。
+  已实现 step99：12 核 barrier 后同时 seamless 进入 guest，延续体永久阻塞，
+  沿用 INTR/NMI 拦截 + 宿主 ISR + MSR_PROT + clean bits，无 AVIC/影子 APIC。
+  构建 SHA256 `DC1EAA13FD95E99B0D06D3CA4453A702A01A414617FE62F737DDD30A5CBC4F06`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v99_step99.sys`，已复制 `C:\yuanguard_hv.sys`。
+- v99 实机结果：**FAIL**，C 盘哈希已核对 `DC1EAA13...`，15:34:05 重启；日志
+  `bm os allcore resident start` 后 **12 核全部出现 `allcore enter=0..11`**，
+  随后冻结，未见 `bm os allcore resident running`，无 `resident alive`、无 dump。
+- 最终结论：全核对称常驻同样硬冻结，**排除“单核不对称”假设**；在 Ryzen 5 5500
+  上以当前透明 OS-as-guest 方式常驻不可行，判定为平台级限制，停线收尾。
+  非驻留保护路线保持稳定可用。
+
+### 9.85 2026-08-12 云服务器 KD 调试配置（WinDbg over network）
+
+- 用户提供云服务器（公网 `192.140.176.241`）作为 KD 主机；实际系统为
+  Windows Server 2022 Datacenter x64，SSH 22 关闭，RDP 3389 / WinRM 5985 开放。
+- 本地远程通道：PowerShell `New-PSSession` 缺 WSMan 客户端、`winrs.exe` 不可用；
+  改用本机 `pywinrm`（NTLM over HTTP 5985）成功。
+- 已安装 Debugging Tools for Windows 10.0.26100.1 到
+  `C:\Program Files (x86)\Windows Kits\10\Debuggers\x64`
+  （`kd.exe` / `cdb.exe` / `windbg.exe` 均存在）。
+- 已放行云服务器 Windows 防火墙 UDP 50000 入站（规则 `yghv_kd`）。
+- 已后台启动 KD 网络监听：
+  `kd.exe -y srv*C:\kd\symbols*https://msdl.microsoft.com/download/symbols -k net:port=50000,key=1.2.3.4 -logo C:\kd\kd.log`
+  状态 `Waiting to reconnect...`，进程 PID 4576，UDP 50000 已监听。
+- 待用户操作：云厂商安全组放行 UDP 50000 入站。
+- 实机侧准备命令（执行前需备份 BCD）：
+  `bcdedit /dbgsettings net hostip:192.140.176.241 port:50000 key:1.2.3.4`
+  `bcdedit /debug on`
+- 云服务器凭据不写入项目文档。
+
+### 9.86 2026-08-12 云服务器信息落档（凭据存仓库外）
+
+- 云服务器公网 `192.140.176.241`，Windows Server 2022 Datacenter x64，
+  Administrator 账号；密码与远程操作模板只保存在
+  `D:\aaaaaavm\yghv_cloud_kd_server.md`（不写入仓库）。
+- 管理通道：WinRM HTTP 5985（本机用 pywinrm NTLM）；SSH 22 关闭。
+- KD 监听：UDP 50000，`kd.exe -g` 自动继续，日志 `C:\kd\kd.log`；
+  Windows 防火墙与云安全组均已放行，UDP echo 端到端测试 PASS。
+- 本机 BCD：已备份 `C:\yghv_bcd_backup_20260812.bcd`，已设置
+  `net hostip:192.140.176.241 port:50000 key:1.2.3.4`，`debug on`。
+- 下一步：实机重启验证云 KD 连接。
+
+### 9.87 2026-08-12 云 KD 连接失败：Realtek 网卡不被 KDNET 支持
+
+- 实机重启后云端 `kd.log` 仍 `Waiting to reconnect...`，KD 未连上。
+- 本机 BCD 正确（NET hostip 192.140.176.241 port 50000 key 1.2.3.4，debug Yes）；
+  网卡为 Realtek RTL8168（PCI 8.0.0，VEN_10EC DEV_8168），驱动 2015/4/10
+  9.1.410.2015。
+- 新旧 kdnet（2020 / 10.0.26100）均报“Network debugging is not supported on
+  any of the NICs”，并 `Failed to parse the busparams:PCI 8 0 0`；
+  显式 `kdnet /busparams 8.0.0 192.140.176.241 50000` 报
+  “The specified debug Device was not found”。
+- 驱动二进制 `rt640x64.sys` 无 KDNET 字符串；驱动存储内也无更新版本。
+- 云端 KD 端保持就绪（UDP 50000，`-g`）；UDP 端到端 echo 测试 PASS。
+- 待用户决策：a) 更新最新 Realtek 公版驱动后再试；b) 更换受支持网卡；
+  c) 放弃云端 KD，沿用现有进度日志/看门狗方案。
+- 注意：本机以太网为静态 IP，LAN 若无 DHCP，KDNET 会退回 APIPA，无法经
+  公网到达云服务器；即使网卡支持也需 LAN 有 DHCP。
+
+### 9.88 2026-08-12 Realtek 驱动更新后 KDNET 仍不支持（结论）
+
+- 用户从 Station-Drivers 安装最新驱动：`10.80.50.407`（2026/4/7），
+  `rt640x64.sys` 已更新为 1,473,064 字节（2026/7/20）。
+- 新版 kdnet 10.0.26100 仍报 `Network debugging is not supported on any of
+  the NICs`；显式 `kdnet /busparams 8.0.0 192.140.176.241 50000` 仍报
+  `The specified debug Device was not found`。
+- 最终结论：板载 Realtek RTL8168（REV_15，SUBSYS 8677）为硬件级
+  KDNET 不支持，驱动更新无法解决；云端 KD 方案需换受支持网卡或改走
+  其他调试/日志方案。
+
+### 9.89 2026-08-12 KDNET 扩展模块试验：云端 Server 2022 DLL 仍不识别
+
+- 新发现：WDK 自带 Realtek KDNET 扩展模块完整源码
+  `C:\Program Files (x86)\Windows Kits\10\Debuggers\ddk\samples\kdnet\ethernet\realtek\`
+  （产出 `kd_02_10ec.dll`）；本机 Win10 19045 的 `System32` 原本完全没有
+  `kd_02_*.dll`，怀疑是系统组件缺失。
+- 云端 Windows Server 2022 的 `C:\Windows\System32\kd_02_10ec.dll` 存在，
+  430,416 字节，微软签名有效，SHA256
+  `4D6F0B041B1678AC2993D4DCCCE4A3049A88BFCBC798212E1EEA50087438C208`；
+  反汇编显示比 WDK 示例多支持 `2C000000/2C800000/48/4C/54/60/64` 等
+  新版 Realtek 内部版本，曾推测可覆盖 REV_15。
+- 用户确认试验“复制 DLL + 跑 kdnet，不重启、不改 BCD”。已把云端 DLL
+  复制到本机 `C:\Windows\System32\kd_02_10ec.dll`，并归档到
+  `D:\aaaaaavm\kd_02_10ec_srv2022.dll`。
+- 结果：`kdnet.exe` 输出与之前完全相同，仍报
+  `Network debugging is not supported on any of the NICs`，8.0.0 仍
+  `Failed to parse the busparams`。仅加 DLL 不改变 kdnet 检测结果。
+- 已按约定回滚：活动文件改名为
+  `C:\Windows\System32\kd_02_10ec.dll.bak`，未改 BCD、未重启。
+- 待用户确认的下一步：用 `bcdedit /copy {current}` 建独立测试启动项，
+  直接强制 `busparams=8.0.0` 后重启验证云端 KD 是否连接；或继续编译
+  并补改 WDK Realtek 扩展模块源码。
+
+### 9.90 2026-08-12 独立 KDNET 测试启动项（用户确认，已准备重启）
+
+- 用户确认继续强制 `busparams` 测试。已把云端 Server 2022 的
+  `kd_02_10ec.dll` 重新复制为活动文件
+  `C:\Windows\System32\kd_02_10ec.dll`（SHA256
+  `4D6F0B041B1678AC2993D4DCCCE4A3049A88BFCBC798212E1EEA50087438C208`）。
+- 已导出测试前 BCD 备份：`C:\yghv_bcd_backup_20260812_kdnet_test.bcd`。
+- 已用 `bcdedit /copy {current}` 创建独立测试项：
+  `{72407a44-68b4-11f1-9ddb-bc907795b50b}`，描述
+  `YuanGuardHV KDNET Test`；默认启动项保持 `{current}`。
+- 测试项设置：`debug on`、`kerneldebugtype NET`、
+  `kernelbusparams 8.0.0`、`kernelhostip 192.140.176.241`、
+  `kernelport 50000`、`kernelkey 1.2.3.4`、`kerneldhcp Yes`、
+  `bootstatuspolicy IgnoreAllFailures`、`recoveryenabled No`。
+- 首次设置 `kernelhostip` 十进制算错（曾变成 192.140.184.193），已修正为
+  3230445809，`bcdedit /enum` 复核显示 192.140.176.241 正确。
+- 准备用 `bcdedit /bootsequence {guid}` 做一次性启动到测试项；云端
+  `kd.exe` PID 1912 监听 UDP 50000，`kd.log` 为 `Waiting to reconnect...`。
+- 重启后核对云端 `C:\kd\kd.log` 是否出现连接/断点；若启动失败，正常项
+  `{current}` 仍是默认，可进 WinRE 改名 `kd_02_10ec.dll` 并恢复 BCD。
+
+### 9.91 2026-08-12 独立测试项重启结果 + 本地编译 Win10 版模块
+
+- 第一次测试项重启结果：成功进入 `YuanGuardHV KDNET Test`（描述已确认），
+  云端 `kd.log` 仍 `Waiting to reconnect...`，未收到任何 KD 连接。
+- 本地 `kd -kl` 能连接但仅显示 `nt` 模块；`KdDebuggerEnabled=0`、
+  `KdDebuggerNotPresent=1`，说明 KDNET 传输实际未初始化成功。
+- 归因：Server 2022 版 `kd_02_10ec.dll`（10.0.20348）与本机
+  `kdcom.dll`（10.0.19041）未成功接上，或该版本模块不加载。
+- 已从 WDK 示例源码手工编译 Win10 19041 版 `kd_02_10ec.dll`：
+  clang-cl + MSVC link，修正 `KdInitializeController` 签名为
+  `PKDNET_SHARED_DATA`，补本地 `memset`/`__security_init_cookie` stub，
+  产物 35,840 字节、无导入、只导出 `KdInitializeLibrary`；
+  SHA256 `EE373DC2B24F4A09320B5E97DFF8A76F5B01799BB02C9AD954C780293F882320`，
+  归档 `D:\aaaaaavm\kd_02_10ec_win10_19041_local.dll`。
+- 用户确认后已把本地编译版复制为
+  `C:\Windows\System32\kd_02_10ec.dll`；原 Server 2022 版改名为
+  `kd_02_10ec_srv2022.dll.bak` 保留。
+- 准备再次用 `bcdedit /bootsequence {guid}` 一次性启动测试项并重启，
+  继续核对云端 `C:\kd\kd.log` 与本机 `KdDebuggerEnabled`。
+
+### 9.92 2026-08-12 导入数量修正：31 导入 + 13 导出
+
+- 本地 30 导入版（WDK 示例头）重启后 `KdDebuggerEnabled=0`、
+  `KdDebuggerNotPresent=1`，云端仍无来自本机的包；`kd.log` 中的
+  `Bad packet sent from 198.235.24.228` 经本机主动 UDP 测试判定为公网
+  扫描（本机实测源 IP 为 117.172.241.116），不是 KDNET 握手。
+- 反汇编本机 `C:\Windows\System32\kdstub.dll` 发现它校验
+  **ImportTable->FunctionCount == 0x1F（31）**、导出表
+  `FunctionCount == 0x0D（13）`；WDK 示例头为 30 导入，导致
+  `KdInitializeLibrary` 直接返回 `STATUS_INVALID_PARAMETER`，模块未接入。
+- 已复制示例头到临时构建目录，把 `KDNET_EXT_IMPORTS` 改为 31 后重新
+  编译/签名/归档：`D:\aaaaaavm\kd_02_10ec_win10_19041_imp31.dll`，
+  37,248 字节，SHA256
+  `3260BC3604C59BA238A946246106FEE1FE497FF183CC491724C4DBB26CD3C945`；
+  反汇编确认 `cmp [rdi],1Fh` 与 `cmp [rcx],0Dh`。
+- 用户确认后已把 imp31 复制为 `C:\Windows\System32\kd_02_10ec.dll`；
+  上一版 30 导入本地模块改名为 `kd_02_10ec_imp30.dll.bak`。
+- 准备再次一次性启动测试项并重启，核对云端 `kd.log` 与
+  `KdDebuggerEnabled`。
+
+### 9.93 2026-08-12 常驻冻结线恢复 + step100 冻结现场环形缓冲
+
+- 用户明确放弃云 KD 路线，回到本机解决 OS-as-guest 常驻冻结（先前 9.84
+  记录到 v99 全核 FAIL 后停线，现恢复推进）。
+- 现状核对：`C:\yuanguard_hv.sys` = v99 step99 冻结版（SHA256
+  `DC1EAA13...`），服务 Stopped；加载即会重演整机硬冻结。
+- 复盘实验矩阵：唯一 PASS 仍是 step20 自旋 + INTR/NMI 拦截 + 宿主 ISR
+  （v96 延长 140 秒 PASS）；阻塞变体 step22/23/24 与 AVIC/VM_CR/clean
+  bits/TPR/HLT-MWAIT/xAPIC 影子/全核 step99 全部 FAIL，冻结特征为
+  alive 日志都停、无 dump。
+- step100 决策（用户确认）：保持 step23 阻塞编排不变，在 VMEXIT 热路径
+  加每 vcpu 64 项环形缓冲（exitcode/exitinfo1/2/RIP/CR3/RSP/RFLAGS/CPL +
+  seq），由 core0 专用监控线程每 250ms 看 vcpu1 的 exits/seq；连续 10 次
+  不推进即把 VMCB 现状 + 最近 64 条退出现场同步落盘（`v100 freeze site`、
+  `v100 <seq> exit=...`），首次拿到冻结前 guest 现场。
+- 实现：`svm_vcpu.h` 增 `v100_seq` + `v100_ring[64]`；`vmexit.c`
+  `svm_dispatch_exit` 顶部 `yghv_v100_record`（仅 `g_v100_monitor_active`
+  时记录）；`main.c` 增 `yghv_v100_dump`、`yghv_v100_monitor_thread`、
+  step100 入口（复用 `yghv_os_guest_resident_delay_thread` + alive +
+  monitor，**不挂看门狗**，避免 3 秒 bugcheck 抢在落盘前；监控线程等
+  `g_v100_guest_entered` 后才开始计时，防初始误判；`seq==0` 不落盘）。
+  默认版与 step100 版均构建通过。
+- 构建：step100 SHA256 `E300CF39EC9E705B0041F70FA39D4EADD6009E5DF99FBD5F9CF867DB1836C55D`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v100_step100.sys`（待复制 `C:\yuanguard_hv.sys`）。
+- 下一步：复制到 C 盘后实机加载 `sc start yuanguard`；观察
+  `C:\Windows\yghv_progress.log`，冻结后重启读取 `v100` 现场。
+
+### 9.94 2026-08-12 step100 构建事故根因与修正（重要）
+
+- 症状：step100 版构建后 `C:\yuanguard_hv.sys` 不包含任何 step 字符串
+  （`bm step`/`freeze-site` 等全无），驱动加载走的是默认路径，无法测试。
+- 根因：`yghv_baremetal_step_test` 开头 `if (step > 99) return
+  STATUS_NOT_IMPLEMENTED;`。step100 是编译期常量，clang `/O2` 把该分支
+  常量折叠为恒真，整个函数体（含全部 step 字符串与逻辑）被判不可达并
+  裁成只剩 `svm_core_get_vcpu(0)` 的空壳；DriverEntry 的 `bm done` 仍保留，
+  造成“调用点在、函数体无”的假象。v99 及以前能构建是因为 99 未超上限。
+- 修正：上限改为 `step > 100`；新发现链接期依赖 `KeQueryPerformanceCounter`
+  （HAL，当前仅链 ntoskrnl）与 `RtlStringCchPrintfA`（编译器引 UCRT），
+  已改为 `__rdtsc()` + `yghv_trace_u64` 逐行落盘，去除外部符号依赖。
+- 构建验证：/O2 下 step100 版 64,384 字节，`freeze-site`/`bm step`/
+  `resident alive`/`os resident delay enter`/`v100 seq` 字符串全部存在；
+  默认版（`YGHV_BAREMETAL_STEP=0`）恢复可构建。
+- 最终产物：step100 SHA256
+  `322C7286082A1A6BDDF80093472D2B684D4971CA2E4466C958D9BF5DDEA42D17`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v100_step100.sys`；默认版 SHA256
+  `C8D5AD6863173555245F000642E753D5116DDE520132474C3E7CFC090A30C4C8`。
+- 待办：把 step100 归档复制回 `C:\yuanguard_hv.sys`（当前 C 盘是默认版），
+  再 `sc start yuanguard` 实机测试。
+
+### 9.95 2026-08-12 step100 首次实机：复现冻结 + 日志增强
+
+- 首次实机加载 step100（SHA256 `322C7286...`）：日志完整出现
+  `bm step=0x64 → bm os resident freeze-site start → os resident delay
+  enter=1 → bm os resident freeze-site running → bm done`，随后整机冻结
+  （无 `resident alive`、无 `v100 freeze site`，18:18:30 重启）。
+- 判定：冻结发生在 guest 进入后极短窗口，core0 的监控线程（250ms 轮询 +
+  10 次 stall）来不及落盘；连 guest 延续体的 `os resident delay guest
+  block` 都没打到，说明冻结点在 trampoline 返回 guest 到首次
+  KeDelayExecutionThread 之间。
+- 日志增强（本版 E66A2AAD，已复制 C 盘）：
+  - VMEXIT 前 200 次退出逐条同步落盘（`v100 exit/rip/cr3/rsp/rf/cpl`），
+    冻结瞬间若已有 VMEXIT 即有现场；
+  - 监控线程每 250ms 落盘 `v100 pulse` 心跳，stall 阈值 10→4 次。
+- 待实机复测：重启加载后读 `C:\Windows\yghv_progress.log` 找
+  `v100 exit` 序列，定位冻结前最后一次退出类型与 RIP/CR3/RSP。
+
+### 9.96 2026-08-12 step100 实机蓝屏 0x139：首次拿到崩溃 dump（关键证据）
+
+- 实机加载增强版 step100（SHA256 `E66A2AAD...`）后蓝屏：
+  **0x139 KERNEL_SECURITY_CHECK_FAILURE，Arg1=4
+  （FAST_FAIL_INCORRECT_STACK）**，18:36:23，minidump
+  `C:\Windows\Minidump\081226-19625-01.dmp`，已归档
+  `D:\aaaaaavm\yghv_bsod_0x139_step100_20260812_1836.dmp`。
+- 崩溃线程：`yuanguard_hv` delay 常驻线程（System 进程，Win32 Start
+  Address 指向驱动），正在 `NtWriteFile`（guest 延续体里 `yghv_trace`
+  写进度日志）→ 文件锁等待 → `KeWaitForSingleObject` →
+  `KiSwapThread` → **`KiAbProcessContextSwitch` 触发 GP 异常** →
+  异常分发时线程栈指针 `ffffc685994f6810` 越过栈底
+  `ffffc68599521000` → 0x139。
+- 关键结论：崩溃发生在 **guest 模式内部、Windows 调度器上下文切换
+  路径**，且整个过程没有产生任何 VMEXIT（前 200 次 v100 落盘一条都
+  没有），所以 ring buffer 无法捕获；之前的“硬冻结”与本次蓝屏应为
+  同一机制（guest 内上下文切换 GP + 栈损坏），只是此前无 dump。
+- 推断：常驻 OS-as-guest 要成立，必须让 Windows 在 guest 模式下正常
+  完成上下文切换；当前 SVM 状态在此路径上会 GP。下一步待用户确认的
+  隔离实验：guest 延续体不再调用 `yghv_trace`（文件写是本次阻塞/切换
+  直接触发点），只留纯 `KeDelayExecutionThread` 阻塞，验证是否任何
+  guest 内调度都会崩，还是仅阻塞文件 I/O 触发。
+
+### 9.97 2026-08-12 隔离实验两轮蓝屏 + v100c 修复
+
+- v100b（guest 延续体 quiet，无文件写；哈希 `C41D8821...`）实机仍蓝屏
+  **0x139/Arg1=4**（18:46:56，minidump `081226-12390-01.dmp`），崩溃栈
+  与 v100 完全一致：`yuanguard_hv+0x132d`（`yghv_trace` 的 `ZwWriteFile`）
+  → `NtWriteFile` → 文件锁等待 → `KiSwapThread` →
+  `KiAbProcessContextSwitch` GP → 栈越界。
+- 关键：guest 已 quiet 但仍在写文件，来源是 **v100 逐条落盘在
+  `svm_dispatch_exit` VMEXIT 路径内同步 `yghv_trace`**，与 alive/monitor
+  线程抢同一日志文件锁；写阻塞后 Windows 在 hypervisor 分发中途上下文
+  切换，栈损坏。结论：VMRUN 循环内任何阻塞 I/O + 上下文切换都会崩。
+- v100c 修复：删除 `yghv_v100_record` 中前 200 次逐条同步落盘，仅保留
+  内存 ring；guest 延续体保持 quiet；磁盘写入只剩 core0 monitor/alive
+  线程。SHA256 `E4BA6C78F7E0127FD89446C7A9BFD8DA7F50D0556213B1E56519F05FD9D092C9`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v100c_step100_nofileio.sys`，已复制
+  `C:\yuanguard_hv.sys`。
+- 待测：`sc start yuanguard` 验证无任何阻塞 I/O 时纯 guest 阻塞是否仍崩。
+
+### 9.98 2026-08-12 v100c 实机：纯 guest 阻塞仍硬冻结（隔离结论）
+
+- v100c（无 guest 文件写、无 VMEXIT 路径文件写；SHA256 `E4BA6C78...`）
+  实机：日志推进到 `bm os resident freeze-site running → bm done` 后
+  整机硬冻结，18:53:34 重启；无新 minidump、无 `resident alive`、
+  monitor 的 `v100 pulse` 也一条未写（250ms 内即冻结）。
+- 三轮变量分离结论：
+  - v100（guest 内 `yghv_trace` 文件写）：0x139 BSOD，栈在
+    KiAbProcessContextSwitch GP；
+  - v100b（guest quiet，但 VMEXIT 路径 v100 逐条同步写盘）：仍 0x139
+    BSOD，同栈；
+  - v100c（guest quiet + VMEXIT 路径零文件写）：硬冻结、无 dump。
+- 结论：冻结/崩溃的根因是 **guest 模式下 Windows 调度器上下文切换本身**
+  （`KiSwapThread`/`KiAbProcessContextSwitch`），与文件 I/O 无关；移除
+  I/O 后从可诊断的 0x139 变为不可诊断的整机硬冻结。与 9.84 阶段结论
+  （平台级限制）一致，当前代码/平台下透明 OS-as-guest 常驻不可行。
+
+### 9.99 2026-08-12 v101 #GP/#DF 拦截实验：未捕获，仍硬冻结
+
+- v101 实现：delay 线程 VMCB 打开 `exception_intercepts` 的
+  #DF(8)/#NP(11)/#SS(12)/#GP(13)，`svm_dispatch_exit` 新增 0x48/0x4B/
+  0x4C/0x4D 分支捕获现场并停止 guest，`yghv_os_guest_host_done` 落盘
+  `v101 gp captured`。SHA256 `BE30E65FE2A0C51853C214EB121366C4B83738689D9BD2009497C899F5F159E2`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v101_step101_gpcap.sys`。
+- 实机：日志到 `bm step=0x65 → bm os resident freeze-site start →
+  os resident delay enter=1 → bm os resident freeze-site running →
+  bm done` 后整机无响应（19:07:56 重启）；**无 `v101 gp captured`、
+  无 alive、无新 minidump**。
+- 结论：冻结不经过可拦截的 #DF/#NP/#SS/#GP 异常向量，且连 core0 的
+  monitor/alive 线程都无法执行，属整机级硬停（疑似平台/SVM 行为，
+  非普通 guest 异常）。常驻 OS-as-guest 继续硬啃成本极高、无收敛证据，
+  建议停线并恢复稳定默认版。
+
+### 9.100 2026-08-13 v102 全异常 + HLT 拦截（决定性诊断）
+
+- v102 实现：delay 线程 VMCB `exception_intercepts = 0xFFFFFFFF`，
+  `general1_intercepts |= HLT`；`svm_dispatch_exit` 顶部对任何
+  `0x40-0x5F` 异常退出与 `0x78` HLT 捕获完整现场并停止 guest；
+  `yghv_os_guest_host_done` 落盘 `v102 fault captured`。SHA256
+  `D693577F8EBF02364FAC678B2D7C9F21D0294B4EA5282A8344612078749BE4F2`，
+  归档 `D:\aaaaaavm\yuanguard_hv_v102_step102_catchall.sys`，已复制
+  `C:\yuanguard_hv.sys`。
+- 判据：若出现 `v102 fault captured` → 找到可拦截异常向量（含 #MC/HLT）；
+  若仍整机硬停且无任何捕获 → 确认为平台级停机，常驻线在 Ryzen 5 5500
+  停线，转非驻留保护路线或换平台验证。
+
+### 9.101 2026-08-13 v102 实机阴性：平台级停机确认，常驻线停线
+
+- v102（全 32 异常向量 + HLT 拦截；SHA256 `D693577F...`）实机：日志
+  `bm step=0x66 → bm os resident freeze-site start → os resident delay
+  enter=1 → bm os resident freeze-site running → bm done` 后整机硬停；
+  无 `v102 fault captured`、无 alive、无 v100 pulse、无新 minidump
+  （14:30:59 重启）。
+- 决定性结论：guest 模式 Windows 调度器上下文切换导致的整机停止
+  **不经过任何可拦截的异常向量，也不执行可拦截的 HLT**。结合此前
+  v100c/v101 与“文件 I/O 触发 0x139”的实验，判定为平台级停机
+  （最可能是中断/锁交互在 SVM guest 态的死锁或硬件级 halt，符合
+  AMD 56683/errata 1363 方向）。
+- 常驻 OS-as-guest 在 Ryzen 5 5500 当前方案下停线：step20 自旋 +
+  宿主 ISR 是唯一 PASS 形态（guest 永不阻塞），无法支撑真实 Windows
+  调度器。剩余路径为完整 APIC/TSC 虚拟化（AVIC 分支此前已失败）或
+  换平台验证，成本高且无本机收敛证据。
+- 收尾：建议把 `C:\yuanguard_hv.sys` 换回稳定默认版（SHA256
+  `C8D5AD6863173555245F000642E753D5116DDE520132474C3E7CFC090A30C4C8`，
+  `D:\aaaaaavm\yuanguard_hv_v100_step100.sys` 非此；默认版需重新构建或
+  用此前 v54 归档），恢复非驻留保护路线可用状态。
+
+### 9.102 2026-08-13 仓库整理、文档校对与提交
+
+- 用户要求完整整理仓库、校对文档、同步内容、提交代码、清理。
+- 校验结果：`git status` 11 个修改文件 + 2 个未跟踪
+  （`build.bat.bak`、`docs/superpowers/plans/2026-08-12-os-as-guest-allcore-resident.md`）；
+  handoff 共 75 节、无 NUL 字节，9.93-9.101 完整连续；`build.bat` 与
+  原始版无内容差异（仅换行，git 不显示 diff）；`main.c` 默认
+  `YGHV_BAREMETAL_STEP 0`，无临时硬编码。
+- 清理：临时调试产物（`main_*.obj`/`main_*.i`、`build.bat.bak`）已移出
+  仓库到 `D:\aaaaaavm\yghv_cleanup_20260813\`（文件删除被沙箱策略禁止，
+  采用移出方式；均为 git 忽略文件，不影响仓库）。
+- 同步：`docs/TASKS.md` 增补 2026-08-13 阶段结论；本节记录整理动作。
+- 提交：将 v52-v102 常驻实验全部代码与文档（step100-102 诊断、
+  0x139 两次 dump 结论、v102 全异常+HLT 拦截阴性、平台级停机停线）
+  作为一次提交合入 main。
+- 默认版重新构建验证通过：SHA256
+  `EB4CA2A5B48EFE39D4FC2EA86DD9A841ED22860CBB1D0B77D1C734462786EF12`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_20260813.sys`（含 v100-102
+  代码、默认 step=0 路径），可用于恢复 C 盘安全版。
+- 遗留：`C:\yuanguard_hv.sys` 当前仍为 v102（冻结版），恢复默认版需
+  用户确认后另行构建替换；`D:\aaaaaavm\` 保留全部归档与 dump。

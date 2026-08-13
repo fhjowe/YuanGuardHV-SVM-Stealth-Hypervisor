@@ -100,6 +100,22 @@ int npt_split_2mb_to_4kb(npt_mgr_t*m,uint64_t g){
     return STATUS_SUCCESS;
 }
 
+int npt_map_page(npt_mgr_t*m,uint64_t g,uint64_t spa,uint64_t flags){
+    npt_entry_t *pd, *pt;
+    uint32_t p4=(uint32_t)NPT_PML4_INDEX(g),p2=(uint32_t)NPT_PDPT_INDEX(g),p1=(uint32_t)NPT_PD_INDEX(g),p0=(uint32_t)NPT_PT_INDEX(g);
+    int st;
+
+    if(!m||!m->pml4_va)return STATUS_INVALID_PARAMETER;
+    st=npt_split_2mb_to_4kb(m,g);
+    if(!NT_SUCCESS(st))return st;
+    pd=npt_get_pd(m,p4,p2);
+    if(!pd||!pd[p1].present)return STATUS_NOT_FOUND;
+    pt=npt_get_pt(m,p4,p2,p1);
+    if(!pt)return STATUS_NOT_FOUND;
+    pt[p0].all=(spa&~0xFFFULL)|(flags&0xFFFULL)|(flags&(1ULL<<63));
+    return STATUS_SUCCESS;
+}
+
 int npt_set_page_perm(npt_mgr_t*m,uint64_t g,uint64_t f){
     npt_entry_t *pd, *pt;
     uint32_t p4=(uint32_t)NPT_PML4_INDEX(g),p2=(uint32_t)NPT_PDPT_INDEX(g),p1=(uint32_t)NPT_PD_INDEX(g),p0=(uint32_t)NPT_PT_INDEX(g);

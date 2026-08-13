@@ -41,6 +41,22 @@
 #define SVM_VMCB_STATE_RSP_OFFSET        0x5D8
 #define SVM_VMCB_STATE_RAX_OFFSET        0x5F8
 
+/* v100: freeze-site ring buffer. 64 entries keeps the hot-path record tiny
+   while giving the monitor a meaningful last-64-exits snapshot. */
+#define YGHV_V100_RING_ENTRIES 64
+
+typedef struct {
+    volatile uint64_t seq;
+    uint64_t exitcode;
+    uint64_t exitinfo1;
+    uint64_t exitinfo2;
+    uint64_t rip;
+    uint64_t cr3;
+    uint64_t rsp;
+    uint64_t rflags;
+    uint64_t cpl;
+} svm_v100_ring_entry_t;
+
 /* Guest register context (for saving/restoring guest GPRs) */
 typedef struct {
     uint64_t r15, r14, r13, r12, r11, r10, r9, r8;
@@ -114,6 +130,32 @@ typedef struct {
 
     /* Context proof (CRx + EFER + XMM verification frame) */
     svm_context_proof_frame_t context_proof;
+
+    /* AVIC state (step25: vAPIC backing + APIC ID tables) */
+    void *avic_backing_page;
+    uint64_t avic_backing_pa;
+    void *avic_logical_id_table;
+    uint64_t avic_logical_id_pa;
+    void *avic_physical_id_table;
+    uint64_t avic_physical_id_pa;
+    void *avic_host_apic_va;
+    void *avic_host_idt;
+    uint64_t avic_old_idt_base;
+    uint16_t avic_old_idt_limit;
+    volatile ULONG avic_apic_id;
+    KTIMER avic_timer;
+    KDPC avic_timer_dpc;
+    BOOLEAN avic_timer_initialized;
+    volatile LONG avic_timer_armed;
+    volatile ULONG avic_timer_vector;
+    volatile ULONG avic_timer_period_ms;
+    volatile ULONG64 avic_noaccel_exits;
+    volatile ULONG64 avic_incomplete_ipi_exits;
+    volatile ULONG64 avic_irr_injections;
+
+    /* v100: exit-site ring buffer (monitor reads it when the core stalls). */
+    volatile uint64_t v100_seq;
+    svm_v100_ring_entry_t v100_ring[YGHV_V100_RING_ENTRIES];
 
     /* Resident state */
     volatile int32_t resident_state;
@@ -193,6 +235,10 @@ int  svm_vmrun_context_proof(svm_vcpu_t *vcpu);
 void svm_vmrun_trampoline_poisoned(svm_vcpu_t *vcpu);
 int  svm_resident_enter(svm_vcpu_t *vcpu);
 int  svm_resident_vmmcall_stop(void);
+int  svm_avic_record_pending_intr(svm_vcpu_t *vcpu);
+int  svm_avic_timer_init(svm_vcpu_t *vcpu);
+int  svm_avic_start_timer(svm_vcpu_t *vcpu, uint32_t vector, uint32_t period_ms);
+int  svm_avic_update_timer(svm_vcpu_t *vcpu, uint32_t offset);
 
 /* Guest test labels (for determining guest code region bounds) */
 extern const uint8_t svm_trampoline_test_guest[];

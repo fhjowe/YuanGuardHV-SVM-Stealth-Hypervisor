@@ -24,6 +24,7 @@ typedef signed int         int32_t;
 #define MSR_IA32_PAT      0x277
 #define MSR_VM_CR         0xC0010114
 #define MSR_VM_HSAVE      0xC0010117
+#define MSR_AMD64_SVM_AVIC_DOORBELL 0xC001011B
 
 /* EFER bits */
 #define EFER_SVME          (1ULL << 12)
@@ -42,6 +43,8 @@ typedef signed int         int32_t;
 /* SVM CPUID feature bits (CPUID 0x8000000A.EDX) */
 #define CPUID_NPT_FEATURE_NPT  (1 << 0)
 #define CPUID_NPT_FEATURE_FLUSHBYASID (1 << 6)
+#define CPUID_NPT_FEATURE_AVIC  (1 << 13)
+#define CPUID_NPT_FEATURE_X2AVIC (1 << 18)
 
 /* VMCB control area intercept bit offsets */
 #define SVM_INTERCEPT_INTR       0
@@ -165,6 +168,10 @@ typedef signed int         int32_t;
 #define SVM_EXIT_CR15_WRITE       0x1F
 #define SVM_EXIT_EXCEPTION_BASE   0x40
 #define SVM_EXIT_EXCEPTION_DB     (SVM_EXIT_EXCEPTION_BASE + 1)  /* #DB, vector 1 */
+#define SVM_EXIT_EXCEPTION_DF     (SVM_EXIT_EXCEPTION_BASE + 8)  /* #DF, vector 8 */
+#define SVM_EXIT_EXCEPTION_NP     (SVM_EXIT_EXCEPTION_BASE + 11) /* #NP, vector 11 */
+#define SVM_EXIT_EXCEPTION_SS     (SVM_EXIT_EXCEPTION_BASE + 12) /* #SS, vector 12 */
+#define SVM_EXIT_EXCEPTION_GP     (SVM_EXIT_EXCEPTION_BASE + 13) /* #GP, vector 13 */
 #define SVM_EXIT_EXCEPTION_UD     0x46
 #define SVM_EXIT_INTR             0x60
 #define SVM_EXIT_NMI              0x61
@@ -213,6 +220,36 @@ typedef signed int         int32_t;
 #define SVM_EXIT_MWAIT_COND       0x8C
 #define SVM_EXIT_XSETBV           0x8D
 #define SVM_EXIT_NPF              0x400
+#define SVM_EXIT_AVIC_INCOMPLETE_IPI 0x401
+#define SVM_EXIT_AVIC_UNACCELERATED_ACCESS 0x402
+
+/* AVIC VMCB / table bits */
+#define APIC_DEFAULT_PHYS_BASE        0xFEE00000ULL
+#define SVM_INT_CTL_AVIC_ENABLE       (1ULL << 31)
+#define SVM_INT_CTL_X2APIC_MODE       (1ULL << 30)
+#define AVIC_PHYSICAL_ID_ENTRY_VALID          (1ULL << 63)
+#define AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING     (1ULL << 62)
+#define AVIC_PHYSICAL_ID_ENTRY_BACKING_PAGE_MASK 0x000FFFFFFFFFF000ULL
+#define AVIC_PHYSICAL_ID_ENTRY_HOST_ID_MASK   0xFFULL
+#define AVIC_PHYSICAL_MAX_INDEX_MASK          0xFFULL
+#define AVIC_LOGICAL_ID_ENTRY_VALID           (1U << 31)
+#define AVIC_LOGICAL_ID_ENTRY_GUEST_ID_MASK   0xFFU
+#define AVIC_UNACCEL_ACCESS_WRITE_MASK        (1ULL << 32)
+#define AVIC_UNACCEL_ACCESS_OFFSET_MASK       0xFF0ULL
+
+/* xAPIC register offsets (used by AVIC forwarding) */
+#define APIC_OFFSET_TPR    0x80
+#define APIC_OFFSET_EOI    0xB0
+#define APIC_OFFSET_LDR    0xD0
+#define APIC_OFFSET_DFR    0xE0
+#define APIC_OFFSET_SPIV   0xF0
+#define APIC_OFFSET_ESR    0x280
+#define APIC_OFFSET_ICRL   0x300
+#define APIC_OFFSET_ICRH   0x310
+#define APIC_OFFSET_LVTT   0x320
+#define APIC_OFFSET_TMICT  0x380
+#define APIC_OFFSET_TCC    0x390
+#define APIC_OFFSET_TDCR   0x3E0
 
 /* Legacy VMEXIT_* aliases for compatibility with existing dispatch */
 #define VMEXIT_CPUID              SVM_EXIT_CPUID

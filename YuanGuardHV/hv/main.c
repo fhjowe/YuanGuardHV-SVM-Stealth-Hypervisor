@@ -35,7 +35,50 @@ volatile LONG g_os_guest_test_active = 0;
 volatile LONG g_os_guest_counter = 0;
 volatile ULONG64 g_os_guest_cpuid_acc = 0;
 volatile BOOLEAN g_os_resident_mode = FALSE;
+volatile BOOLEAN g_os_guest_intr_intercept = FALSE;
+volatile BOOLEAN g_os_guest_host_isr = FALSE;
+volatile BOOLEAN g_os_guest_inject_intr = FALSE;
+volatile BOOLEAN g_os_guest_avic_irr_inject = FALSE;
+volatile BOOLEAN g_os_guest_avic_eoi_only = FALSE;
+volatile BOOLEAN g_os_guest_avic_timer_emu = FALSE;
+void *g_avic_eoi_apic_va = NULL;
+typedef struct __attribute__((packed)) {
+    uint16_t limit;
+    uint64_t base;
+} yghv_idtr_desc_t;
+yghv_idtr_desc_t g_avic_eoi_idtr;
+yghv_idtr_desc_t g_avic_old_idtr;
+volatile BOOLEAN g_os_guest_delay_quiet = FALSE;
+volatile BOOLEAN g_v96_apic_tpr_stress = FALSE;
+void *g_v96_apic_tpr_va = NULL;
+volatile BOOLEAN g_v97_hlt_intercept = FALSE;
+volatile BOOLEAN g_v98_apic_shadow = FALSE;
+void *g_v98_apic_shadow_va = NULL;
+uint64_t g_v98_apic_shadow_pa = 0;
+void *g_v98_real_apic_va = NULL;
+volatile ULONG g_v98_last_tpr = 0;
+volatile ULONG g_v98_last_icrl = 0;
+volatile ULONG g_v98_last_icrh = 0;
+volatile ULONG g_v98_last_lvtt = 0;
+volatile ULONG g_v98_last_tmict = 0;
+volatile ULONG g_v98_last_tdcr = 0;
+static volatile LONG g_v99_allcore_ready = 0;
+static volatile LONG g_v99_allcore_go = 0;
+static volatile LONG g_v99_allcore_abort = 0;
+static volatile LONG g_v99_allcore_online = 0;
+volatile BOOLEAN g_os_resident_log_active = FALSE;
 volatile ULONG64 g_os_resident_exits = 0;
+volatile BOOLEAN g_v100_monitor_active = FALSE;
+volatile BOOLEAN g_v100_guest_entered = FALSE;
+volatile BOOLEAN g_v101_gp_intercept = FALSE;
+volatile BOOLEAN g_v101_gp_seen = FALSE;
+volatile uint64_t g_v101_gp_exitcode = 0;
+volatile uint64_t g_v101_gp_err = 0;
+volatile uint64_t g_v101_gp_rip = 0;
+volatile uint64_t g_v101_gp_rsp = 0;
+volatile uint64_t g_v101_gp_cr3 = 0;
+volatile uint64_t g_v101_gp_gs_base = 0;
+volatile BOOLEAN g_v102_catchall = FALSE;
 static KEVENT g_os_guest_done_events[SVM_MAX_CORES];
 static KEVENT g_os_resident_stop_event;
 
@@ -57,6 +100,7 @@ extern const uint8_t svm_trampoline_test_cpuid_guest[];
 extern const uint8_t svm_trampoline_test_cpuid_guest_end[];
 extern const uint8_t svm_trampoline_test_resident_guest[];
 extern const uint8_t svm_trampoline_test_resident_guest_end[];
+extern const uint8_t yghv_avic_eoi_isr[];
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD DriverUnload;
@@ -651,6 +695,17 @@ __declspec(noinline) __declspec(noreturn)
 void yghv_os_guest_host_done(svm_vcpu_t *vcpu) {
     uint32_t core = vcpu ? vcpu->resident_index : 0;
     yghv_trace_u64("os guest host done", core);
+    if (g_v101_gp_seen) {
+        yghv_trace(g_v102_catchall ? "v102 fault captured" : "v101 gp captured");
+        yghv_trace_u64("v101 gp exitcode", g_v101_gp_exitcode);
+        yghv_trace_u64("v101 gp err", g_v101_gp_err);
+        yghv_trace_u64("v101 gp rip", g_v101_gp_rip);
+        yghv_trace_u64("v101 gp rsp", g_v101_gp_rsp);
+        yghv_trace_u64("v101 gp cr3", g_v101_gp_cr3);
+        yghv_trace_u64("v101 gp gsbase", g_v101_gp_gs_base);
+        yghv_trace_u64("v101 gp cs", vcpu ? vcpu->vmcb->state.cs_selector : 0);
+        yghv_trace_u64("v101 gp ss", vcpu ? vcpu->vmcb->state.ss_selector : 0);
+    }
     if (core < SVM_MAX_CORES)
         KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
     PsTerminateSystemThread(STATUS_SUCCESS);
@@ -675,7 +730,8 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     v->vmcb->state.rsp = 0;
     v->vmcb->control.general1_intercepts =
         INTERCEPT_CPUID | INTERCEPT_RDTSC |
-        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN) |
+        INTR_GEN1(SVM_INTERCEPT_MSR_PROT);
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     v->vmcb->control.exception_intercepts = 0;
@@ -709,7 +765,8 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
     v->vmcb->state.rsp = 0;
     v->vmcb->control.general1_intercepts =
         INTERCEPT_CPUID | INTERCEPT_RDTSC |
-        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN) |
+        INTR_GEN1(SVM_INTERCEPT_MSR_PROT);
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     v->vmcb->control.exception_intercepts = 0;
@@ -747,14 +804,35 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     v->vmcb->state.rsp = 0;
     v->vmcb->control.general1_intercepts =
         INTERCEPT_CPUID | INTERCEPT_RDTSC |
-        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN) |
+        INTR_GEN1(SVM_INTERCEPT_MSR_PROT);
+    if (g_os_guest_intr_intercept) {
+        v->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI);
+    }
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (g_v97_hlt_intercept) {
+        v->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_HLT);
+        v->vmcb->control.general2_intercepts |=
+            INTR_GEN2(SVM_INTERCEPT_MWAIT) |
+            INTR_GEN2(SVM_INTERCEPT_MWAIT_COND);
+    }
     v->vmcb->control.exception_intercepts = 0;
     v->vmcb->control.tlb_control = 0;
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    if (g_v96_apic_tpr_stress && !g_v96_apic_tpr_va) {
+        PHYSICAL_ADDRESS apic_pa;
+        apic_pa.QuadPart = 0xFEE00000ULL;
+        g_v96_apic_tpr_va = MmMapIoSpace(apic_pa, HV_PAGE_SIZE, MmNonCached);
+        if (!g_v96_apic_tpr_va)
+            LOG_ERROR("v96: map APIC TPR failed");
+        else
+            yghv_trace("v96 tpr stress armed");
+    }
     g_os_resident_mode = TRUE;
     yghv_trace_u64("os resident enter", core);
     if (core < SVM_MAX_CORES)
@@ -808,6 +886,100 @@ static VOID yghv_resident_watchdog_thread(PVOID ctx) {
     }
 }
 
+static void yghv_v100_dump(svm_vcpu_t *vcpu) {
+    uint64_t seq;
+    uint64_t start;
+    uint64_t n;
+    ULONG i;
+
+    if (!vcpu)
+        return;
+    seq = vcpu->v100_seq;
+    if (seq == 0)
+        return;
+    yghv_trace("v100 freeze site");
+    yghv_trace_u64("v100 seq", seq);
+    yghv_trace_u64("v100 exits", vcpu->resident_exits);
+    yghv_trace_u64("v100 intr exits", vcpu->resident_interrupt_exits);
+    yghv_trace_u64("v100 msr exits", vcpu->resident_msr_exits);
+    yghv_trace_u64("v100 cr exits", vcpu->resident_cr_exits);
+    yghv_trace_u64("v100 last exitcode",
+        vcpu->vmcb->control.exitcode);
+    yghv_trace_u64("v100 last rip", vcpu->vmcb->state.rip);
+    yghv_trace_u64("v100 last cr3", vcpu->vmcb->state.cr3);
+    yghv_trace_u64("v100 last rsp", vcpu->vmcb->state.rsp);
+    yghv_trace_u64("v100 last rflags", vcpu->vmcb->state.rflags);
+    yghv_trace_u64("v100 last cpl", vcpu->vmcb->state.cpl);
+
+    start = (seq >= YGHV_V100_RING_ENTRIES)
+                ? seq - (YGHV_V100_RING_ENTRIES - 1)
+                : 0;
+    n = seq - start + 1;
+    for (i = 0; i < n; i++) {
+        uint64_t s = start + i;
+        svm_v100_ring_entry_t *e = &vcpu->v100_ring[s % YGHV_V100_RING_ENTRIES];
+        if (e->seq != s)
+            continue;
+        yghv_trace_u64("v100 seq", s);
+        yghv_trace_u64("v100 exit", e->exitcode);
+        yghv_trace_u64("v100 i1", e->exitinfo1);
+        yghv_trace_u64("v100 i2", e->exitinfo2);
+        yghv_trace_u64("v100 rip", e->rip);
+        yghv_trace_u64("v100 cr3", e->cr3);
+        yghv_trace_u64("v100 rsp", e->rsp);
+        yghv_trace_u64("v100 rf", e->rflags);
+        yghv_trace_u64("v100 cpl", e->cpl);
+    }
+}
+
+static VOID yghv_v100_monitor_thread(PVOID ctx) {
+    LARGE_INTEGER delay;
+    ULONG64 last_exits = 0;
+    uint64_t last_seq = 0;
+    ULONG stall = 0;
+    BOOLEAN dumped = FALSE;
+    (void)ctx;
+
+    KeSetSystemAffinityThread((KAFFINITY)1);
+    delay.QuadPart = -250LL * 10000LL;
+    for (;;) {
+        svm_vcpu_t *v;
+
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        if (!g_v100_monitor_active)
+            continue;
+        if (!g_v100_guest_entered)
+            continue;
+        v = svm_core_get_vcpu(1);
+        if (!v) {
+            if (++stall >= 4) {
+                yghv_trace("v100 vcpu1 unavailable");
+                break;
+            }
+            continue;
+        }
+        yghv_trace_u64("v100 pulse exits", v->resident_exits);
+        yghv_trace_u64("v100 pulse seq", v->v100_seq);
+        yghv_trace_u64("v100 pulse last exit", v->vmcb->control.exitcode);
+        yghv_trace_u64("v100 pulse rip", v->vmcb->state.rip);
+        yghv_trace_u64("v100 pulse cr3", v->vmcb->state.cr3);
+        yghv_trace_u64("v100 pulse rsp", v->vmcb->state.rsp);
+        if (v->resident_exits == last_exits && v->v100_seq == last_seq) {
+            if (++stall >= 4 && !dumped) {
+                yghv_trace_u64("v100 stall exits", v->resident_exits);
+                yghv_trace_u64("v100 stall ticks",
+                               (uint64_t)__rdtsc());
+                yghv_v100_dump(v);
+                dumped = TRUE;
+            }
+        } else {
+            last_exits = v->resident_exits;
+            last_seq = v->v100_seq;
+            stall = 0;
+        }
+    }
+}
+
 static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     uint32_t core = (uint32_t)(uintptr_t)ctx;
     svm_vcpu_t *v;
@@ -825,9 +997,21 @@ static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     v->vmcb->state.rsp = 0;
     v->vmcb->control.general1_intercepts =
         INTERCEPT_CPUID | INTERCEPT_RDTSC |
-        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN) |
+        INTR_GEN1(SVM_INTERCEPT_MSR_PROT);
+    if (g_os_guest_intr_intercept) {
+        v->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI);
+    }
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (g_v97_hlt_intercept) {
+        v->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_HLT);
+        v->vmcb->control.general2_intercepts |=
+            INTR_GEN2(SVM_INTERCEPT_MWAIT) |
+            INTR_GEN2(SVM_INTERCEPT_MWAIT_COND);
+    }
     v->vmcb->control.exception_intercepts = 0;
     v->vmcb->control.tlb_control = 0;
     v->vmcb->control.vmcb_clean_bits = 0;
@@ -844,7 +1028,383 @@ static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
         __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
                                  : "a"(1) : "memory");
         (void)__rdtsc();
+        if (g_v96_apic_tpr_stress && g_v96_apic_tpr_va) {
+            *(volatile ULONG *)((ULONG_PTR)g_v96_apic_tpr_va + APIC_OFFSET_TPR) = 0;
+        }
     }
+}
+
+static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
+    uint32_t core = (uint32_t)(uintptr_t)ctx;
+    svm_vcpu_t *v;
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    v = svm_core_get_vcpu(core);
+    if (!v || g_vcpu_count <= core) {
+        InterlockedExchange(&g_v99_allcore_abort, 1);
+        if (core < SVM_MAX_CORES)
+            KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
+    }
+    svm_prepare_vcpu(v, (uint64_t)svm_os_seamless_cont);
+    v->vmcb->state.rip = (uint64_t)svm_os_seamless_cont;
+    v->vmcb->state.rsp = 0;
+    v->vmcb->control.general1_intercepts =
+        INTERCEPT_CPUID | INTERCEPT_RDTSC |
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN) |
+        INTR_GEN1(SVM_INTERCEPT_MSR_PROT) |
+        INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI);
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    v->vmcb->control.exception_intercepts = 0;
+    v->vmcb->control.tlb_control = 0;
+    v->vmcb->control.vmcb_clean_bits = 0;
+    v->resident_index = core;
+    svm_core_set_npt(core, g_npt.pml4_pa);
+    g_os_resident_mode = TRUE;
+
+    InterlockedIncrement(&g_v99_allcore_ready);
+    while (!g_v99_allcore_go && !g_v99_allcore_abort) {
+        __asm__ volatile("pause");
+    }
+    if (g_v99_allcore_abort) {
+        yghv_trace_u64("allcore abort", core);
+        if (core < SVM_MAX_CORES)
+            KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+        PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
+    }
+
+    yghv_trace_u64("allcore enter", core);
+    if (core < SVM_MAX_CORES)
+        KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+    svm_trampoline_os_enter(v, 1);
+    /* Guest continuation: block so the scheduler switches threads on this core. */
+    KeWaitForSingleObject(&g_os_resident_stop_event, Executive,
+                          KernelMode, FALSE, NULL);
+    for (;;) {
+        __asm__ volatile("pause");
+    }
+}
+
+static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
+    uint32_t core = (uint32_t)(uintptr_t)ctx;
+    svm_vcpu_t *v;
+    uint32_t a, b, c, d;
+    LARGE_INTEGER delay;
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    v = svm_core_get_vcpu(core);
+    if (!v || g_vcpu_count <= core) {
+        if (core < SVM_MAX_CORES)
+            KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
+    }
+    svm_prepare_vcpu(v, (uint64_t)svm_os_seamless_cont);
+    v->vmcb->state.rip = (uint64_t)svm_os_seamless_cont;
+    v->vmcb->state.rsp = 0;
+    v->vmcb->control.general1_intercepts =
+        INTERCEPT_CPUID | INTERCEPT_RDTSC |
+        INTR_GEN1(SVM_INTERCEPT_SHUTDOWN) |
+        INTR_GEN1(SVM_INTERCEPT_MSR_PROT);
+    if (g_os_guest_intr_intercept) {
+        v->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI);
+    }
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    if (g_v97_hlt_intercept) {
+        v->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_HLT);
+        v->vmcb->control.general2_intercepts |=
+            INTR_GEN2(SVM_INTERCEPT_MWAIT) |
+            INTR_GEN2(SVM_INTERCEPT_MWAIT_COND);
+    }
+    v->vmcb->control.exception_intercepts = 0;
+    if (g_v101_gp_intercept) {
+        /* Turn the context-switch fault into a VMEXIT so we can capture the
+           site before Windows exception dispatch destroys the stack. */
+        v->vmcb->control.exception_intercepts =
+            (1ULL << 8) | (1ULL << 11) | (1ULL << 12) | (1ULL << 13);
+    }
+    if (g_v102_catchall) {
+        /* v102: catch every guest fault vector plus HLT. If the machine
+           still stops without any of these, it is a platform-level halt. */
+        v->vmcb->control.exception_intercepts = 0xFFFFFFFFULL;
+        v->vmcb->control.general1_intercepts |=
+            INTR_GEN1(SVM_INTERCEPT_HLT);
+    }
+    v->vmcb->control.tlb_control = 0;
+    v->vmcb->control.vmcb_clean_bits = 0;
+    v->resident_index = core;
+    svm_core_set_npt(core, g_npt.pml4_pa);
+    if (g_v98_apic_shadow && !g_v98_apic_shadow_va) {
+        PHYSICAL_ADDRESS apic_pa;
+        apic_pa.QuadPart = 0xFEE00000ULL;
+        g_v98_apic_shadow_va = MmAllocateContiguousMemory(
+            HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+        if (!g_v98_apic_shadow_va) {
+            LOG_ERROR("v98: shadow page alloc failed");
+        } else {
+            RtlZeroMemory(g_v98_apic_shadow_va, HV_PAGE_SIZE);
+            g_v98_apic_shadow_pa = MmGetPhysicalAddress(g_v98_apic_shadow_va).QuadPart;
+            g_v98_real_apic_va = MmMapIoSpace(apic_pa, HV_PAGE_SIZE, MmNonCached);
+            if (!g_v98_real_apic_va) {
+                LOG_ERROR("v98: map real APIC failed");
+            } else {
+                RtlCopyMemory(g_v98_apic_shadow_va, g_v98_real_apic_va, HV_PAGE_SIZE);
+                g_v98_last_tpr = READ_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TPR));
+                g_v98_last_icrl = READ_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRL));
+                g_v98_last_icrh = READ_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRH));
+                g_v98_last_lvtt = READ_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_LVTT));
+                g_v98_last_tmict = READ_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TMICT));
+                g_v98_last_tdcr = READ_REGISTER_ULONG(
+                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TDCR));
+                if (npt_map_page(&g_npt, 0xFEE00000ULL, g_v98_apic_shadow_pa,
+                                 NPT_4K_PAGE_FLAGS | (1ULL << 4) | (1ULL << 63)) != STATUS_SUCCESS)
+                    LOG_ERROR("v98: npt_map_page failed");
+                v->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;
+                yghv_trace_u64("v98 apic shadow armed", g_v98_apic_shadow_pa);
+            }
+        }
+    }
+    g_os_resident_mode = TRUE;
+    yghv_trace_u64("os resident delay enter", core);
+    g_v100_guest_entered = TRUE;
+    if (core < SVM_MAX_CORES)
+        KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+    svm_trampoline_os_enter(v, 1);
+    /* Guest continuation: block once so the scheduler performs at least one
+       real context switch inside guest mode, then return to the proven spin
+       shape with the host-ISR path. */
+    delay.QuadPart = -1LL * 10000000LL;
+    if (!g_os_guest_delay_quiet)
+        yghv_trace("os resident delay guest block");
+    KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    if (!g_os_guest_delay_quiet)
+        yghv_trace("os resident delay guest wake");
+    for (;;) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                                 : "a"(1) : "memory");
+        (void)__rdtsc();
+    }
+}
+
+static void *yghv_avic_alloc_page(uint64_t *pa_out) {
+    void *page;
+
+    page = MmAllocateContiguousMemory(HV_PAGE_SIZE,
+        (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (!page)
+        return NULL;
+    RtlZeroMemory(page, HV_PAGE_SIZE);
+    *pa_out = MmGetPhysicalAddress(page).QuadPart;
+    return page;
+}
+
+static void yghv_avic_cleanup(svm_vcpu_t *vcpu) {
+    if (!vcpu)
+        return;
+    if (vcpu->avic_host_apic_va) {
+        MmUnmapIoSpace(vcpu->avic_host_apic_va, HV_PAGE_SIZE);
+        vcpu->avic_host_apic_va = NULL;
+    }
+    if (vcpu->avic_physical_id_table) {
+        MmFreeContiguousMemory(vcpu->avic_physical_id_table);
+        vcpu->avic_physical_id_table = NULL;
+        vcpu->avic_physical_id_pa = 0;
+    }
+    if (vcpu->avic_logical_id_table) {
+        MmFreeContiguousMemory(vcpu->avic_logical_id_table);
+        vcpu->avic_logical_id_table = NULL;
+        vcpu->avic_logical_id_pa = 0;
+    }
+    if (vcpu->avic_backing_page) {
+        MmFreeContiguousMemory(vcpu->avic_backing_page);
+        vcpu->avic_backing_page = NULL;
+        vcpu->avic_backing_pa = 0;
+    }
+}
+
+static uint32_t yghv_avic_ffs_u32(uint32_t value) {
+    uint32_t i;
+    for (i = 0; i < 32; i++) {
+        if (value & (1U << i))
+            return i;
+    }
+    return 0;
+}
+
+static NTSTATUS yghv_avic_prepare(svm_vcpu_t *vcpu, uint32_t core) {
+    int cpu_info[4];
+    KAFFINITY old_affinity;
+    uint32_t guest_apic_id, host_apic_id;
+    uint32_t ldr, dfr, logical_id, table_index;
+    uint64_t entry;
+    PHYSICAL_ADDRESS apic_pa;
+    NTSTATUS st = STATUS_SUCCESS;
+
+    if (!vcpu)
+        return STATUS_INVALID_PARAMETER;
+
+    __cpuidex(cpu_info, CPUID_AMD_NPT, 0);
+    if (!(cpu_info[3] & CPUID_NPT_FEATURE_AVIC)) {
+        LOG_ERROR("step25: AVIC unsupported by CPU");
+        return STATUS_HV_FEATURE_UNAVAILABLE;
+    }
+
+    vcpu->avic_backing_page = yghv_avic_alloc_page(&vcpu->avic_backing_pa);
+    if (!vcpu->avic_backing_page) { st = STATUS_INSUFFICIENT_RESOURCES; goto fail; }
+    vcpu->avic_logical_id_table = yghv_avic_alloc_page(&vcpu->avic_logical_id_pa);
+    if (!vcpu->avic_logical_id_table) { st = STATUS_INSUFFICIENT_RESOURCES; goto fail; }
+    vcpu->avic_physical_id_table = yghv_avic_alloc_page(&vcpu->avic_physical_id_pa);
+    if (!vcpu->avic_physical_id_table) { st = STATUS_INSUFFICIENT_RESOURCES; goto fail; }
+
+    old_affinity = KeSetSystemAffinityThreadEx((KAFFINITY)(1ULL << core));
+    __cpuidex(cpu_info, 1, 0);
+    guest_apic_id = ((uint32_t)cpu_info[1] >> 24) & 0xFF;
+    KeSetSystemAffinityThread(old_affinity);
+    if (guest_apic_id == 0xFF) {
+        LOG_ERROR("step25: guest APIC ID 0xFF reserved");
+        st = STATUS_INVALID_PARAMETER;
+        goto fail;
+    }
+    host_apic_id = guest_apic_id;
+    vcpu->avic_apic_id = host_apic_id;
+
+    apic_pa.QuadPart = APIC_DEFAULT_PHYS_BASE;
+    vcpu->avic_host_apic_va = MmMapIoSpace(apic_pa, HV_PAGE_SIZE, MmNonCached);
+    if (!vcpu->avic_host_apic_va) {
+        LOG_ERROR("step25: map host APIC failed");
+        st = STATUS_INSUFFICIENT_RESOURCES;
+        goto fail;
+    }
+    RtlCopyMemory(vcpu->avic_backing_page, vcpu->avic_host_apic_va, HV_PAGE_SIZE);
+
+    ldr = READ_REGISTER_ULONG((PULONG)((ULONG_PTR)vcpu->avic_host_apic_va + APIC_OFFSET_LDR));
+    dfr = READ_REGISTER_ULONG((PULONG)((ULONG_PTR)vcpu->avic_host_apic_va + APIC_OFFSET_DFR));
+
+    entry = (vcpu->avic_backing_pa & AVIC_PHYSICAL_ID_ENTRY_BACKING_PAGE_MASK) |
+            AVIC_PHYSICAL_ID_ENTRY_VALID |
+            AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING |
+            (host_apic_id & AVIC_PHYSICAL_ID_ENTRY_HOST_ID_MASK);
+    ((uint64_t *)vcpu->avic_physical_id_table)[guest_apic_id] = entry;
+
+    logical_id = (ldr >> 24) & 0xFF;
+    if (logical_id) {
+        if (dfr == 0xFFFFFFFF) {
+            table_index = yghv_avic_ffs_u32(logical_id) * 4;
+        } else {
+            uint32_t cluster = (logical_id >> 4) & 0xF;
+            uint32_t apic_ix = yghv_avic_ffs_u32(logical_id & 0xF);
+            table_index = cluster < 15 ? cluster * 16 + apic_ix * 4 : 0;
+        }
+        if (table_index + 4 <= HV_PAGE_SIZE) {
+            *(volatile uint32_t *)((ULONG_PTR)vcpu->avic_logical_id_table + table_index) =
+                AVIC_LOGICAL_ID_ENTRY_VALID |
+                (guest_apic_id & AVIC_LOGICAL_ID_ENTRY_GUEST_ID_MASK);
+        }
+    }
+
+    vcpu->vmcb->control.avic_apic_bar = APIC_DEFAULT_PHYS_BASE;
+    vcpu->vmcb->control.avic_backing_page = vcpu->avic_backing_pa;
+    vcpu->vmcb->control.avic_logical_id = vcpu->avic_logical_id_pa;
+    vcpu->vmcb->control.avic_physical_id =
+        (vcpu->avic_physical_id_pa & AVIC_PHYSICAL_ID_ENTRY_BACKING_PAGE_MASK) |
+        (0xFE & AVIC_PHYSICAL_MAX_INDEX_MASK);
+    vcpu->vmcb->control.vintr |= SVM_INT_CTL_AVIC_ENABLE;
+    vcpu->vmcb->control.vintr &= ~SVM_INT_CTL_X2APIC_MODE;
+    vcpu->vmcb->control.vmcb_clean_bits = 0;
+
+    yghv_trace_u64("avic prepare backing", vcpu->avic_backing_pa);
+    yghv_trace_u64("avic prepare apicid", guest_apic_id);
+    yghv_trace_u64("avic ctl vintr", vcpu->vmcb->control.vintr);
+    yghv_trace_u64("avic bar", vcpu->vmcb->control.avic_apic_bar);
+    yghv_trace_u64("avic backing", vcpu->vmcb->control.avic_backing_page);
+    yghv_trace_u64("avic phys", vcpu->vmcb->control.avic_physical_id);
+    yghv_trace_u64("avic log", vcpu->vmcb->control.avic_logical_id);
+    return STATUS_SUCCESS;
+
+fail:
+    yghv_avic_cleanup(vcpu);
+    return st;
+}
+
+typedef struct __attribute__((packed)) {
+    uint16_t offset_low;
+    uint16_t selector;
+    uint8_t  ist;
+    uint8_t  type_attr;
+    uint16_t offset_mid;
+    uint32_t offset_high;
+    uint32_t reserved;
+} yghv_idt_entry_t;
+
+_Static_assert(sizeof(yghv_idt_entry_t) == 16, "IDT entry size");
+
+static void yghv_avic_read_idtr(uint64_t *base, uint16_t *limit) {
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
+    __asm__ volatile("sidt %0" : "=m"(idtr));
+    *limit = idtr.limit;
+    *base = idtr.base;
+}
+
+static void yghv_avic_load_idtr(uint64_t base, uint16_t limit) {
+    struct { uint16_t limit; uint64_t base; } __attribute__((packed)) idtr;
+    idtr.limit = limit;
+    idtr.base = base;
+    __asm__ volatile("lidt %0" : : "m"(idtr));
+}
+
+static void yghv_avic_restore_idt(svm_vcpu_t *vcpu) {
+    if (!vcpu || !vcpu->avic_host_idt)
+        return;
+    ExFreePoolWithTag(vcpu->avic_host_idt, YGHV_TAG);
+    vcpu->avic_host_idt = NULL;
+    g_avic_eoi_apic_va = NULL;
+}
+
+static NTSTATUS yghv_avic_install_eoi_idt(svm_vcpu_t *vcpu) {
+    yghv_idt_entry_t *idt;
+    uint64_t handler;
+    uint16_t cs;
+    int i;
+
+    if (!vcpu || !vcpu->avic_host_apic_va)
+        return STATUS_INVALID_PARAMETER;
+    if (vcpu->avic_host_idt)
+        return STATUS_SUCCESS;
+
+    idt = (yghv_idt_entry_t *)ExAllocatePoolWithTag(NonPagedPool, 0x1000, YGHV_TAG);
+    if (!idt)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(idt, 0x1000);
+
+    yghv_avic_read_idtr(&vcpu->avic_old_idt_base, &vcpu->avic_old_idt_limit);
+    g_avic_old_idtr.limit = vcpu->avic_old_idt_limit;
+    g_avic_old_idtr.base = vcpu->avic_old_idt_base;
+
+    __asm__ volatile("mov %%cs, %0" : "=r"(cs));
+    handler = (uint64_t)yghv_avic_eoi_isr;
+    for (i = 0; i < 256; i++) {
+        idt[i].offset_low  = (uint16_t)(handler & 0xFFFF);
+        idt[i].selector    = cs;
+        idt[i].ist         = 0;
+        idt[i].type_attr   = 0x8E;
+        idt[i].offset_mid  = (uint16_t)((handler >> 16) & 0xFFFF);
+        idt[i].offset_high = (uint32_t)(handler >> 32);
+        idt[i].reserved    = 0;
+    }
+
+    vcpu->avic_host_idt = idt;
+    g_avic_eoi_apic_va = vcpu->avic_host_apic_va;
+    g_avic_eoi_idtr.limit = 0xFFF;
+    g_avic_eoi_idtr.base = (uint64_t)idt;
+    return STATUS_SUCCESS;
 }
 
 static NTSTATUS yghv_baremetal_step_test(int step) {
@@ -856,10 +1416,52 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 18)
+    if (step > 102)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
+    g_os_guest_host_isr = FALSE;
+    g_os_guest_inject_intr = FALSE;
+    g_os_guest_avic_irr_inject = FALSE;
+    g_os_guest_avic_eoi_only = FALSE;
+    g_os_guest_avic_timer_emu = FALSE;
+    g_os_guest_delay_quiet = FALSE;
+    g_v96_apic_tpr_stress = FALSE;
+    g_v97_hlt_intercept = FALSE;
+    g_v98_apic_shadow = FALSE;
+    g_v101_gp_intercept = FALSE;
+    g_v101_gp_seen = FALSE;
+    g_v102_catchall = FALSE;
+    g_os_resident_log_active = FALSE;
+
+    /* v96: step20 PASS baseline + persistent guest physical-APIC TPR writes. */
+    if (step == 96) {
+        g_v96_apic_tpr_stress = TRUE;
+        step = 20;
+    }
+    /* v97: step23 blocking baseline + intercept guest HLT/MWAIT so idle
+       instructions are emulated by the VMM instead of halting in guest mode. */
+    if (step == 97) {
+        g_v97_hlt_intercept = TRUE;
+        step = 23;
+    }
+    /* v98: step23 blocking baseline + NPT-remapped shadow xAPIC page. */
+    if (step == 98) {
+        g_v98_apic_shadow = TRUE;
+        step = 23;
+    }
+    /* v101: step100 blocking baseline + intercept #DF/#NP/#SS/#GP so the
+       guest context-switch fault becomes a VMEXIT we can capture. */
+    if (step == 101) {
+        g_v101_gp_intercept = TRUE;
+        step = 100;
+    }
+    /* v102: catch all guest faults + HLT to prove or rule out an
+       interceptable exception as the machine-stop cause. */
+    if (step == 102) {
+        g_v102_catchall = TRUE;
+        step = 100;
+    }
 
     if (step == 6) {
         ULONG i;
@@ -1258,12 +1860,14 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
         KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
         g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
         st17 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
                                     NULL, yghv_os_guest_resident_thread,
                                     (PVOID)(uintptr_t)1);
         if (!NT_SUCCESS(st17)) {
             LOG_ERROR("bm step 17: thread create failed 0x%x", st17);
             g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
             return st17;
         }
         st17 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
@@ -1272,6 +1876,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             LOG_ERROR("bm step 17: alive thread create failed 0x%x", st17);
             ZwClose(thread);
             g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
             return st17;
         }
         st17 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
@@ -1281,6 +1886,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             ZwClose(thread);
             ZwClose(alive);
             g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
             return st17;
         }
         KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
@@ -1301,13 +1907,16 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         yghv_trace("bm os resident spin start");
         KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
         KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = FALSE;
         g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
         st18 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
                                     NULL, yghv_os_guest_resident_spin_thread,
                                     (PVOID)(uintptr_t)1);
         if (!NT_SUCCESS(st18)) {
             LOG_ERROR("bm step 18: thread create failed 0x%x", st18);
             g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
             return st18;
         }
         st18 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
@@ -1316,6 +1925,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             LOG_ERROR("bm step 18: alive thread create failed 0x%x", st18);
             ZwClose(thread);
             g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
             return st18;
         }
         st18 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
@@ -1325,6 +1935,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             ZwClose(thread);
             ZwClose(alive);
             g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
             return st18;
         }
         KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
@@ -1333,6 +1944,1238 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         ZwClose(alive);
         ZwClose(watchdog);
         yghv_trace("bm os resident spin running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 19) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st19;
+
+        yghv_trace("bm os resident spin intr start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st19 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_spin_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st19)) {
+            LOG_ERROR("bm step 19: thread create failed 0x%x", st19);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st19;
+        }
+        st19 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st19)) {
+            LOG_ERROR("bm step 19: alive thread create failed 0x%x", st19);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st19;
+        }
+        st19 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st19)) {
+            LOG_ERROR("bm step 19: watchdog thread create failed 0x%x", st19);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st19;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident spin intr running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 20) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st20;
+
+        yghv_trace("bm os resident spin host-isr start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st20 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_spin_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st20)) {
+            LOG_ERROR("bm step 20: thread create failed 0x%x", st20);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st20;
+        }
+        st20 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st20)) {
+            LOG_ERROR("bm step 20: alive thread create failed 0x%x", st20);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st20;
+        }
+        st20 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st20)) {
+            LOG_ERROR("bm step 20: watchdog thread create failed 0x%x", st20);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st20;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident spin host-isr running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 21) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st21;
+
+        yghv_trace("bm os resident spin inject start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_inject_intr = TRUE;
+        g_os_guest_host_isr = FALSE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st21 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_spin_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st21)) {
+            LOG_ERROR("bm step 21: thread create failed 0x%x", st21);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_inject_intr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st21;
+        }
+        st21 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st21)) {
+            LOG_ERROR("bm step 21: alive thread create failed 0x%x", st21);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_inject_intr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st21;
+        }
+        st21 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st21)) {
+            LOG_ERROR("bm step 21: watchdog thread create failed 0x%x", st21);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_inject_intr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st21;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident spin inject running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 22) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st22;
+
+        yghv_trace("bm os resident block host-isr start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = FALSE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st22 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st22)) {
+            LOG_ERROR("bm step 22: thread create failed 0x%x", st22);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st22;
+        }
+        st22 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st22)) {
+            LOG_ERROR("bm step 22: alive thread create failed 0x%x", st22);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st22;
+        }
+        st22 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st22)) {
+            LOG_ERROR("bm step 22: watchdog thread create failed 0x%x", st22);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st22;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident block host-isr running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 23) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st23;
+
+        yghv_trace("bm os resident block delay start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st23 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st23)) {
+            LOG_ERROR("bm step 23: thread create failed 0x%x", st23);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st23;
+        }
+        st23 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st23)) {
+            LOG_ERROR("bm step 23: alive thread create failed 0x%x", st23);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st23;
+        }
+        st23 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st23)) {
+            LOG_ERROR("bm step 23: watchdog thread create failed 0x%x", st23);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st23;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident block delay running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 24) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st24;
+
+        yghv_trace("bm os resident block delay quiet start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st24 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st24)) {
+            LOG_ERROR("bm step 24: thread create failed 0x%x", st24);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st24;
+        }
+        st24 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st24)) {
+            LOG_ERROR("bm step 24: alive thread create failed 0x%x", st24);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st24;
+        }
+        st24 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st24)) {
+            LOG_ERROR("bm step 24: watchdog thread create failed 0x%x", st24);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            return st24;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident block delay quiet running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 25) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st25;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident block avic start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 25: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        st25 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st25)) {
+            LOG_ERROR("bm step 25: avic prepare failed 0x%x", st25);
+            return st25;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st25 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st25)) {
+            LOG_ERROR("bm step 25: thread create failed 0x%x", st25);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st25;
+        }
+        st25 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st25)) {
+            LOG_ERROR("bm step 25: alive thread create failed 0x%x", st25);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st25;
+        }
+        st25 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st25)) {
+            LOG_ERROR("bm step 25: watchdog thread create failed 0x%x", st25);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st25;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident block avic running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 26) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st26;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident avic spin start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 26: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        st26 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st26)) {
+            LOG_ERROR("bm step 26: avic prepare failed 0x%x", st26);
+            return st26;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st26 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_spin_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st26)) {
+            LOG_ERROR("bm step 26: thread create failed 0x%x", st26);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st26;
+        }
+        st26 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st26)) {
+            LOG_ERROR("bm step 26: alive thread create failed 0x%x", st26);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st26;
+        }
+        st26 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st26)) {
+            LOG_ERROR("bm step 26: watchdog thread create failed 0x%x", st26);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st26;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident avic spin running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 27) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st27;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident block avic direct start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 27: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        st27 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st27)) {
+            LOG_ERROR("bm step 27: avic prepare failed 0x%x", st27);
+            return st27;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = FALSE;
+        g_os_guest_host_isr = FALSE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st27 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st27)) {
+            LOG_ERROR("bm step 27: thread create failed 0x%x", st27);
+            g_os_resident_mode = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st27;
+        }
+        st27 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st27)) {
+            LOG_ERROR("bm step 27: alive thread create failed 0x%x", st27);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st27;
+        }
+        st27 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st27)) {
+            LOG_ERROR("bm step 27: watchdog thread create failed 0x%x", st27);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st27;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident block avic direct running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 28) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st28;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident avic irr spin start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 28: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        st28 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st28)) {
+            LOG_ERROR("bm step 28: avic prepare failed 0x%x", st28);
+            return st28;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_avic_irr_inject = TRUE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st28 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_spin_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st28)) {
+            LOG_ERROR("bm step 28: thread create failed 0x%x", st28);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st28;
+        }
+        st28 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st28)) {
+            LOG_ERROR("bm step 28: alive thread create failed 0x%x", st28);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st28;
+        }
+        st28 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st28)) {
+            LOG_ERROR("bm step 28: watchdog thread create failed 0x%x", st28);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st28;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident avic irr spin running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 29) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st29;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident avic scan spin start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 29: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        st29 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st29)) {
+            LOG_ERROR("bm step 29: avic prepare failed 0x%x", st29);
+            return st29;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_avic_irr_inject = TRUE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st29 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_spin_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st29)) {
+            LOG_ERROR("bm step 29: thread create failed 0x%x", st29);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st29;
+        }
+        st29 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st29)) {
+            LOG_ERROR("bm step 29: alive thread create failed 0x%x", st29);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st29;
+        }
+        st29 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st29)) {
+            LOG_ERROR("bm step 29: watchdog thread create failed 0x%x", st29);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st29;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident avic scan spin running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 30) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st30;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident avic scan block start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 30: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        st30 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st30)) {
+            LOG_ERROR("bm step 30: avic prepare failed 0x%x", st30);
+            return st30;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_avic_irr_inject = TRUE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st30 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st30)) {
+            LOG_ERROR("bm step 30: thread create failed 0x%x", st30);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st30;
+        }
+        st30 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st30)) {
+            LOG_ERROR("bm step 30: alive thread create failed 0x%x", st30);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st30;
+        }
+        st30 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st30)) {
+            LOG_ERROR("bm step 30: watchdog thread create failed 0x%x", st30);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st30;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident avic scan block running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 31) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st31;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident avic stack block start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 31: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        st31 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st31)) {
+            LOG_ERROR("bm step 31: avic prepare failed 0x%x", st31);
+            return st31;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_avic_irr_inject = TRUE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st31 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st31)) {
+            LOG_ERROR("bm step 31: thread create failed 0x%x", st31);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st31;
+        }
+        st31 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st31)) {
+            LOG_ERROR("bm step 31: alive thread create failed 0x%x", st31);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st31;
+        }
+        st31 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st31)) {
+            LOG_ERROR("bm step 31: watchdog thread create failed 0x%x", st31);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st31;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident avic stack block running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 32) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st32;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+
+        yghv_trace("bm os resident avic eoi spin start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 32: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        av->resident_index = 1;
+        st32 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st32)) {
+            LOG_ERROR("bm step 32: avic prepare failed 0x%x", st32);
+            return st32;
+        }
+        st32 = yghv_avic_install_eoi_idt(av);
+        if (!NT_SUCCESS(st32)) {
+            LOG_ERROR("bm step 32: eoi idt install failed 0x%x", st32);
+            yghv_avic_cleanup(av);
+            return st32;
+        }
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = FALSE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_avic_irr_inject = TRUE;
+        g_os_guest_avic_eoi_only = TRUE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st32 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_spin_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st32)) {
+            LOG_ERROR("bm step 32: thread create failed 0x%x", st32);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_avic_eoi_only = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_restore_idt(av);
+            yghv_avic_cleanup(av);
+            return st32;
+        }
+        st32 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st32)) {
+            LOG_ERROR("bm step 32: alive thread create failed 0x%x", st32);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_avic_eoi_only = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_restore_idt(av);
+            yghv_avic_cleanup(av);
+            return st32;
+        }
+        st32 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st32)) {
+            LOG_ERROR("bm step 32: watchdog thread create failed 0x%x", st32);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_avic_eoi_only = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_restore_idt(av);
+            yghv_avic_cleanup(av);
+            return st32;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident avic eoi spin running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 33) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE watchdog;
+        NTSTATUS st33;
+        svm_vcpu_t *av = svm_core_get_vcpu(1);
+        uint32_t lvtt;
+        uint32_t clock_vector;
+
+        yghv_trace("bm os resident avic timer block start");
+        if (!av || g_vcpu_count <= 1) {
+            LOG_ERROR("bm step 33: vcpu1 unavailable");
+            return STATUS_NOT_FOUND;
+        }
+        av->resident_index = 1;
+        st33 = yghv_avic_prepare(av, 1);
+        if (!NT_SUCCESS(st33)) {
+            LOG_ERROR("bm step 33: avic prepare failed 0x%x", st33);
+            return st33;
+        }
+        svm_avic_timer_init(av);
+        lvtt = READ_REGISTER_ULONG(
+            (PULONG)((ULONG_PTR)av->avic_host_apic_va + APIC_OFFSET_LVTT));
+        clock_vector = lvtt & 0xFF;
+        svm_avic_start_timer(av, clock_vector, 10);
+        WRITE_REGISTER_ULONG(
+            (PULONG)((ULONG_PTR)av->avic_host_apic_va + APIC_OFFSET_TMICT), 0);
+        WRITE_REGISTER_ULONG(
+            (PULONG)((ULONG_PTR)av->avic_host_apic_va + APIC_OFFSET_TDCR), 0);
+
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_avic_irr_inject = TRUE;
+        g_os_guest_avic_eoi_only = FALSE;
+        g_os_guest_avic_timer_emu = TRUE;
+        g_os_guest_delay_quiet = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        st33 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st33)) {
+            LOG_ERROR("bm step 33: thread create failed 0x%x", st33);
+            if (av->avic_timer_initialized) {
+                KeCancelTimer(&av->avic_timer);
+                av->avic_timer_armed = FALSE;
+            }
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_avic_timer_emu = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st33;
+        }
+        st33 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st33)) {
+            LOG_ERROR("bm step 33: alive thread create failed 0x%x", st33);
+            if (av->avic_timer_initialized) {
+                KeCancelTimer(&av->avic_timer);
+                av->avic_timer_armed = FALSE;
+            }
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_avic_timer_emu = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st33;
+        }
+        st33 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st33)) {
+            LOG_ERROR("bm step 33: watchdog thread create failed 0x%x", st33);
+            if (av->avic_timer_initialized) {
+                KeCancelTimer(&av->avic_timer);
+                av->avic_timer_armed = FALSE;
+            }
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_guest_avic_irr_inject = FALSE;
+            g_os_guest_avic_timer_emu = FALSE;
+            g_os_guest_delay_quiet = FALSE;
+            g_os_resident_log_active = FALSE;
+            yghv_avic_cleanup(av);
+            return st33;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(watchdog);
+        yghv_trace("bm os resident avic timer block running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 99) {
+        ULONG i;
+        ULONG j;
+        ULONG bm_cores = g_vcpu_count;
+        HANDLE threads[SVM_MAX_CORES] = { 0 };
+        HANDLE alive = NULL;
+        HANDLE watchdog = NULL;
+        NTSTATUS st99 = STATUS_SUCCESS;
+
+        yghv_trace("bm os allcore resident start");
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        InterlockedExchange(&g_v99_allcore_ready, 0);
+        InterlockedExchange(&g_v99_allcore_go, 0);
+        InterlockedExchange(&g_v99_allcore_abort, 0);
+        InterlockedExchange(&g_v99_allcore_online, (LONG)bm_cores);
+
+        for (i = 0; i < bm_cores; i++) {
+            KeInitializeEvent(&g_os_guest_done_events[i], NotificationEvent, FALSE);
+            st99 = PsCreateSystemThread(&threads[i], THREAD_ALL_ACCESS, NULL,
+                                        NULL, NULL,
+                                        yghv_os_guest_allcore_thread,
+                                        (PVOID)(uintptr_t)i);
+            if (!NT_SUCCESS(st99)) {
+                LOG_ERROR("bm step 99: thread core %u failed 0x%x", i, st99);
+                break;
+            }
+        }
+        if (!NT_SUCCESS(st99)) {
+            InterlockedExchange(&g_v99_allcore_abort, 1);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            for (j = 0; j < bm_cores; j++)
+                if (threads[j]) ZwClose(threads[j]);
+            return st99;
+        }
+
+        st99 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st99)) {
+            LOG_ERROR("bm step 99: alive thread create failed 0x%x", st99);
+            InterlockedExchange(&g_v99_allcore_abort, 1);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            for (j = 0; j < bm_cores; j++)
+                if (threads[j]) ZwClose(threads[j]);
+            return st99;
+        }
+        st99 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st99)) {
+            LOG_ERROR("bm step 99: watchdog thread create failed 0x%x", st99);
+            InterlockedExchange(&g_v99_allcore_abort, 1);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            for (j = 0; j < bm_cores; j++)
+                if (threads[j]) ZwClose(threads[j]);
+            return st99;
+        }
+
+        InterlockedExchange(&g_v99_allcore_go, 1);
+        for (i = 0; i < bm_cores; i++) {
+            KeWaitForSingleObject(&g_os_guest_done_events[i], Executive,
+                                  KernelMode, FALSE, NULL);
+        }
+        ZwClose(alive);
+        ZwClose(watchdog);
+        for (i = 0; i < bm_cores; i++)
+            if (threads[i]) ZwClose(threads[i]);
+        yghv_trace("bm os allcore resident running");
+        return STATUS_SUCCESS;
+    }
+
+    if (step == 100) {
+        HANDLE thread;
+        HANDLE alive;
+        HANDLE monitor;
+        NTSTATUS st100;
+        svm_vcpu_t *mv;
+
+        yghv_trace("bm os resident freeze-site start");
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        g_v100_monitor_active = TRUE;
+        g_v100_guest_entered = FALSE;
+        /* step100 isolation: guest continuation performs no file I/O
+           (no yghv_trace), leaving only a pure KeDelayExecutionThread
+           block, to separate "any guest-mode scheduler switch" from
+           "blocking file write triggers the 0x139". */
+        g_os_guest_delay_quiet = TRUE;
+        mv = svm_core_get_vcpu(1);
+        if (mv) {
+            RtlZeroMemory(mv->v100_ring, sizeof(mv->v100_ring));
+            mv->v100_seq = 0;
+        }
+        st100 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_os_guest_resident_delay_thread,
+                                    (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st100)) {
+            LOG_ERROR("bm step 100: thread create failed 0x%x", st100);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            g_v100_monitor_active = FALSE;
+            return st100;
+        }
+        st100 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st100)) {
+            LOG_ERROR("bm step 100: alive thread create failed 0x%x", st100);
+            ZwClose(thread);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            g_v100_monitor_active = FALSE;
+            return st100;
+        }
+        st100 = PsCreateSystemThread(&monitor, THREAD_ALL_ACCESS, NULL, NULL,
+                                    NULL, yghv_v100_monitor_thread, NULL);
+        if (!NT_SUCCESS(st100)) {
+            LOG_ERROR("bm step 100: monitor thread create failed 0x%x", st100);
+            ZwClose(thread);
+            ZwClose(alive);
+            g_os_resident_mode = FALSE;
+            g_os_guest_intr_intercept = FALSE;
+            g_os_guest_host_isr = FALSE;
+            g_os_resident_log_active = FALSE;
+            g_v100_monitor_active = FALSE;
+            return st100;
+        }
+        KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                              KernelMode, FALSE, NULL);
+        ZwClose(thread);
+        ZwClose(alive);
+        ZwClose(monitor);
+        yghv_trace("bm os resident freeze-site running");
         return STATUS_SUCCESS;
     }
 
@@ -1699,7 +3542,8 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     {
         NTSTATUS st2 = yghv_baremetal_step_test(YGHV_BAREMETAL_STEP);
         yghv_trace("bm done");
-        yghv_trace_close();
+        if (YGHV_BAREMETAL_STEP < 17 || !g_os_resident_log_active)
+            yghv_trace_close();
         KeRevertToUserAffinityThread();
         return st2;
     }
