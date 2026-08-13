@@ -6,7 +6,7 @@ Build:
 build.bat
 ```
 
-Usage (all commands require the yuanguard driver to be loaded):
+Java client usage (all commands require the yuanguard driver to be loaded):
 
 ```
 run.bat state
@@ -15,10 +15,43 @@ run.bat add-page <hex_va>
 run.bat remove-page <hex_va>
 run.bat start
 run.bat stop
+run.bat target
+run.bat list-targets
+run.bat list-pages
+run.bat list-hooks
+run.bat install-hook <name|hex_va> [hook_id]
+run.bat remove-hook <hook_id>
+run.bat clear
+run.bat config [auto-disarm <0|1> | deny-status <hex>]
 run.bat list-java
 run.bat protect <pid> [maxPages]
 run.bat unprotect
 run.bat scan <pid> [maxPages]
+```
+
+PowerShell client usage:
+
+```
+yghv_ctl.ps1 state
+yghv_ctl.ps1 set-target <pid>
+yghv_ctl.ps1 add-page <hex_va>
+yghv_ctl.ps1 remove-page <hex_va>
+yghv_ctl.ps1 start
+yghv_ctl.ps1 stop
+yghv_ctl.ps1 target
+yghv_ctl.ps1 list-targets
+yghv_ctl.ps1 list-pages
+yghv_ctl.ps1 list-hooks
+yghv_ctl.ps1 install-hook <name|hex_va> [hook_id]
+yghv_ctl.ps1 remove-hook <hook_id>
+yghv_ctl.ps1 clear
+yghv_ctl.ps1 config [auto-disarm <0|1> | deny-status <hex>]
+yghv_ctl.ps1 set-auto-start
+yghv_ctl.ps1 unset-auto-start
+yghv_ctl.ps1 harden-service
+yghv_ctl.ps1 unharden-service
+yghv_ctl.ps1 selftest
+yghv_ctl.ps1 exit-test
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,

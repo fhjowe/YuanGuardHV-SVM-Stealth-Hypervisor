@@ -2033,3 +2033,17 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 交接文档顶部快照与 `YUANMOD_NEXT_WINDOW_PROMPT.md` 同步到清理后的
   文档结构。
 - 收尾：`git rm` 删除并提交；工作区保持干净。
+
+### 9.133 2026-08-13 tests/ 静态校验脚本（PASS）
+
+- 用户确认执行：建 `YuanGuardHV/tests/` 目录，做接口编号、命令清单与
+  安全红线静态校验，不加载驱动、不碰 hook 实机路径。
+- 新增：`tests/README.md`、`ioctl_parity.ps1`、`command_parity.ps1`、
+  `safety_checks.ps1`、`run_static_checks.ps1`。
+- 同步 `tools/yghv_client/README.md` 为完整命令清单（Java 18 个、
+  PowerShell 20 个）。
+- 运行结果全部 PASS：IOCTL parity C=15/PowerShell=15/Java=15；Command
+  parity PowerShell=20/Java=18；Safety checks PASS（pause-under-lock
+  限定已知两函数、无 `STATUS_DEVICE_BUSY`、0x5AA 命名正确、README
+  包含 unprotect/scan）。
+- 收尾：未加载驱动、未跑 hook 路径；提交。
