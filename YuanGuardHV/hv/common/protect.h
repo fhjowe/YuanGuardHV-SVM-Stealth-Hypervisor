@@ -6,6 +6,7 @@
 
 #define YGHV_PROTECT_MAX_PAGES 64
 #define YGHV_PROTECT_MAX_HOOKS 4
+#define YGHV_PROTECT_MAX_TARGETS 4
 #define YGHV_PROTECT_PATCH_LEN 16
 #define YGHV_PROTECT_PATCH_MIN 12
 
@@ -29,11 +30,16 @@ typedef struct {
 
 typedef struct {
     uint32_t pid;
+    uint32_t flags;
     uint64_t cr3;
-    PEPROCESS process;
-    uint64_t flags;
     uint32_t page_count;
     yghv_protect_page_t pages[YGHV_PROTECT_MAX_PAGES];
+    PEPROCESS process;
+} yghv_protect_target_t;
+
+typedef struct {
+    uint32_t target_count;
+    yghv_protect_target_t targets[YGHV_PROTECT_MAX_TARGETS];
     yghv_protect_config_t config;
     volatile BOOLEAN active;
 } yghv_protect_state_t;

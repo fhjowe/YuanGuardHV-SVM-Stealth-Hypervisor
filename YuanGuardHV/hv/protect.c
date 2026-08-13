@@ -20,15 +20,15 @@ yghv_protect_hook_t g_protect_hooks[YGHV_PROTECT_MAX_HOOKS];
 static FAST_MUTEX g_protect_lock;
 
 static BOOLEAN yghv_protect_is_target_cr3_locked(uint64_t cr3) {
-    return g_protect.cr3 != 0 && cr3 == g_protect.cr3;
+    return g_protect.targets[0].cr3 != 0 && cr3 == g_protect.targets[0].cr3;
 }
 
 static yghv_protect_page_t *yghv_protect_find_page_locked(uint64_t gpa) {
     uint32_t i;
     uint64_t page = gpa & ~0xFFFULL;
-    for (i = 0; i < g_protect.page_count; i++)
-        if (g_protect.pages[i].gpa == page)
-            return &g_protect.pages[i];
+    for (i = 0; i < g_protect.targets[0].page_count; i++)
+        if (g_protect.targets[0].pages[i].gpa == page)
+            return &g_protect.targets[0].pages[i];
     return NULL;
 }
 
@@ -70,10 +70,10 @@ static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
     KAPC_STATE apc;
     uint64_t pa;
 
-    if (!g_protect.process)
+    if (!g_protect.targets[0].process)
         return 0;
 
-    KeStackAttachProcess(g_protect.process, &apc);
+    KeStackAttachProcess(g_protect.targets[0].process, &apc);
     pa = MmGetPhysicalAddress((PVOID)target_va).QuadPart;
     KeUnstackDetachProcess(&apc);
     if (pa)
@@ -83,14 +83,14 @@ static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
     {
         SIZE_T copied = 0;
         UCHAR tmp;
-        NTSTATUS st = MmCopyVirtualMemory(g_protect.process, (PVOID)target_va,
+        NTSTATUS st = MmCopyVirtualMemory(g_protect.targets[0].process, (PVOID)target_va,
                                           IoGetCurrentProcess(), &tmp, 1,
                                           KernelMode, &copied);
         if (!NT_SUCCESS(st) || copied != 1)
             return 0;
     }
 
-    KeStackAttachProcess(g_protect.process, &apc);
+    KeStackAttachProcess(g_protect.targets[0].process, &apc);
     pa = MmGetPhysicalAddress((PVOID)target_va).QuadPart;
     KeUnstackDetachProcess(&apc);
     return pa;
@@ -100,6 +100,7 @@ NTSTATUS yghv_protect_init(void) {
     ExInitializeFastMutex(&g_protect_lock);
     RtlZeroMemory(&g_protect, sizeof(g_protect));
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
+    g_protect.target_count = 1;
     g_protect.config.auto_disarm = 1;
     g_protect.config.deny_status = 0xC0000022;
     return STATUS_SUCCESS;
@@ -113,9 +114,9 @@ void yghv_protect_cleanup(void) {
             yghv_protect_remove_hook_locked(i);
     }
     yghv_protect_stop_locked();
-    if (g_protect.process) {
-        ObDereferenceObject(g_protect.process);
-        g_protect.process = NULL;
+    if (g_protect.targets[0].process) {
+        ObDereferenceObject(g_protect.targets[0].process);
+        g_protect.targets[0].process = NULL;
     }
     RtlZeroMemory(&g_protect, sizeof(g_protect));
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
@@ -131,11 +132,11 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
         return STATUS_INVALID_PARAMETER;
 
     ExAcquireFastMutex(&g_protect_lock);
-    if (g_protect.page_count) {
+    if (g_protect.targets[0].page_count) {
         ULONG i;
-        for (i = 0; i < g_protect.page_count; i++) {
-            if (g_protect.pages[i].armed) {
-                int ds = yghv_protect_disarm_page_locked(&g_protect.pages[i]);
+        for (i = 0; i < g_protect.targets[0].page_count; i++) {
+            if (g_protect.targets[0].pages[i].armed) {
+                int ds = yghv_protect_disarm_page_locked(&g_protect.targets[0].pages[i]);
                 if (ds) {
                     LOG_ERROR("protect set_target: disarm page %u failed 0x%x",
                         i, ds);
@@ -144,13 +145,13 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
                 }
             }
         }
-        g_protect.page_count = 0;
+        g_protect.targets[0].page_count = 0;
     }
-    if (g_protect.process) {
-        ObDereferenceObject(g_protect.process);
-        g_protect.process = NULL;
-        g_protect.cr3 = 0;
-        g_protect.pid = 0;
+    if (g_protect.targets[0].process) {
+        ObDereferenceObject(g_protect.targets[0].process);
+        g_protect.targets[0].process = NULL;
+        g_protect.targets[0].cr3 = 0;
+        g_protect.targets[0].pid = 0;
     }
     ExReleaseFastMutex(&g_protect_lock);
 
@@ -173,9 +174,9 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
         return STATUS_INVALID_PARAMETER;
     }
     ExAcquireFastMutex(&g_protect_lock);
-    g_protect.pid = pid;
-    g_protect.process = proc;
-    g_protect.cr3 = cr3;
+    g_protect.targets[0].pid = pid;
+    g_protect.targets[0].process = proc;
+    g_protect.targets[0].cr3 = cr3;
     ExReleaseFastMutex(&g_protect_lock);
     LOG_ERROR("protect target: pid=%u process=0x%llx cr3=0x%llx", pid,
         (uint64_t)proc, cr3);
@@ -201,9 +202,9 @@ NTSTATUS yghv_protect_add_page(uint64_t target_va) {
 static NTSTATUS yghv_protect_add_page_locked(uint64_t target_va) {
     uint64_t gpa;
     yghv_protect_page_t *p;
-    if (g_protect.page_count >= YGHV_PROTECT_MAX_PAGES)
+    if (g_protect.targets[0].page_count >= YGHV_PROTECT_MAX_PAGES)
         return STATUS_INSUFFICIENT_RESOURCES;
-    if (!g_protect.cr3)
+    if (!g_protect.targets[0].cr3)
         return STATUS_INVALID_PARAMETER;
     gpa = yghv_protect_resolve_va(target_va);
     gpa &= ~(uint64_t)0xFFFULL;
@@ -211,7 +212,7 @@ static NTSTATUS yghv_protect_add_page_locked(uint64_t target_va) {
         LOG_ERROR("protect add_page: va 0x%llx not mapped", target_va);
         return STATUS_INVALID_ADDRESS;
     }
-    p = &g_protect.pages[g_protect.page_count++];
+    p = &g_protect.targets[0].pages[g_protect.targets[0].page_count++];
     p->gpa = gpa;
     p->target_va = target_va;
     p->flags = YGHV_PROTECT_MEM;
@@ -230,15 +231,15 @@ NTSTATUS yghv_protect_remove_page(uint64_t target_va) {
 
 static NTSTATUS yghv_protect_remove_page_locked(uint64_t target_va) {
     uint32_t i;
-    for (i = 0; i < g_protect.page_count; i++) {
-        if (g_protect.pages[i].target_va == target_va) {
-            if (g_protect.pages[i].armed) {
-                int st = yghv_protect_disarm_page_locked(&g_protect.pages[i]);
+    for (i = 0; i < g_protect.targets[0].page_count; i++) {
+        if (g_protect.targets[0].pages[i].target_va == target_va) {
+            if (g_protect.targets[0].pages[i].armed) {
+                int st = yghv_protect_disarm_page_locked(&g_protect.targets[0].pages[i]);
                 if (st)
                     return (NTSTATUS)st;
             }
-            g_protect.pages[i] = g_protect.pages[g_protect.page_count - 1];
-            g_protect.page_count--;
+            g_protect.targets[0].pages[i] = g_protect.targets[0].pages[g_protect.targets[0].page_count - 1];
+            g_protect.targets[0].page_count--;
             return STATUS_SUCCESS;
         }
     }
@@ -309,9 +310,9 @@ NTSTATUS yghv_protect_start(void) {
 
 static NTSTATUS yghv_protect_start_locked(void) {
     uint32_t i;
-    if (!g_protect.cr3) return STATUS_INVALID_PARAMETER;
-    for (i = 0; i < g_protect.page_count; i++) {
-        int st = yghv_protect_arm_page_locked(&g_protect.pages[i]);
+    if (!g_protect.targets[0].cr3) return STATUS_INVALID_PARAMETER;
+    for (i = 0; i < g_protect.targets[0].page_count; i++) {
+        int st = yghv_protect_arm_page_locked(&g_protect.targets[0].pages[i]);
         if (st) {
             LOG_ERROR("protect start: arm page %u failed 0x%x", i, st);
             NTSTATUS disarm_status = yghv_protect_stop_locked();
@@ -325,7 +326,7 @@ static NTSTATUS yghv_protect_start_locked(void) {
         }
     }
     g_protect.active = TRUE;
-    LOG_ERROR("protect start: %u pages armed", g_protect.page_count);
+    LOG_ERROR("protect start: %u pages armed", g_protect.targets[0].page_count);
     return STATUS_SUCCESS;
 }
 
@@ -340,9 +341,9 @@ NTSTATUS yghv_protect_stop(void) {
 static NTSTATUS yghv_protect_stop_locked(void) {
     uint32_t i;
     NTSTATUS first_failure = STATUS_SUCCESS;
-    for (i = 0; i < g_protect.page_count; i++) {
-        if (g_protect.pages[i].armed) {
-            int st = yghv_protect_disarm_page_locked(&g_protect.pages[i]);
+    for (i = 0; i < g_protect.targets[0].page_count; i++) {
+        if (g_protect.targets[0].pages[i].armed) {
+            int st = yghv_protect_disarm_page_locked(&g_protect.targets[0].pages[i]);
             if (st && first_failure == STATUS_SUCCESS) {
                 first_failure = (NTSTATUS)st;
                 LOG_ERROR("protect stop: disarm page %u failed 0x%x", i, st);
@@ -411,15 +412,15 @@ void yghv_protect_rearm(svm_vcpu_t *vcpu) {
 void yghv_protect_get_state(ULONG *active, ULONG *pid, ULONG *page_count) {
     ExAcquireFastMutex(&g_protect_lock);
     if (active) *active = g_protect.active ? 1 : 0;
-    if (pid) *pid = g_protect.pid;
-    if (page_count) *page_count = g_protect.page_count;
+    if (pid) *pid = g_protect.targets[0].pid;
+    if (page_count) *page_count = g_protect.targets[0].page_count;
     ExReleaseFastMutex(&g_protect_lock);
 }
 
 void yghv_protect_get_heartbeat(uint64_t *page_va, uint64_t *hook_va) {
     ExAcquireFastMutex(&g_protect_lock);
     if (page_va)
-        *page_va = g_protect.page_count ? g_protect.pages[0].target_va : 0;
+        *page_va = g_protect.targets[0].page_count ? g_protect.targets[0].pages[0].target_va : 0;
     if (hook_va)
         *hook_va = g_protect_hooks[0].installed ? g_protect_hooks[0].func_va : 0;
     ExReleaseFastMutex(&g_protect_lock);
@@ -430,9 +431,9 @@ void yghv_protect_get_target(ULONG *active, ULONG *pid, ULONG_PTR *cr3,
     ULONG i;
     ExAcquireFastMutex(&g_protect_lock);
     if (active) *active = g_protect.active ? 1 : 0;
-    if (pid) *pid = g_protect.pid;
-    if (cr3) *cr3 = g_protect.cr3;
-    if (page_count) *page_count = g_protect.page_count;
+    if (pid) *pid = g_protect.targets[0].pid;
+    if (cr3) *cr3 = g_protect.targets[0].cr3;
+    if (page_count) *page_count = g_protect.targets[0].page_count;
     if (hook_count) {
         ULONG n = 0;
         for (i = 0; i < YGHV_PROTECT_MAX_HOOKS; i++) {
@@ -448,15 +449,15 @@ void yghv_protect_get_pages_info(yghv_protect_pages_info_t *info) {
     ULONG i;
     ULONG n;
     ExAcquireFastMutex(&g_protect_lock);
-    n = g_protect.page_count;
+    n = g_protect.targets[0].page_count;
     if (info->count < n)
         n = info->count;
-    info->returned = g_protect.page_count;
+    info->returned = g_protect.targets[0].page_count;
     for (i = 0; i < n; i++) {
-        info->pages[i].gpa = g_protect.pages[i].gpa;
-        info->pages[i].target_va = g_protect.pages[i].target_va;
-        info->pages[i].flags = g_protect.pages[i].flags;
-        info->pages[i].armed = g_protect.pages[i].armed;
+        info->pages[i].gpa = g_protect.targets[0].pages[i].gpa;
+        info->pages[i].target_va = g_protect.targets[0].pages[i].target_va;
+        info->pages[i].flags = g_protect.targets[0].pages[i].flags;
+        info->pages[i].armed = g_protect.targets[0].pages[i].armed;
         RtlZeroMemory(info->pages[i].reserved, sizeof(info->pages[i].reserved));
     }
     ExReleaseFastMutex(&g_protect_lock);
@@ -492,13 +493,13 @@ NTSTATUS yghv_protect_clear(void) {
         if (g_protect_hooks[i].installed)
             yghv_protect_remove_hook_locked(i);
     }
-    g_protect.page_count = 0;
-    if (g_protect.process) {
-        ObDereferenceObject(g_protect.process);
-        g_protect.process = NULL;
+    g_protect.targets[0].page_count = 0;
+    if (g_protect.targets[0].process) {
+        ObDereferenceObject(g_protect.targets[0].process);
+        g_protect.targets[0].process = NULL;
     }
-    g_protect.pid = 0;
-    g_protect.cr3 = 0;
+    g_protect.targets[0].pid = 0;
+    g_protect.targets[0].cr3 = 0;
     g_protect.active = FALSE;
     LOG_ERROR("protect clear: target/pages/hooks cleared");
     ExReleaseFastMutex(&g_protect_lock);
@@ -539,8 +540,8 @@ BOOLEAN yghv_protect_check_target_exited(void) {
     NTSTATUS st;
 
     ExAcquireFastMutex(&g_protect_lock);
-    proc = g_protect.process;
-    pid = g_protect.pid;
+    proc = g_protect.targets[0].process;
+    pid = g_protect.targets[0].pid;
     ExReleaseFastMutex(&g_protect_lock);
     if (!proc)
         return FALSE;
@@ -556,7 +557,7 @@ BOOLEAN yghv_protect_on_target_exit(ULONG pid) {
     uint32_t i;
 
     ExAcquireFastMutex(&g_protect_lock);
-    if (g_protect.process && g_protect.pid == pid) {
+    if (g_protect.targets[0].process && g_protect.targets[0].pid == pid) {
         NTSTATUS st = yghv_protect_stop_locked();
         if (st)
             LOG_ERROR("protect target exit: stop failed 0x%x", st);
@@ -564,11 +565,11 @@ BOOLEAN yghv_protect_on_target_exit(ULONG pid) {
             if (g_protect_hooks[i].installed)
                 yghv_protect_remove_hook_locked(i);
         }
-        g_protect.page_count = 0;
-        ObDereferenceObject(g_protect.process);
-        g_protect.process = NULL;
-        g_protect.pid = 0;
-        g_protect.cr3 = 0;
+        g_protect.targets[0].page_count = 0;
+        ObDereferenceObject(g_protect.targets[0].process);
+        g_protect.targets[0].process = NULL;
+        g_protect.targets[0].pid = 0;
+        g_protect.targets[0].cr3 = 0;
         handled = TRUE;
         LOG_ERROR("protect target exited: auto disarm, pid cleared");
     }
@@ -889,8 +890,8 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
        on a VMMCALL VMEXIT. */
     uint8_t *p = stub;
     p[0]=0x50; p[1]=0x51; p[2]=0x53;               /* push rax,rcx,rbx */
-    p[3]=0x48; p[4]=0xBB;                           /* movabs rbx, &g_protect.cr3 */
-    yghv_emit_u64(p+5, (uint64_t)&g_protect.cr3);
+    p[3]=0x48; p[4]=0xBB;                           /* movabs rbx, &g_protect.targets[0].cr3 */
+    yghv_emit_u64(p+5, (uint64_t)&g_protect.targets[0].cr3);
     p[13]=0x48; p[14]=0x8B; p[15]=0x1B;             /* mov rbx,[rbx] */
     p[16]=0x48; p[17]=0x0F; p[18]=0x20; p[19]=0xD8; /* mov rax,cr3 */
     p[20]=0x48; p[21]=0x25; p[22]=0x00; p[23]=0xF0;

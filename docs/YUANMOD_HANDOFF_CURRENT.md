@@ -1829,3 +1829,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
   `70888311...`，服务 STOPPED；下一步进入 2B-3-a 多目标状态结构重构
   （保持单目标行为，先回归再开放多目标）。
+
+### 9.123 2026-08-13 2B-3-a 多目标状态结构重构（保持单目标行为，PASS）
+
+- `protect.h`：新增 `YGHV_PROTECT_MAX_TARGETS 4` 与
+  `yghv_protect_target_t`（pid/flags/cr3/page_count/pages/process），
+  `yghv_protect_state_t` 改为 `target_count + targets[4] + config + active`。
+- `protect.c`/`main.c`：所有 `g_protect.pid/cr3/process/flags/page_count/
+  pages` 机械改写为 `g_protect.targets[0].*`（单目标槽 0），hook stub
+  地址同步为 `&g_protect.targets[0].cr3`；`init` 置 `target_count=1`，
+  config/active 保持 state 顶层。
+- 实机回归（新默认版 SHA256
+  `C9638324855A298F225A1A22DC9900892D2366E9B742DDF70EBADCB6DE4668C3`，
+  归档 `D:\aaaaaavm\yuanguard_hv_targets_refactor_20260813.sys`）：启动
+  自测（hook resident allow/deny、boundary、多核 heartbeat、all
+  stopped）PASS；`state/target/list-hooks/selftest/exit-test` PASS；
+  无冻结。
+- 收尾：C 盘恢复稳定默认版 `70888311...`，服务 STOPPED；下一步
+  2B-3-b 开放多目标（按 cr3 绑定槽、stub 遍历、list-targets）。

@@ -429,7 +429,7 @@ static NTSTATUS yghv_protect_test(void) {
     int ok = 1;
 
     /* Phase B: policy matrix (synthetic) */
-    g_protect.cr3 = 0x1000ULL;   /* fake target CR3 */
+    g_protect.targets[0].cr3 = 0x1000ULL;   /* fake target CR3 */
     if (!yghv_protect_is_target_cr3(0x1000ULL)) ok = 0;
     if (yghv_protect_is_target_cr3(0x2000ULL)) ok = 0;
     LOG_ERROR("protect test: policy %s", ok ? "PASS" : "FAIL");
@@ -439,7 +439,7 @@ static NTSTATUS yghv_protect_test(void) {
     st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect test: set_target FAILED 0x%x", st);
-        g_protect.cr3 = 0;   /* don't leave the synthetic policy CR3 behind */
+        g_protect.targets[0].cr3 = 0;   /* don't leave the synthetic policy CR3 behind */
         return st;
     }
     buf = MmAllocateContiguousMemory(HV_PAGE_SIZE,
@@ -574,8 +574,8 @@ static NTSTATUS yghv_hook_test(void) {
     entry_before = npt_read_entry(&g_npt, gpa);
     if (entry_before & NPT_PERM_WRITABLE) ok = 0;
 
-    if (yghv_protect_on_hook_query(0, g_protect.cr3) != YGHV_STATUS_OK) ok = 0;
-    if (yghv_protect_on_hook_query(0, g_protect.cr3 + 0x1000) != YGHV_STATUS_DENIED) ok = 0;
+    if (yghv_protect_on_hook_query(0, g_protect.targets[0].cr3) != YGHV_STATUS_OK) ok = 0;
+    if (yghv_protect_on_hook_query(0, g_protect.targets[0].cr3 + 0x1000) != YGHV_STATUS_DENIED) ok = 0;
 
     if (!NT_SUCCESS(yghv_protect_remove_hook(0))) {
         LOG_ERROR("protect hook test: remove FAILED");
@@ -596,8 +596,8 @@ static NTSTATUS yghv_hook_test(void) {
         entry_before = npt_read_entry(&g_npt, gpa2);
         if (entry_before & NPT_PERM_WRITABLE) ok = 0;
 
-        if (yghv_protect_on_hook_query(1, g_protect.cr3) != YGHV_STATUS_OK) ok = 0;
-        if (yghv_protect_on_hook_query(1, g_protect.cr3 + 0x1000) != YGHV_STATUS_DENIED) ok = 0;
+        if (yghv_protect_on_hook_query(1, g_protect.targets[0].cr3) != YGHV_STATUS_OK) ok = 0;
+        if (yghv_protect_on_hook_query(1, g_protect.targets[0].cr3 + 0x1000) != YGHV_STATUS_DENIED) ok = 0;
 
         if (!NT_SUCCESS(yghv_protect_remove_hook(1))) {
             LOG_ERROR("protect hook test: remove1 FAILED");
@@ -631,7 +631,7 @@ static NTSTATUS yghv_hook_resident_test(void) {
         LOG_ERROR("hook resident test: install FAILED");
         return STATUS_UNSUCCESSFUL;
     }
-    real_cr3 = g_protect.cr3;
+    real_cr3 = g_protect.targets[0].cr3;
 
     v = svm_core_get_vcpu(0);
     v->regs.rsi = dummy;
@@ -653,8 +653,8 @@ static NTSTATUS yghv_hook_resident_test(void) {
     if (v->regs.rdx == 0xC0000022ULL)
         ok = 0;
 
-    /* Deny: keep guest CR3 valid, shift g_protect.cr3 out of match. */
-    g_protect.cr3 = real_cr3 + 0x1000;
+    /* Deny: keep guest CR3 valid, shift g_protect.targets[0].cr3 out of match. */
+    g_protect.targets[0].cr3 = real_cr3 + 0x1000;
     v->regs.rsi = dummy;
     v->regs.rcx = g_vmmcall_auth_cookie;
     v->vmcb->state.cr3 = real_cr3;
@@ -665,7 +665,7 @@ static NTSTATUS yghv_hook_resident_test(void) {
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
         LOG_ERROR("hook resident test: npt restore #2 FAILED");
-        g_protect.cr3 = real_cr3;
+        g_protect.targets[0].cr3 = real_cr3;
         yghv_protect_remove_hook(0);
         return STATUS_UNSUCCESSFUL;
     }
@@ -682,7 +682,7 @@ static NTSTATUS yghv_hook_resident_test(void) {
     yghv_trace_u64("hook resident deny", v->regs.rdx);
     if (v->regs.rdx != 0xC0000022ULL)
         ok = 0;
-    g_protect.cr3 = real_cr3;
+    g_protect.targets[0].cr3 = real_cr3;
 
     st = yghv_protect_remove_hook(0);
     yghv_trace_u64("hook resident remove", (uint64_t)st);
@@ -770,7 +770,7 @@ static NTSTATUS yghv_real_hook_test(void) {
         LOG_ERROR("real hook test: set_target FAILED 0x%x", st);
         return st;
     }
-    real_cr3 = g_protect.cr3;
+    real_cr3 = g_protect.targets[0].cr3;
 
     /* install/remove validation on the handle-open function first. */
     if (yghv_protect_install_hook(1, open)) {
@@ -798,14 +798,14 @@ static NTSTATUS yghv_real_hook_test(void) {
         if (st == 0xC0000022L)
             ok = 0;
 
-        /* Deny: shift g_protect.cr3 out of match, guest CR3 stays real. */
-        g_protect.cr3 = real_cr3 + 0x1000;
+        /* Deny: shift g_protect.targets[0].cr3 out of match, guest CR3 stays real. */
+        g_protect.targets[0].cr3 = real_cr3 + 0x1000;
         deny_st = fn((HANDLE)(ULONG_PTR)0xDEADBEEFULL);
         LOG_ERROR("real hook test: deny st=0x%x", deny_st);
         yghv_trace_u64("real hook deny", (uint64_t)deny_st);
         if (deny_st != 0xC0000022L)
             ok = 0;
-        g_protect.cr3 = real_cr3;
+        g_protect.targets[0].cr3 = real_cr3;
 
         st = yghv_protect_remove_hook(0);
         if (!NT_SUCCESS(st)) {
@@ -1687,7 +1687,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             svm_vcpu_t *cv = g_vcpus[i];
             if (!cv) continue;
             cv->regs.rcx = g_vmmcall_auth_cookie;
-            cv->vmcb->state.cr3 = g_protect.cr3;
+            cv->vmcb->state.cr3 = g_protect.targets[0].cr3;
             cv->vmcb->control.general1_intercepts = INTERCEPT_CPUID;
             cv->vmcb->control.general2_intercepts =
                 INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
@@ -4026,7 +4026,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
             g_vcpus[i]->regs.rdi = 0;
             g_vcpus[i]->regs.rsi = 0;
         }
-        g_vcpus[i]->vmcb->state.cr3 = g_protect.cr3;
+        g_vcpus[i]->vmcb->state.cr3 = g_protect.targets[0].cr3;
 #else
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
 #endif
