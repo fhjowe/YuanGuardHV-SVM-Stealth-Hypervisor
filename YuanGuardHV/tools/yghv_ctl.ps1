@@ -178,7 +178,7 @@ if ($sysCommands -contains $Command.ToLower()) {
             }
             Set-Content -LiteralPath 'D:\aaaaaavm\yghv_service_sddl_backup.txt' `
                 -Value $backup -Encoding UTF8
-            $hardenSddl = 'D:(D;;SD;;;BA)(A;;CCLCSWRPWPDTLOCRRC;;;SY)' +
+            $hardenSddl = 'D:(D;;SDWP;;;BA)(A;;CCLCSWRPWPDTLOCRRC;;;SY)' +
                 '(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)' +
                 '(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)' +
                 'S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)'

@@ -29,6 +29,9 @@
 #ifndef YGHV_LOADER_STEALTH
 #define YGHV_LOADER_STEALTH 0
 #endif
+#ifndef YGHV_UNLOAD_GUARD
+#define YGHV_UNLOAD_GUARD 0
+#endif
 
 NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
@@ -3563,7 +3566,9 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 #if YGHV_LOADER_STEALTH
     yghv_loader_stealth(d, r);
 #endif
+#if !YGHV_UNLOAD_GUARD
     d->DriverUnload = DriverUnload;
+#endif
     d->Flags |= DRVO_LEGACY_DRIVER;
     LOG_INFO("DriverEntry start");
 

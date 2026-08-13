@@ -1782,3 +1782,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 待续：2C-3 内核侧防卸载（不注册 DriverUnload / 拦截 NtUnloadDriver）
   未做，风险高需独立门控评估；loader_stealth 默认关闭，产品化时再并入
   默认构建。
+
+### 9.120 2026-08-13 阶段 2C-3：内核侧防卸载门控实验（PASS）
+
+- `harden-service` 扩展：Deny ACE 由 `SD` 改为 `SDWP`（拒绝管理员
+  DELETE + STOP），实测 `sc stop yuanguard` 返回 error 5 且服务保持
+  RUNNING；`unharden-service` 恢复默认 SDDL 后 `sc stop` 正常。
+- 新增 `YGHV_UNLOAD_GUARD` 门控（`build.bat` 支持，默认 0）：开启时
+  DriverEntry 不注册 `DriverUnload`（`d->DriverUnload` 保持 NULL）。
+  门控版 SHA256
+  `8B147F299CACFFD653C15A255F33CD950EC884531CCDE0BC189F03FEC6F36109`
+  （归档 `D:\aaaaaavm\yuanguard_hv_unload_guard_20260813.sys`）实机验证：
+  - 加载 RUNNING，`state` 功能正常（active=1 page_count=2），无蓝屏；
+  - `sc stop` → 1052，服务变为 `NOT_STOPPABLE`；
+  - `unload_driver.ps1`（`NtUnloadDriver`）→ `0xC0000010`
+    （STATUS_INVALID_DEVICE_REQUEST），驱动保持加载。
+- 解除方式：重启（服务 `DEMAND_START` 不自动加载），重启后覆盖
+  `C:\yuanguard_hv.sys` 为稳定默认版即可恢复卸载能力。当前 C 盘仍为
+  门控版且驱动 RUNNING 不可卸载，待用户重启后恢复 `70888311...`。
+- 待办：loader_stealth 的 kd `!driver` 复核需内核调试会话；门控默认
+  关闭，产品化时再决定并入默认构建与卸载逃生通道。
