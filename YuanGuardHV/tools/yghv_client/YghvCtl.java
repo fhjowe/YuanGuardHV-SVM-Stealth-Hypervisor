@@ -1,5 +1,6 @@
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -21,6 +22,8 @@ public class YghvCtl {
     private static final int FN_CLEAR = 0x809;
     private static final int FN_SET_CONFIG = 0x80A;
     private static final int FN_GET_CONFIG = 0x80B;
+    private static final int FN_INSTALL_HOOK = 0x80C;
+    private static final int FN_REMOVE_HOOK = 0x80D;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);
@@ -194,6 +197,28 @@ public class YghvCtl {
         System.out.printf("config: deny_status=0x%X OK%n", value);
     }
 
+    private static byte[] hookInstall(String nameOrVa, long hookId) {
+        ByteBuffer b = ByteBuffer.allocate(144).order(ByteOrder.LITTLE_ENDIAN);
+        b.putInt((int) hookId);
+        b.putInt(0);
+        if (nameOrVa.startsWith("0x")) {
+            b.putLong(Long.decode(nameOrVa));
+        } else {
+            byte[] name = nameOrVa.getBytes(StandardCharsets.UTF_16LE);
+            if (name.length > 126) {
+                fail("INSTALL_HOOK name too long", 87);
+            }
+            b.position(16);
+            b.put(name);
+        }
+        return b.array();
+    }
+
+    private static byte[] hookRemove(long hookId) {
+        return ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+                .putInt((int) hookId).putInt(0).array();
+    }
+
     private static void setTarget(long pid) {
         check(ioctl(handle, FN_SET_TARGET, u32(pid), null), "SET_TARGET");
         System.out.println("set-target: pid=" + pid + " OK");
@@ -286,6 +311,8 @@ public class YghvCtl {
         System.out.println("  YghvCtl target");
         System.out.println("  YghvCtl list-pages");
         System.out.println("  YghvCtl list-hooks");
+        System.out.println("  YghvCtl install-hook <name|hex_va> [hook_id]");
+        System.out.println("  YghvCtl remove-hook <hook_id>");
         System.out.println("  YghvCtl clear");
         System.out.println("  YghvCtl config [auto-disarm <0|1> | deny-status <hex>]");
         System.out.println("  YghvCtl list-java");
@@ -370,6 +397,31 @@ public class YghvCtl {
                         close();
                     }
                     break;
+                case "install-hook": {
+                    long hid = args.length > 2 ? Long.parseLong(args[2]) : 2;
+                    open();
+                    try {
+                        check(ioctl(handle, FN_INSTALL_HOOK,
+                                hookInstall(args[1], hid), null), "INSTALL_HOOK");
+                        System.out.println("install-hook: id=" + hid +
+                                " target=" + args[1] + " OK");
+                    } finally {
+                        close();
+                    }
+                    break;
+                }
+                case "remove-hook": {
+                    long hid = Long.parseLong(args[1]);
+                    open();
+                    try {
+                        check(ioctl(handle, FN_REMOVE_HOOK,
+                                hookRemove(hid), null), "REMOVE_HOOK");
+                        System.out.println("remove-hook: id=" + hid + " OK");
+                    } finally {
+                        close();
+                    }
+                    break;
+                }
                 case "clear":
                     open();
                     try {

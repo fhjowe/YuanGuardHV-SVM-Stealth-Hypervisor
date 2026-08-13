@@ -12,6 +12,8 @@ Commands:
   target
   list-pages
   list-hooks
+  install-hook <name|hex_va> [hook_id]
+  remove-hook <hook_id>
   clear
   config [auto-disarm <0|1> | deny-status <hex>]
   selftest
@@ -245,6 +247,23 @@ function Read-YghvConfig {
     }
 }
 
+function New-YghvHookInstallBuffer {
+    param([string]$NameOrVa, [uint32]$HookId)
+    $buf = New-Object byte[] 144
+    [BitConverter]::GetBytes($HookId).CopyTo($buf, 0)
+    if ($NameOrVa -match '^0x') {
+        $va = [Convert]::ToUInt64($NameOrVa.Substring(2), 16)
+        [BitConverter]::GetBytes([uint64]$va).CopyTo($buf, 8)
+    } else {
+        if ($NameOrVa.Length -gt 63) {
+            throw 'install-hook: name too long (max 63 chars)'
+        }
+        $bytes = [System.Text.Encoding]::Unicode.GetBytes($NameOrVa)
+        $bytes.CopyTo($buf, 16)
+    }
+    return $buf
+}
+
 try {
     switch ($Command.ToLower()) {
         'state' {
@@ -298,6 +317,21 @@ try {
                 Write-Host ("  id={0} va={1} installed={2} patch_len={3}" -f
                     $h.hookId, $h.funcVa, $h.installed, $h.patchLen)
             }
+        }
+        'install-hook' {
+            $hid = if ($null -eq $Arg2) { [uint32]2 } else { [uint32]::Parse($Arg2) }
+            $buf = New-YghvHookInstallBuffer -NameOrVa $Arg1 -HookId $hid
+            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80C)) `
+                -InBytes $buf | Out-Null
+            Write-Host ("install-hook: id={0} target={1} OK" -f $hid, $Arg1)
+        }
+        'remove-hook' {
+            $hid = [uint32]::Parse($Arg1)
+            $buf = New-Object byte[] 8
+            [BitConverter]::GetBytes($hid).CopyTo($buf, 0)
+            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80D)) `
+                -InBytes $buf | Out-Null
+            Write-Host ("remove-hook: id={0} OK" -f $hid)
         }
         'clear' {
             Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x809)) | Out-Null

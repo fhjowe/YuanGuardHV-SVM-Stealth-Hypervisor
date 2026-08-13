@@ -83,6 +83,18 @@ typedef struct {
     yghv_protect_hook_info_t hooks[YGHV_PROTECT_MAX_HOOKS];
 } yghv_protect_hooks_info_t;
 
+typedef struct {
+    ULONG hook_id;
+    ULONG flags;
+    ULONG_PTR func_va;
+    WCHAR name[64];
+} yghv_protect_install_hook_info_t;
+
+typedef struct {
+    ULONG hook_id;
+    ULONG reserved;
+} yghv_protect_remove_hook_info_t;
+
 typedef enum {
     YGHV_NPF_NONE = 0,
     YGHV_NPF_ALLOW,

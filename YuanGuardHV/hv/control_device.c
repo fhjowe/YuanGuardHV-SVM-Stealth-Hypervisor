@@ -5,6 +5,7 @@
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
+NTKERNELAPI HANDLE PsGetProcessId(PEPROCESS Process);
 NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
 
@@ -244,6 +245,70 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         }
         yghv_protect_get_config(out);
         info = sizeof(*out);
+        break;
+    }
+    case IOCTL_YGHV_INSTALL_HOOK: {
+        yghv_protect_install_hook_info_t *in =
+            (yghv_protect_install_hook_info_t *)buf;
+        PEPROCESS req_proc = IoGetRequestorProcess(irp);
+        uint64_t caller_cr3 = req_proc ?
+            *(volatile uint64_t *)((uint8_t *)req_proc + 0x028) : 0;
+        uint64_t va;
+        BOOLEAN terminated = FALSE;
+        ULONG i;
+        if (in_len < sizeof(*in)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (in->hook_id >= YGHV_PROTECT_MAX_HOOKS) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (!yghv_protect_is_target_cr3(caller_cr3)) {
+            status = yghv_protect_set_target(
+                (uint32_t)(ULONG_PTR)PsGetProcessId(req_proc));
+            if (!NT_SUCCESS(status))
+                break;
+        }
+        for (i = 0; i < 64; i++) {
+            if (in->name[i] == 0) {
+                terminated = TRUE;
+                break;
+            }
+        }
+        if (!terminated) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        va = in->func_va;
+        if (!va)
+            va = yghv_protect_find_func_pattern(in->name, NULL, 0);
+        if (!va) {
+            status = STATUS_NOT_FOUND;
+            break;
+        }
+        status = yghv_protect_install_hook((uint8_t)in->hook_id, va);
+        break;
+    }
+    case IOCTL_YGHV_REMOVE_HOOK: {
+        yghv_protect_remove_hook_info_t *in =
+            (yghv_protect_remove_hook_info_t *)buf;
+        PEPROCESS req_proc = IoGetRequestorProcess(irp);
+        uint64_t caller_cr3 = req_proc ?
+            *(volatile uint64_t *)((uint8_t *)req_proc + 0x028) : 0;
+        if (in_len < sizeof(*in)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (in->hook_id >= YGHV_PROTECT_MAX_HOOKS) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        if (!yghv_protect_is_target_cr3(caller_cr3)) {
+            status = STATUS_ACCESS_DENIED;
+            break;
+        }
+        status = yghv_protect_remove_hook((uint8_t)in->hook_id);
         break;
     }
     default:

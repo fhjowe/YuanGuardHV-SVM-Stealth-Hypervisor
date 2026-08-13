@@ -1676,3 +1676,35 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B`，
   服务 STOPPED。提交包含驱动、`control_ioctl.h`、PowerShell/Java 客户端
   源码与交接文档；Java `.class`/JNI DLL 不入库。
+
+### 9.117 2026-08-13 阶段 2B-2：真实 hook 接入控制面（PASS）
+
+- 新增 IOCTL：`INSTALL_HOOK 0x80C` / `REMOVE_HOOK 0x80D`。
+  `yghv_protect_install_hook_info_t`（hook_id/flags/func_va/name[64]，
+  支持按导出名或 VA 安装）、`yghv_protect_remove_hook_info_t`。
+- 安全绑定：`INSTALL_HOOK` 若调用者 CR3 不是当前 target，自动
+  `yghv_protect_set_target(调用者)`（等价“保护当前进程”，与 P0 只能设
+  自己一致，但会清空原有保护页）；`REMOVE_HOOK` 严格要求调用者就是
+  当前 target，否则 `STATUS_ACCESS_DENIED`；名字未以 null 结尾返回
+  `STATUS_INVALID_PARAMETER`。
+- 客户端：PowerShell/Java 新增
+  `install-hook <name|hex_va> [hook_id]`（默认 hook_id=2）和
+  `remove-hook <hook_id>`；`list-hooks` 复用。
+- 实机验证（新默认版 SHA256
+  `FB410209D9D15736C850B21DF3FC2A3AE93EF0951738FF010595444299D5B5C7`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_hookctl_20260813.sys`）：
+  - 后台存活 PowerShell 进程 `install-hook ZwOpenProcess 1`，期间
+    `list-hooks` 显示 id=0 dummy + id=1 ZwOpenProcess（真实地址），
+    `remove-hook 1` 后恢复；调用者进程退出后 heartbeat 自动清理 target，
+    `state/target` 回 active=0 pid=0 page_count=0；
+  - Java `install-hook ZwTerminateProcess 3` OK；全程无冻结。
+- 语义确认：hook 目标是内核 `Zw*` 入口（内核态调用路径），用户态
+  syscall 不走该入口；allow/deny 决策语义已在 9.115 门控真实 hook 测试
+  验证（原生调用 allow 返回正常错误码、deny 返回 deny_status）。
+- 已知限制（延续记录）：dummy hook 0 在切换 target/clear 后可能残留；
+  INSTALL_HOOK 自动切换 target 会清空原保护页，需要先
+  `sc stop/start` 恢复默认持久保护；remove 的全核心 pause 锁序优化
+  留待后续阶段。
+- 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
+  `70888311...`，服务 STOPPED；本轮提交驱动、`control_ioctl.h`、客户端
+  源码与交接文档。
