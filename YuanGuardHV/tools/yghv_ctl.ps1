@@ -10,6 +10,7 @@ Commands:
   start
   stop
   target
+  list-targets
   list-pages
   list-hooks
   install-hook <name|hex_va> [hook_id]
@@ -296,6 +297,26 @@ function Read-YghvHooks {
     return @{ returned = $returned; hooks = $hooks }
 }
 
+function Read-YghvTargets {
+    $buf = New-Object byte[] 104
+    [BitConverter]::GetBytes([uint32]4).CopyTo($buf, 0)
+    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80E)) `
+        -InBytes $buf -OutputLength 104
+    $returned = [BitConverter]::ToUInt32($out, 4)
+    $targets = @()
+    for ($i = 0; $i -lt $returned; $i++) {
+        $base = 8 + $i * 24
+        $targets += [pscustomobject]@{
+            active    = [BitConverter]::ToUInt32($out, $base)
+            pid       = [BitConverter]::ToUInt32($out, $base + 4)
+            pageCount = [BitConverter]::ToUInt32($out, $base + 8)
+            hookCount = [BitConverter]::ToUInt32($out, $base + 12)
+            cr3       = [BitConverter]::ToUInt64($out, $base + 16)
+        }
+    }
+    return @{ returned = $returned; targets = $targets }
+}
+
 function Read-YghvConfig {
     $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80B)) -OutputLength 8
     return @{
@@ -358,6 +379,14 @@ try {
             $t = Read-YghvTarget
             Write-Host ("target: active={0} pid={1} cr3=0x{2:X} page_count={3} hook_count={4}" -f
                 $t.active, $t.pid, $t.cr3, $t.pageCount, $t.hookCount)
+        }
+        'list-targets' {
+            $r = Read-YghvTargets
+            Write-Host ("list-targets: returned={0}" -f $r.returned)
+            foreach ($t in $r.targets) {
+                Write-Host ("  active={0} pid={1} cr3=0x{2:X} pages={3} hooks={4}" -f
+                    $t.active, $t.pid, $t.cr3, $t.pageCount, $t.hookCount)
+            }
         }
         'list-pages' {
             $r = Read-YghvPages
@@ -440,23 +469,23 @@ try {
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x800)) `
                     -InBytes ([BitConverter]::GetBytes([uint32]$pidVal)) | Out-Null
                 Write-Host 'selftest: set-target OK'
-                $st = Read-YghvState
-                if ($st.pageCount -ne 0) {
-                    throw ("selftest: set-target did not clear pages (page_count={0})" -f
-                        $st.pageCount)
+                $targets = Read-YghvTargets
+                $mySlot = $targets.targets | Where-Object { $_.pid -eq $pidVal }
+                if ($null -eq $mySlot -or $mySlot.pageCount -ne 0) {
+                    throw 'selftest: own target slot not registered/empty'
                 }
 
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x801)) `
                     -InBytes ([BitConverter]::GetBytes([uint64]$addr)) | Out-Null
                 Write-Host 'selftest: add-page OK'
-                $st = Read-YghvState
-                if ($st.pageCount -ne 1) {
-                    throw ("selftest: add-page did not register (page_count={0})" -f
-                        $st.pageCount)
+                $targets = Read-YghvTargets
+                $mySlot = $targets.targets | Where-Object { $_.pid -eq $pidVal }
+                if ($null -eq $mySlot -or $mySlot.pageCount -ne 1) {
+                    throw 'selftest: add-page did not register in own slot'
                 }
                 $pages = Read-YghvPages
-                if ($pages.returned -lt 1 -or
-                    $pages.pages[0].targetVa -ne ('0x{0:X}' -f $addr)) {
+                $addrText = '0x{0:X}' -f $addr
+                if (-not ($pages.pages.targetVa -contains $addrText)) {
                     throw ("selftest: list-pages mismatch (returned={0})" -f
                         $pages.returned)
                 }
@@ -466,9 +495,9 @@ try {
                 Write-Host 'selftest: start OK'
 
                 $st = Read-YghvState
-                if ($st.active -ne 1 -or $st.pageCount -ne 1 -or $st.pid -ne $pidVal) {
-                    throw ("selftest: state mismatch after start (active={0} pid={1} page_count={2})" -f
-                        $st.active, $st.pid, $st.pageCount)
+                if ($st.active -ne 1) {
+                    throw ("selftest: not active after start (active={0})" -f
+                        $st.active)
                 }
 
                 [Runtime.InteropServices.Marshal]::WriteInt64(
@@ -484,14 +513,13 @@ try {
                     -InBytes ([BitConverter]::GetBytes([uint64]$addr)) | Out-Null
 
                 $st = Read-YghvState
-                if ($st.active -ne 0 -or $st.pageCount -ne 0) {
-                    throw ("selftest: state mismatch after stop (active={0} page_count={1})" -f
-                        $st.active, $st.pageCount)
+                if ($st.active -ne 0) {
+                    throw ("selftest: still active after stop (active={0})" -f
+                        $st.active)
                 }
                 $pages = Read-YghvPages
-                if ($pages.returned -ne 0) {
-                    throw ("selftest: list-pages not empty after stop (returned={0})" -f
-                        $pages.returned)
+                if ($pages.pages.targetVa -contains $addrText) {
+                    throw 'selftest: own page still listed after remove'
                 }
                 Write-Host 'selftest: PASS'
             } finally {
@@ -509,9 +537,10 @@ try {
                     -InBytes ([BitConverter]::GetBytes([uint32]$childPid)) | Out-Null
                 Write-Host 'exit-test: set-target OK'
 
-                $st = Read-YghvState
-                if ($st.pid -ne $childPid) {
-                    throw ("exit-test: target not set (pid={0})" -f $st.pid)
+                $targets = Read-YghvTargets
+                $childSlot = $targets.targets | Where-Object { $_.pid -eq $childPid }
+                if ($null -eq $childSlot) {
+                    throw 'exit-test: child slot not registered'
                 }
 
                 $deadline = (Get-Date).AddSeconds(20)
@@ -527,15 +556,18 @@ try {
                 $deadline = (Get-Date).AddSeconds(10)
                 do {
                     Start-Sleep -Milliseconds 250
-                    $st = Read-YghvState
-                } while (($st.active -ne 0 -or $st.pid -ne 0) -and
+                    $targets = Read-YghvTargets
+                    $childSlot = $targets.targets |
+                        Where-Object { $_.pid -eq $childPid -and $_.cr3 -ne 0 }
+                } while ($null -ne $childSlot -and
                     (Get-Date) -lt $deadline)
-                if ($st.active -ne 0 -or $st.pid -ne 0) {
-                    throw ("exit-test: auto disarm not observed (active={0} pid={1} page_count={2})" -f
-                        $st.active, $st.pid, $st.pageCount)
+                $targets = Read-YghvTargets
+                $childSlot = $targets.targets |
+                    Where-Object { $_.pid -eq $childPid -and $_.cr3 -ne 0 }
+                if ($null -ne $childSlot) {
+                    throw 'exit-test: child slot auto disarm not observed'
                 }
-                Write-Host ("exit-test: PASS (active=0 pid=0 page_count={0})" -f
-                    $st.pageCount)
+                Write-Host 'exit-test: PASS (child slot auto cleared)'
             } finally {
                 if (-not $child.HasExited) {
                     Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue

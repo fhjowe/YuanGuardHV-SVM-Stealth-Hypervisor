@@ -154,20 +154,26 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
     }
     case IOCTL_YGHV_ADD_PAGE: {
         yghv_ioctl_va_t *in = (yghv_ioctl_va_t *)buf;
+        PEPROCESS req_proc = IoGetRequestorProcess(irp);
+        uint64_t caller_cr3 = req_proc ?
+            *(volatile uint64_t *)((uint8_t *)req_proc + 0x028) : 0;
         if (in_len < sizeof(*in)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
-        status = yghv_protect_add_page(in->target_va);
+        status = yghv_protect_add_page_for(caller_cr3, in->target_va);
         break;
     }
     case IOCTL_YGHV_REMOVE_PAGE: {
         yghv_ioctl_va_t *in = (yghv_ioctl_va_t *)buf;
+        PEPROCESS req_proc = IoGetRequestorProcess(irp);
+        uint64_t caller_cr3 = req_proc ?
+            *(volatile uint64_t *)((uint8_t *)req_proc + 0x028) : 0;
         if (in_len < sizeof(*in)) {
             status = STATUS_BUFFER_TOO_SMALL;
             break;
         }
-        status = yghv_protect_remove_page(in->target_va);
+        status = yghv_protect_remove_page_for(caller_cr3, in->target_va);
         break;
     }
     case IOCTL_YGHV_START_PROTECT:
@@ -222,6 +228,19 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         if (out->count > YGHV_PROTECT_MAX_HOOKS)
             out->count = YGHV_PROTECT_MAX_HOOKS;
         yghv_protect_get_hooks_info(out);
+        info = sizeof(*out);
+        break;
+    }
+    case IOCTL_YGHV_GET_TARGETS: {
+        yghv_protect_targets_info_t *out =
+            (yghv_protect_targets_info_t *)buf;
+        if (in_len < sizeof(*out) || out_len < sizeof(*out)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (out->count > YGHV_PROTECT_MAX_TARGETS)
+            out->count = YGHV_PROTECT_MAX_TARGETS;
+        yghv_protect_get_targets_info(out);
         info = sizeof(*out);
         break;
     }

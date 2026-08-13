@@ -24,6 +24,7 @@ public class YghvCtl {
     private static final int FN_GET_CONFIG = 0x80B;
     private static final int FN_INSTALL_HOOK = 0x80C;
     private static final int FN_REMOVE_HOOK = 0x80D;
+    private static final int FN_GET_TARGETS = 0x80E;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);
@@ -149,6 +150,29 @@ public class YghvCtl {
             b.getInt(); /* reserved */
             System.out.printf("  id=%d va=0x%X installed=%d patch_len=%d%n",
                     hookId, va, installed, patchLen);
+        }
+    }
+
+    private static void listTargets() {
+        byte[] buf = new byte[4 + 4 + 4 * 24];
+        ByteBuffer in = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+        in.putInt(4);
+        byte[] out = new byte[buf.length];
+        System.arraycopy(buf, 0, out, 0, buf.length);
+        check(ioctl(handle, FN_GET_TARGETS, out, out), "GET_TARGETS");
+        ByteBuffer b = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
+        b.getInt(); /* count */
+        int returned = b.getInt();
+        System.out.printf("list-targets: returned=%d%n", returned);
+        for (int i = 0; i < returned; i++) {
+            long active = Integer.toUnsignedLong(b.getInt());
+            long pid = Integer.toUnsignedLong(b.getInt());
+            long pageCount = Integer.toUnsignedLong(b.getInt());
+            long hookCount = Integer.toUnsignedLong(b.getInt());
+            long cr3 = b.getLong();
+            System.out.printf(
+                    "  active=%d pid=%d cr3=0x%X pages=%d hooks=%d%n",
+                    active, pid, cr3, pageCount, hookCount);
         }
     }
 
@@ -309,6 +333,7 @@ public class YghvCtl {
         System.out.println("  YghvCtl start");
         System.out.println("  YghvCtl stop");
         System.out.println("  YghvCtl target");
+        System.out.println("  YghvCtl list-targets");
         System.out.println("  YghvCtl list-pages");
         System.out.println("  YghvCtl list-hooks");
         System.out.println("  YghvCtl install-hook <name|hex_va> [hook_id]");
@@ -377,6 +402,14 @@ public class YghvCtl {
                     open();
                     try {
                         printTarget();
+                    } finally {
+                        close();
+                    }
+                    break;
+                case "list-targets":
+                    open();
+                    try {
+                        listTargets();
                     } finally {
                         close();
                     }

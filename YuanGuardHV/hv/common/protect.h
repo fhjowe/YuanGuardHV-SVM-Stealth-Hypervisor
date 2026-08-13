@@ -62,6 +62,12 @@ typedef struct {
 } yghv_protect_target_info_t;
 
 typedef struct {
+    ULONG count;
+    ULONG returned;
+    yghv_protect_target_info_t targets[YGHV_PROTECT_MAX_TARGETS];
+} yghv_protect_targets_info_t;
+
+typedef struct {
     uint64_t gpa;
     uint64_t target_va;
     uint8_t  flags;
@@ -113,6 +119,8 @@ NTSTATUS yghv_protect_set_target(uint32_t pid);
 BOOLEAN yghv_protect_is_target_cr3(uint64_t cr3);
 NTSTATUS yghv_protect_add_page(uint64_t target_va);
 NTSTATUS yghv_protect_remove_page(uint64_t target_va);
+NTSTATUS yghv_protect_add_page_for(uint64_t cr3, uint64_t target_va);
+NTSTATUS yghv_protect_remove_page_for(uint64_t cr3, uint64_t target_va);
 yghv_protect_page_t *yghv_protect_find_page(uint64_t gpa);
 int yghv_protect_arm_page(yghv_protect_page_t *p);
 int yghv_protect_disarm_page(yghv_protect_page_t *p);
@@ -129,6 +137,7 @@ void yghv_protect_get_state(ULONG *active, ULONG *pid, ULONG *page_count);
 void yghv_protect_get_heartbeat(uint64_t *page_va, uint64_t *hook_va);
 void yghv_protect_get_target(ULONG *active, ULONG *pid, ULONG_PTR *cr3,
     ULONG *page_count, ULONG *hook_count);
+void yghv_protect_get_targets_info(yghv_protect_targets_info_t *info);
 void yghv_protect_get_pages_info(yghv_protect_pages_info_t *info);
 void yghv_protect_get_hooks_info(yghv_protect_hooks_info_t *info);
 NTSTATUS yghv_protect_clear(void);

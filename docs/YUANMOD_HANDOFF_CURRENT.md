@@ -1847,3 +1847,33 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   无冻结。
 - 收尾：C 盘恢复稳定默认版 `70888311...`，服务 STOPPED；下一步
   2B-3-b 开放多目标（按 cr3 绑定槽、stub 遍历、list-targets）。
+
+### 9.124 2026-08-13 2B-3-b 完整多目标（b1+b2 合并，PASS）
+
+- 目标槽注册：`yghv_protect_set_target` 按 pid 查找/分配槽（槽 0 保留给
+  System 基架，客户端从槽 1 起），`target_count` 上限 4。
+- 控制面按 CR3 绑定：新增 `add_page_for/remove_page_for`，ADD/REMOVE_PAGE
+  IOCTL 用调用者 CR3 选槽；旧 API 包装槽 0 供自测/持久保护。
+- NPF/决策跨槽：`is_target_cr3`/`find_page` 遍历全部槽，start/stop 遍历
+  全部槽，`on_target_exit` 按 pid 清对应槽（hooks 全局，不再随目标退出
+  自动移除），`clear` 清空全部槽并把 `target_count` 复位为 1。
+- hook stub 多目标：改为 unrolled 遍历 `targets[0..3].cr3`（按
+  `sizeof(yghv_protect_target_t)` 步长 disp32 读取，动态生效），orig slot
+  移到 0x90；不再依赖需刷新的 cr3_list。
+- 新增 `GET_TARGETS 0x80E` + PowerShell/Java `list-targets`；`selftest`
+  与 `exit-test` 改为多目标语义（自己槽 page_count、list-pages 包含
+  addr、child 槽 auto cleared）。
+- 实机验证（SHA256
+  `14253486481881910CC19EE8CD64AE70E7BB1CADDCBE810462AB91F8359C3F9E`，
+  归档 `D:\aaaaaavm\yuanguard_hv_multi_target_20260813.sys`）：启动自测
+  hook resident deny=0xC0000022 PASS；`selftest`/`exit-test` PASS；
+  双后台进程各注册槽 + install-hook 共存（list-targets 显示 System+客户端
+  槽、list-hooks 双 hook）；后台退出自动清槽；`clear` 清空全部槽与 hooks；
+  服务重启恢复默认保护；Java `list-targets/state` PASS；无冻结。
+- 已知限制（记录待办）：`g_hook_patch_active` 补丁互斥可能因后台进程在
+  install 期间异常退出而残留，后续 install 返回 `ERROR_BUSY`，需重启驱动
+  恢复（建议后续加超时/owner 清理）；hooks 为全局表，目标退出不自动
+  移除；install_hook 的 hook 函数页计入槽 0。
+- 收尾：`sc stop yuanguard`，C 盘恢复稳定默认版 `70888311...`，服务
+  STOPPED；提交 6 个文件（control_ioctl.h、protect.h、control_device.c、
+  protect.c、YghvCtl.java、yghv_ctl.ps1）+ 交接文档。
