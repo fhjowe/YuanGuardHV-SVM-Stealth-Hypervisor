@@ -6,6 +6,13 @@ set "HV_DIR=%PROJECT_DIR%hv"
 set "BIN_DIR=%PROJECT_DIR%bin"
 set "WDK_ROOT=C:\Program Files (x86)\Windows Kits\10"
 
+echo [YuanGuardHV] Running static checks...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_DIR%tests\run_static_checks.ps1"
+if errorlevel 1 (
+    echo [ERROR] Static checks failed
+    exit /b 1
+)
+
 if not exist "%BIN_DIR%" mkdir "%BIN_DIR%"
 
 echo [YuanGuardHV] Building AMD-V Hypervisor Driver...

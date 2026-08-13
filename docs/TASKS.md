@@ -31,6 +31,10 @@
 > 2026-08-13 9.133 tests/ 静态校验脚本 PASS：接口/命令/安全红线校验
 > 全部通过（详见 `YUANMOD_HANDOFF_CURRENT.md` 9.133）。
 
+> 2026-08-13 9.134 build.bat 已接入静态校验：编译前自动运行
+> `tests/run_static_checks.ps1`，失败即中止（详见
+> `YUANMOD_HANDOFF_CURRENT.md` 9.134）。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）

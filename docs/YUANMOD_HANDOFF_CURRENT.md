@@ -2047,3 +2047,14 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   限定已知两函数、无 `STATUS_DEVICE_BUSY`、0x5AA 命名正确、README
   包含 unprotect/scan）。
 - 收尾：未加载驱动、未跑 hook 路径；提交。
+
+### 9.134 2026-08-13 build.bat 接入静态校验（PASS）
+
+- 用户确认执行：`YuanGuardHV/build.bat` 编译前调用
+  `tests\run_static_checks.ps1`，校验失败即中止构建。
+- 验证：`cmd /c build.bat` 输出先为静态校验 PASS，再编译/链接/签名
+  SUCCESS；新构建 SHA256
+  `50FC9809D69528F9135D7F0B5653A24CD9AB98CBC0CE9DFEA4D9C390FDB80555`。
+- 同步 `docs/YUANMOD_NEXT_WINDOW_PROMPT.md` 到 HEAD `d4079bc`/9.133。
+- 收尾：未加载驱动、未跑 hook 路径；`YuanGuardHV/bin` 为构建验证
+  产物（忽略文件，未清理）；提交。
