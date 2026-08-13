@@ -1746,3 +1746,39 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 当前状态：C 盘恢复稳定默认版 `70888311...`，服务 STOPPED；工作区
   `protect.c` 已回退，无锁序实验代码残留。docs 中 9.115-9.117 Codex
   恢复记录为用户工作区已有内容，保留未动。
+
+### 9.118 2026-08-13 桌面新增在线注入脚本
+
+- 新增 `restore-live-inject.ps1` / `restore-live-inject.cmd`：Codex 已打开但项目消失时，通过调试端口 9229 调用 `add-workspace-root-option` 注入 D:\mcmodwork、D:\yuanguard。
+- 已测试幂等：项目已存在时自动跳过，不会重复创建。
+- 使用方式：Codex 运行中直接双击 `restore-live-inject.cmd`；磁盘恢复仍用 `restore-codex-projects.cmd`。
+
+### 9.119 2026-08-13 阶段 2C：loader_stealth 接线 + 服务持久化/防卸载（PASS）
+
+- 2C-1 `loader_stealth` 接线：`build.bat` 把 `loader_stealth.c` 纳入编译
+  与链接；`main.c` 新增 `YGHV_LOADER_STEALTH` 门控（默认 0），开启时
+  DriverEntry 最早调用 `yghv_loader_stealth`（从 `PsLoadedModuleList`
+  摘链并清模块名）。`loader_stealth.c` 补 `<stdint.h>`、去掉重复
+  `YGHV_DEBUG_LOG` 定义。门控版 SHA256
+  `7B9CEECB37129839536B6437AC405BA0AAAC0551C4A3826612158797B51B5034`
+  （归档 `D:\aaaaaavm\yuanguard_hv_loader_stealth_20260813.sys`）实机
+  加载 RUNNING，`state/list-hooks` 正常，无蓝屏；模块列表隐藏效果需
+  kd `!driver yuanguard` 复核，后续窗口记录。
+- 2C-2 服务持久化/防卸载（`yghv_ctl.ps1`）：
+  - `set-auto-start` / `unset-auto-start`：`sc config yuanguard start=
+    auto/demand`，实机验证注册表 `Start` 2↔3；
+  - `harden-service`：先 `sc sdshow` 备份 SDDL 到
+    `D:\aaaaaavm\yghv_service_sddl_backup.txt`，再用 `sc sdset` 加
+    `(D;;SD;;;BA)` Deny DELETE；实测 `sc delete yuanguard` 返回 error 5
+    Access denied，服务保留；
+  - `unharden-service`：用备份 SDDL 恢复，实测恢复默认 SDDL。
+- 方案更正：注册表键 ACL 防删对 SCM 无效（services.exe 已持有键句柄，
+  DeleteService 不重新 AccessCheck），已弃用改为 `sc sdset` 服务安全
+  描述符。
+- 收尾：C 盘恢复稳定默认版 `70888311...`，服务 STOPPED（demand、
+  unharden）；工作区提交 build.bat、loader_stealth.c、main.c、
+  yghv_ctl.ps1 与交接文档（docs 同时包含用户工作区已有的 9.118 Codex
+  在线注入记录）。
+- 待续：2C-3 内核侧防卸载（不注册 DriverUnload / 拦截 NtUnloadDriver）
+  未做，风险高需独立门控评估；loader_stealth 默认关闭，产品化时再并入
+  默认构建。

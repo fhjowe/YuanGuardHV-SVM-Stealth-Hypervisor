@@ -26,9 +26,14 @@
 #ifndef YGHV_HOOK_RENDEZVOUS_TEST
 #define YGHV_HOOK_RENDEZVOUS_TEST 0
 #endif
+#ifndef YGHV_LOADER_STEALTH
+#define YGHV_LOADER_STEALTH 0
+#endif
 
 NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
+NTSTATUS yghv_loader_stealth(PDRIVER_OBJECT DriverObject,
+                             PUNICODE_STRING RegistryPath);
 
 npt_mgr_t g_npt;
 uint64_t g_npt_test_pa;
@@ -3555,6 +3560,9 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     ULONG i;
     ULONG online;
 
+#if YGHV_LOADER_STEALTH
+    yghv_loader_stealth(d, r);
+#endif
     d->DriverUnload = DriverUnload;
     d->Flags |= DRVO_LEGACY_DRIVER;
     LOG_INFO("DriverEntry start");

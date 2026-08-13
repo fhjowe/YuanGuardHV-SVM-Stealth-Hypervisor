@@ -1,7 +1,6 @@
 #include <ntddk.h>
+#include <stdint.h>
 #include "debug.h"
-
-#define YGHV_DEBUG_LOG
 
 /*
  * ponytail: minimal stealth. Unlink from PsLoadedModuleList.

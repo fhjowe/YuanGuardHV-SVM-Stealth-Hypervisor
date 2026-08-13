@@ -16,6 +16,10 @@ Commands:
   remove-hook <hook_id>
   clear
   config [auto-disarm <0|1> | deny-status <hex>]
+  set-auto-start
+  unset-auto-start
+  harden-service
+  unharden-service
   selftest
   exit-test
 #>
@@ -146,6 +150,59 @@ public static class YghvPrivilege
 
 if (-not [YghvPrivilege]::EnableSeDebugPrivilege()) {
     throw 'Unable to enable SeDebugPrivilege. Run this script from an elevated PowerShell session.'
+}
+
+$sysCommands = @('set-auto-start', 'unset-auto-start', 'harden-service', 'unharden-service')
+if ($sysCommands -contains $Command.ToLower()) {
+    switch ($Command.ToLower()) {
+        'set-auto-start' {
+            & sc.exe config yuanguard start= auto | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw ("set-auto-start: sc config failed rc={0}" -f $LASTEXITCODE)
+            }
+            Write-Host 'set-auto-start: OK (start=auto)'
+            exit 0
+        }
+        'unset-auto-start' {
+            & sc.exe config yuanguard start= demand | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                throw ("unset-auto-start: sc config failed rc={0}" -f $LASTEXITCODE)
+            }
+            Write-Host 'unset-auto-start: OK (start=demand)'
+            exit 0
+        }
+        'harden-service' {
+            $backup = (& sc.exe sdshow yuanguard | Select-Object -Last 1).Trim()
+            if (-not $backup) {
+                throw 'harden-service: sdshow returned nothing'
+            }
+            Set-Content -LiteralPath 'D:\aaaaaavm\yghv_service_sddl_backup.txt' `
+                -Value $backup -Encoding UTF8
+            $hardenSddl = 'D:(D;;SD;;;BA)(A;;CCLCSWRPWPDTLOCRRC;;;SY)' +
+                '(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)' +
+                '(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)' +
+                'S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)'
+            $out = & sc.exe sdset yuanguard $hardenSddl
+            if (($out -join ' ') -notmatch 'SUCCESS') {
+                throw ("harden-service: sdset failed: {0}" -f ($out -join ' '))
+            }
+            Write-Host 'harden-service: OK (service delete denied, backup saved)'
+            exit 0
+        }
+        'unharden-service' {
+            $backupPath = 'D:\aaaaaavm\yghv_service_sddl_backup.txt'
+            if (-not (Test-Path $backupPath)) {
+                throw 'unharden-service: backup SDDL not found'
+            }
+            $backup = (Get-Content -LiteralPath $backupPath -Raw).Trim()
+            $out = & sc.exe sdset yuanguard $backup
+            if (($out -join ' ') -notmatch 'SUCCESS') {
+                throw ("unharden-service: sdset failed: {0}" -f ($out -join ' '))
+            }
+            Write-Host 'unharden-service: OK (backup SDDL restored)'
+            exit 0
+        }
+    }
 }
 
 $devicePath = '\\.\YuanGuardHV'
