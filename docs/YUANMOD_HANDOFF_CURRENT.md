@@ -1811,3 +1811,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 2C-3 防卸载门控实验闭环：门控版唯一卸载通道为重启，重启后恢复正常
   加载/卸载能力；该门控保持默认关闭，产品化时再设计逃生通道。
 - 当前机器安全基线恢复，工作区干净，HEAD `1cecd2f`。
+
+### 9.122 2026-08-13 综合回归收尾（2B-1/2B-2/2C 全套 PASS）
+
+- 最新默认构建（无 `YGHV_LOADER_STEALTH`/`YGHV_UNLOAD_GUARD` 门控）
+  SHA256 `8A9734CA2E0A8B9C7DD94854F2F8660747413F570C7A06AD0256C41E6F0059F5`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_full_20260813.sys`。
+- 实机回归清单全部 PASS：`state/target/list-pages/list-hooks/config`
+  读取；`config` stop 后 `auto-disarm 0/1` 与 `deny-status` 设置/恢复；
+  `selftest`（含 list-pages 校验）；`exit-test`（target 退出自动 disarm）；
+  后台进程 `install-hook ZwOpenProcess` → `list-hooks` 可见 →
+  `remove-hook` → 清理；`clear`；`set-auto-start/unset-auto-start`
+  （Start 2↔3）；服务重启后默认持久保护恢复 2 页；Java
+  `config/target/list-pages/list-hooks/install-hook` 全 PASS；全程无冻结。
+- 已知限制不变：`clear` 后 `hook_count=1` 残留（remove 全核心 pause 锁序
+  问题，待 2B-3-b/换平台处理）。
+- 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
+  `70888311...`，服务 STOPPED；下一步进入 2B-3-a 多目标状态结构重构
+  （保持单目标行为，先回归再开放多目标）。
