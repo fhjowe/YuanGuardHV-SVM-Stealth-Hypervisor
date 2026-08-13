@@ -1958,3 +1958,27 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 下一步不变：hook 路径（锁序/ERROR_BUSY/真实多目标语义）换平台或
   硬件调试器；loader_stealth 的 kd `!driver` 复核待内核调试会话；
   R1/NPT 权限收紧待裸机/KVM。
+
+### 9.129 2026-08-13 hook 静态分析与新窗口提示同步（只读）
+
+- 用户确认执行：同步 `docs/YUANMOD_NEXT_WINDOW_PROMPT.md` 到最新状态；
+  对 hook 锁序与 0x5AA 做只读静态分析，输出不改机修复方案。
+- 0x5AA 更正：实测 `RtlNtStatusToDosError(0xC000009A)` 返回 0x5AA，
+  Win32 文本为 `ERROR_NO_SYSTEM_RESOURCES`（1450），不是
+  `ERROR_BUSY`（170）；全仓库无 `STATUS_DEVICE_BUSY`/直接 0x5AA
+  返回点。
+- 候选来源：`protect.c:249` 目标表满（install 自动 set_target 时最
+  常见）、`protect.c:1071` hook stub 池分配失败、`npt_core.c:91`
+  split 页表分配失败、`control_device.c:82` CreateFile 上下文分配
+  失败、`protect.c:314` 目标页表满。
+- 死锁：install/remove 持 `g_protect_lock` 内 pause；NPF 写路径取同一
+  锁，AB-BA 窗口与 5 秒超时/硬冻结一致；clear 持锁逐个 remove_hook，
+  pause 失败不清 `h->installed`，导致 hook_count 残留 1。
+- 修复方案（仅文档，不改驱动）：patch 互斥 -> 资源准备 -> pause ->
+  取锁修改 -> resume；clear 单次 pause 后无条件清 hook 槽；预分配
+  hook stub、明确目标表满语义、扩展 yghv_hook_diag 阶段。
+- 新增
+  `docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md`；同步
+  `docs/YUANMOD_NEXT_WINDOW_PROMPT.md`（HEAD 0268a81、9.128 状态、
+  9.129 更新版）。
+- 收尾：未加载驱动、未跑 hook 路径、无代码改动；提交文档。
