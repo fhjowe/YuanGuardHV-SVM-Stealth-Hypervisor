@@ -1802,3 +1802,12 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   门控版且驱动 RUNNING 不可卸载，待用户重启后恢复 `70888311...`。
 - 待办：loader_stealth 的 kd `!driver` 复核需内核调试会话；门控默认
   关闭，产品化时再决定并入默认构建与卸载逃生通道。
+
+### 9.121 2026-08-13 重启后恢复稳定基线
+
+- 用户重启完成：`yuanguard` 服务 STOPPED（`DEMAND_START` 未自动加载），
+  `C:\yuanguard_hv.sys` 已从 2C-3 门控版 `8B147F29...` 恢复为稳定默认版
+  `70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B`。
+- 2C-3 防卸载门控实验闭环：门控版唯一卸载通道为重启，重启后恢复正常
+  加载/卸载能力；该门控保持默认关闭，产品化时再设计逃生通道。
+- 当前机器安全基线恢复，工作区干净，HEAD `1cecd2f`。
