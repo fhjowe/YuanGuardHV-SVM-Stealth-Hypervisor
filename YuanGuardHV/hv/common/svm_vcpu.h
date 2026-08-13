@@ -171,6 +171,12 @@ typedef struct {
     volatile LONG pause_ack;
     KEVENT pause_done_event;
     KEVENT resume_event;
+
+    /* Synthetic resident guests need a stack that stays mapped in NPT
+       (the host stack is hypervisor-private and R1-excluded). Kept at the
+       end so earlier fixed offsets used by the trampoline stay stable. */
+    void *guest_stack;
+    uint64_t guest_stack_pa;
 } svm_vcpu_t;
 
 extern svm_vcpu_t *g_vcpus[SVM_MAX_CORES];

@@ -10,6 +10,11 @@ NTKERNELAPI NTSTATUS ZwYieldExecution(void);
 svm_vcpu_t *g_vcpus[SVM_MAX_CORES];
 ULONG g_vcpu_count;
 static BOOLEAN g_svm_nested;
+#ifdef YGHV_R1_EXCLUDE_PRIVATE
+extern volatile BOOLEAN g_r1_diag;
+extern volatile ULONG g_r1_diag_count;
+extern volatile ULONG g_r1_entry_seq;
+#endif
 
 /* --- MSR helpers --- */
 static uint64_t yg_read_msr(uint32_t msr) {
@@ -155,6 +160,14 @@ int svm_alloc_vcpu(uint32_t core_id, svm_vcpu_t **out) {
     RtlZeroMemory(vcpu->host_stack, SVM_HOST_STACK_PAGES * HV_PAGE_SIZE);
     vcpu->host_stack_top = (uint64_t)vcpu->host_stack + SVM_HOST_STACK_PAGES * HV_PAGE_SIZE - 8;
 
+    /* Guest stack — 1 page, stays NPT-visible so synthetic guests have a
+       valid stack even after hypervisor-private pages are excluded. */
+    vcpu->guest_stack = MmAllocateContiguousMemory(
+        HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (!vcpu->guest_stack) goto fail_guest_stack;
+    RtlZeroMemory(vcpu->guest_stack, HV_PAGE_SIZE);
+    vcpu->guest_stack_pa = MmGetPhysicalAddress(vcpu->guest_stack).QuadPart;
+
     /* MSRPM — 2 pages, zero = allow MSR access (bit=1 means intercept) */
     vcpu->msrpm = MmAllocateContiguousMemory(SVM_MSRPM_PAGES * HV_PAGE_SIZE,
         (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
@@ -182,6 +195,8 @@ fail_iopm:
     MmFreeContiguousMemory(vcpu->msrpm);
 fail_msrpm:
     MmFreeContiguousMemory(vcpu->host_stack);
+fail_guest_stack:
+    if (vcpu->guest_stack) MmFreeContiguousMemory(vcpu->guest_stack);
 fail_stack:
     MmFreeContiguousMemory(vcpu->hsave);
 fail_hsave:
@@ -199,6 +214,7 @@ static void svm_free_vcpu(svm_vcpu_t *vcpu) {
     if (!vcpu) return;
     if (vcpu->iopm)  MmFreeContiguousMemory(vcpu->iopm);
     if (vcpu->msrpm) MmFreeContiguousMemory(vcpu->msrpm);
+    if (vcpu->guest_stack) MmFreeContiguousMemory(vcpu->guest_stack);
     if (vcpu->host_stack) MmFreeContiguousMemory(vcpu->host_stack);
     if (vcpu->hsave) MmFreeContiguousMemory(vcpu->hsave);
     if (vcpu->host_vmcb) MmFreeContiguousMemory(vcpu->host_vmcb);
@@ -582,6 +598,15 @@ int svm_core_enter_resident_current(uint32_t index) {
 
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
     yghv_trace("resident start");
+    if (vcpu->guest_stack_pa) {
+        vcpu->vmcb->state.rsp =
+            vcpu->guest_stack_pa + HV_PAGE_SIZE - 0x10;
+    }
+#ifdef YGHV_R1_EXCLUDE_PRIVATE
+    g_r1_entry_seq++;
+    g_r1_diag = TRUE;
+    g_r1_diag_count = 0;
+#endif
 
     /* Synthetic resident guest runs Windows code in guest mode; on bare metal
        intercept INTR/NMI/SHUTDOWN so Windows ISRs run in native host context
@@ -619,13 +644,16 @@ int svm_core_enter_resident_current(uint32_t index) {
         if ((vcpu->resident_exits % 100000ULL) == 0)
             yghv_trace("resident exit tick");
         (void)exitcode;
-        int stop = svm_dispatch_exit(vcpu);
+    int stop = svm_dispatch_exit(vcpu);
         if (stop) break;
     }
     }
 
     LOG_INFO("Resident loop exit: state=%d, exits=%llu",
         vcpu->resident_state, vcpu->resident_exits);
+#ifdef YGHV_R1_EXCLUDE_PRIVATE
+    g_r1_diag = FALSE;
+#endif
 
     /* Devirtualize */
     InterlockedExchange((volatile LONG *)&vcpu->resident_state,

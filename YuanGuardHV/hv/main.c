@@ -17,6 +17,9 @@
 #ifndef YGHV_BAREMETAL_STEP
 #define YGHV_BAREMETAL_STEP 0
 #endif
+#ifndef YGHV_R1_EXCLUDE_PRIVATE
+#define YGHV_R1_EXCLUDE_PRIVATE 0
+#endif
 
 NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
@@ -79,6 +82,9 @@ volatile uint64_t g_v101_gp_rsp = 0;
 volatile uint64_t g_v101_gp_cr3 = 0;
 volatile uint64_t g_v101_gp_gs_base = 0;
 volatile BOOLEAN g_v102_catchall = FALSE;
+volatile BOOLEAN g_r1_diag = FALSE;
+volatile ULONG g_r1_diag_count = 0;
+volatile ULONG g_r1_entry_seq = 0;
 static KEVENT g_os_guest_done_events[SVM_MAX_CORES];
 static KEVENT g_os_resident_stop_event;
 
@@ -234,19 +240,65 @@ static void yghv_exclude_driver(PDRIVER_OBJECT d) {
     }
 }
 
+#if YGHV_R1_EXCLUDE_PRIVATE
 static void yghv_exclude_hv_private(PDRIVER_OBJECT d) {
     ULONG i;
+    (void)d;
 
-    /* VMware nested SVM currently rejects VMRUN when guest NPT no longer
-       maps hypervisor-private pages. Keep exclusions disabled until bare-metal
-       validation; only the guest code page copy and auth are active. */
+    /* R1 bare-metal: remove hypervisor-owned pages from the guest NPT.
+       The synthetic guest executes from the driver image, so the driver
+       stays mapped; everything hypervisor-private is made guest-invisible. */
     for (i = 0; i < SVM_MAX_CORES; i++) {
         svm_vcpu_t *v = g_vcpus[i];
+        PHYSICAL_ADDRESS pa;
         if (!v) continue;
-        (void)v;
+        if (v->vmcb) npt_exclude_pa(&g_npt, v->vmcb_pa);
+        if (v->host_vmcb) npt_exclude_pa(&g_npt, v->host_vmcb_pa);
+        if (v->hsave) npt_exclude_pa(&g_npt, v->hsave_pa);
+        if (v->host_stack) {
+            pa = MmGetPhysicalAddress(v->host_stack);
+            npt_exclude_range(&g_npt, pa.QuadPart,
+                              SVM_HOST_STACK_PAGES * HV_PAGE_SIZE);
+        }
+        if (v->msrpm)
+            npt_exclude_range(&g_npt, v->msrpm_pa,
+                              SVM_MSRPM_PAGES * HV_PAGE_SIZE);
+        if (v->iopm)
+            npt_exclude_range(&g_npt, v->iopm_pa,
+                              SVM_IOPM_PAGES * HV_PAGE_SIZE);
     }
-    (void)d;
+    npt_exclude_self(&g_npt);
 }
+
+static NTSTATUS yghv_r1_exclude_check(void) {
+    svm_vcpu_t *v = svm_core_get_vcpu(0);
+    uint64_t pa;
+
+    if (!v || !v->vmcb)
+        return STATUS_INVALID_PARAMETER;
+
+    pa = npt_read_entry(&g_npt, v->vmcb_pa);
+    if (pa & NPT_PERM_PRESENT) {
+        LOG_ERROR("r1 exclude: vmcb still mapped entry=0x%llx", pa);
+        return STATUS_UNSUCCESSFUL;
+    }
+    pa = npt_read_entry(&g_npt, g_npt.pml4_pa);
+    if (pa & NPT_PERM_PRESENT) {
+        LOG_ERROR("r1 exclude: pml4 still mapped entry=0x%llx", pa);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    pa = MmGetPhysicalAddress((PVOID)(uintptr_t)svm_trampoline_test_guest).QuadPart;
+    pa = npt_read_entry(&g_npt, pa);
+    if (!(pa & NPT_PERM_PRESENT)) {
+        LOG_ERROR("r1 exclude: guest code page missing entry=0x%llx", pa);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    LOG_ERROR("r1 exclude check: PASS (vmcb/pml4 excluded, guest code mapped)");
+    return STATUS_SUCCESS;
+}
+#endif
 
 static NTSTATUS yghv_r1_npt_unit_test(void) {
     void *buf = NULL;
@@ -595,7 +647,15 @@ static NTSTATUS yghv_hook_resident_test(void) {
         yghv_protect_remove_hook(0);
         return STATUS_UNSUCCESSFUL;
     }
+#ifdef YGHV_R1_EXCLUDE_PRIVATE
+    v->vmcb->control.exception_intercepts = 0xFFFFFFFFULL;
+    v->vmcb->control.general1_intercepts |= INTR_GEN1(SVM_INTERCEPT_HLT);
+    g_v102_catchall = TRUE;
+#endif
     svm_core_enter_resident_current(0);
+#ifdef YGHV_R1_EXCLUDE_PRIVATE
+    g_v102_catchall = FALSE;
+#endif
     LOG_ERROR("hook resident test: deny rdx=0x%llx", v->regs.rdx);
     if (v->regs.rdx != 0xC0000022ULL)
         ok = 0;
@@ -3479,8 +3539,24 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 
     yghv_trace("map ram n/a");
 
+#if YGHV_R1_EXCLUDE_PRIVATE
     yghv_exclude_hv_private(d);
     yghv_trace("exclude private ok");
+    sv = yghv_r1_exclude_check();
+    if (sv) {
+        LOG_ERROR("r1 exclude check failed 0x%x", sv);
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        yghv_trace_close();
+        KeRevertToUserAffinityThread();
+        return sv;
+    }
+    yghv_trace("exclude check ok");
+#else
+    yghv_trace("exclude private n/a");
+#endif
     yghv_trace("guest code exec n/a");
 
     for (i = 0; i < online; i++) {

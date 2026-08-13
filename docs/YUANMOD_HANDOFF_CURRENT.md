@@ -1341,3 +1341,136 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   代码、默认 step=0 路径），可用于恢复 C 盘安全版。
 - 遗留：`C:\yuanguard_hv.sys` 当前仍为 v102（冻结版），恢复默认版需
   用户确认后另行构建替换；`D:\aaaaaavm\` 保留全部归档与 dump。
+
+### 9.103 2026-08-13 决策：不常驻，转非驻留保护路线（含下一步规划）
+
+- 决策：不再推进 OS-as-guest 常驻（平台级停机已确认），后续开发全部
+  走非驻留保护路线（驱动加载 + NPT/NPF + VMMCALL hook + 控制通道 +
+  Java/JNI 客户端）。
+- 影响评估：功能层无损失（内存页写保护/终止保护/句柄保护/真实目标
+  hook/add_page 翻译/Java 客户端均稳定 PASS）；失去的是“整机隐形 +
+  不可卸载”两个远期目标（真实 OS 不在 guest 模式，CPUID/MSR/IO 隐身
+  不覆盖真实系统，驱动架构上可卸载）；风险层反而更稳（无整机硬停）。
+- 下一步路线（按优先级）：
+  - P0 安全地基：R1 私有页剔除（VMCB/hsave 自剔除）+ NPT 默认权限收紧
+    （默认 NX/RX，仅受保护页按需 RW），在实机非驻留路径验证；VMMCALL
+    认证加固（现有 auth cookie 扩展为 per-handle/per-process）；
+    控制面补 CPL/CR3 校验 + 目标进程生命周期处理。
+  - P1 产品化：真实目标 hook 加固（terminate/handle 双 hook 落到真实
+    进程）、多目标与配置 IOCTL 完善、驱动服务持久化与防卸载、Java
+    客户端补 config/unprotect/scan 等命令。
+  - P2 隐形与完整性：loader_stealth.c 接线（从加载模块列表隐藏）、
+    MSR/IO 隐身（仅对受保护进程生效的替代方案）、hook 边界验证扩展。
+  - 验证：默认版实机回归（selftest/exit-test）、VM 回归仅限安全路径
+    （嵌套下关闭 INTR/NMI 拦截等已知限制）、每次改动先确认并记档。
+- 待确认操作项：把 `C:\yuanguard_hv.sys` 从 v102 冻结版恢复为默认版
+  （SHA256 `EB4CA2A5B48EFE39D4FC2EA86DD9A841ED22860CBB1D0B77D1C734462786EF12`，
+  已归档 `D:\aaaaaavm\yuanguard_hv_default_20260813.sys`）。
+
+### 9.104 2026-08-13 P0 R1 私有页剔除实现（实机验证版）
+
+- 已确认并执行：恢复 C 盘默认版（`EB4CA2A5...`）→ 开始 P0 R1。
+- 实现 `yghv_exclude_hv_private`（原为空壳）：对每个 vcpu 从 guest NPT
+  剔除 vmcb/host_vmcb/hsave/host_stack(4 页)/msrpm(2 页)/iopm(3 页)，
+  并 `npt_exclude_self` 剔除 NPT 表自身；**驱动镜像保持映射**（合成 guest
+  从驱动 `.text` 执行，DriverEntry 设 `g_guest_hb_va = svm_trampoline_test_guest`）。
+- 新增 `yghv_r1_exclude_check`：校验 vmcb PA 与 pml4 PA 的 NPT entry 已
+  非 present、guest 代码页仍 present；DriverEntry 在
+  `yghv_exclude_hv_private` 后调用，失败即清理并返回。
+- 构建：默认版 SHA256
+  `5B158E1B97489B3F1C6E6C2C8B328ECC62FF7F965241E54DF8482460EB401961`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_r1exclude_20260813.sys`，已复制
+  `C:\yuanguard_hv.sys`。
+- 待实机验证：`sc start yuanguard`，期望日志 `exclude private ok →
+  exclude check ok`，随后默认 NPT VMRUN 测试照常 PASS；若 guest 触碰
+  私有页应 NPF 而不会读到 hypervisor 内存。
+
+### 9.105 2026-08-13 R1 剔除实机回归：hook deny 路径死循环，改为编译门控
+
+- 实机加载剔除版（`5B158E1B...`）：`exclude private ok → exclude check
+  ok` 通过，NPT 测试 PASS；但默认路径 `yghv_hook_resident_test` 的
+  deny 阶段陷入无限 `resident exit tick`，服务 StartPending、`sc stop`
+  1052 无效，需重启清除。
+- 结论：剔除与 hook deny 路径存在交互（大概率 NPF/rearm 或 VMMCALL
+  deny 决策在私有页不可见后行为变化），不能直接并入稳定默认路径。
+- 修正：新增 `YGHV_R1_EXCLUDE_PRIVATE` 编译开关（默认 0），
+  `yghv_exclude_hv_private`/`yghv_r1_exclude_check` 及其 DriverEntry
+  调用整体置于开关内；build.bat 支持 `YGHV_R1_EXCLUDE_PRIVATE=1`。
+- 构建：稳定默认版（开关关）SHA256
+  `35498382A8AA0E5220E634B612109357363C09A09FF2BD29D1AFE6F6D161B4FD`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_stable_20260813.sys`（日志走
+  `exclude private n/a`，不含剔除代码）；R1 门控版（开关开）SHA256
+  `D2ED3F3CD8FB180B4506DDDBEACCFB5AB7654CA737174D2349258988C48B8524`，
+  归档 `D:\aaaaaavm\yuanguard_hv_r1exclude_gated_20260813.sys`。
+- 待办：用户重启清除卡死驱动后，把 `C:\yuanguard_hv.sys` 恢复为稳定
+  默认版；R1 剔除与 hook deny 的交互单独排查（先复现 deny 死循环，
+  再决定剔除范围或调整 deny 决策）。
+
+### 9.106 2026-08-13 稳定默认版恢复实机验证 PASS
+
+- 用户重启后，`C:\yuanguard_hv.sys` 已恢复为稳定默认版
+  （SHA256 `35498382...`，`D:\aaaaaavm\yuanguard_hv_default_stable_20260813.sys`）。
+- 实机 `sc start yuanguard`：服务 RUNNING，日志完整走完
+  `exclude private n/a → NPT 测试 PASS（npf test → stop_internal）→
+  protect/hook 测试（多轮 resident+stop_internal）→ cpu0 reset →
+  remote started/ready → before heartbeat → after heartbeat → all stopped`，
+  默认完整流程回归 PASS。
+- 机器恢复可安全加载状态；R1 剔除与 hook deny 的交互问题保持门控，
+  待单独排查。
+
+### 9.107 2026-08-13 hook deny 死循环根因定位 + guest 栈修复
+
+- 升级诊断：每次 `svm_core_enter_resident_current` 进入时编号并落盘前
+  200 次退出（`r1 entry` / `r1 deny exit` / info2 / RIP），diag2 版
+  SHA256 `C7E716DF...`。
+- 实机现场：入口 4（hook deny 阶段）死循环为 **固定 RIP 反复 NPF 写
+  GPA `0xc7de1fe8`**；该 GPA 与 vcpu `host_stack`（R1 已剔除的私有页）
+  吻合 —— 合成 guest 的 `call rsi` 需要 push 到 guest 栈，而 guest
+  RSP 一直继承自 hypervisor host_stack，剔除后写即 NPF → 注入 #PF →
+  重执行 → 无限循环。前 3 个入口（NPT/protect/hook allow）不用栈或
+  恰好在别处，故通过。
+- 修复：每 vcpu 新增 `guest_stack`（1 页连续内存，NPT identity 可见、
+  不剔除），`svm_core_enter_resident_current` 进入前把
+  `vmcb.state.rsp` 指向 `guest_stack_pa + 页大小 - 0x10`；字段追加在
+  `svm_vcpu_t` 末尾避免破坏汇编固定偏移断言；分配/释放/fail 路径已补。
+- 构建：R1 修复版 SHA256
+  `74FC87C546112259E99536035EDB9C1BED934DA46F46BE6C2989EB470D024C27`，
+  归档 `D:\aaaaaavm\yuanguard_hv_r1exclude_gueststack_20260813.sys`；
+  默认版（门控关）SHA256
+  `A1E9743B38ACC1984874032090CE6CE0E7D902D35464712AE03215F1CB07C795`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_stable2_20260813.sys`。
+- 待验证：重启后加载 R1 修复版，预期入口 4 走 NPF/#DB/VMMCALL →
+  stop_internal，hook resident PASS，后续测试继续到 `all stopped`，
+  服务 RUNNING。
+
+### 9.108 2026-08-13 guest 栈修复后 deny 仍整机硬冻结（R1 继续门控）
+
+- 实机加载 R1 修复版（SHA256 `74FC87C5...`）：入口 1/2/3（NPT、protect、hook allow）全部 PASS；入口 4（hook deny）仍为进入后 0 次 VMEXIT 即整机硬冻结（日志停在 `resident start`，无 `r1 entry=4`、无 dump）。guest 栈修复消除了 NPF 写 host_stack 死循环，但 deny 路径在 guest 内直接停机，疑似 guest 内异常未被拦截后走 Windows 异常分发导致机器级 halt。
+- 决策：R1 私有页剔除继续保留 `YGHV_R1_EXCLUDE_PRIVATE=0` 门控；`C:\yuanguard_hv.sys` 已恢复稳定默认版（SHA256 `A1E9743B38ACC1984874032090CE6CE0E7D902D35464712AE03215F1CB07C795`，归档 `D:\aaaaaavm\yuanguard_hv_default_stable2_20260813.sys`）。
+- 后续选项：a) 继续 R1 排查（deny 入口加全异常/HLT 拦截捕获 guest 内异常现场，仍需重启验证）；b) 先转 P0 其它低风险项（VMMCALL 认证加固 / 控制面 CPL-CR3），R1 留待单独窗口。
+
+### 9.109 2026-08-13 Codex 重启后配置与会话恢复
+
+- Codex 重启后项目/会话在侧边栏丢失，用户已手动加回 D:\mcmodwork 与 D:\yuanguard。
+- 核对结果：18 个非归档会话的正文文件与 state_5.sqlite 记录全部完整，未做覆盖；已归档会话按要求不恢复。
+- 恢复动作：在 C:\Users\Administrator\.codex\config.toml 补回 5 个 primary-runtime 插件启用项（documents、pdf、spreadsheets、presentations、template-creator），保留当前模型/供应商/项目设置。
+- 备份目录：C:\Users\Administrator\.codex\backup-20260813-160358-config-session-restore（config.toml、.codex-global-state.json、session_index.jsonl、state_5.sqlite）。
+
+### 9.110 2026-08-13 deny 全异常+HLT 拦截仍零退出硬冻结：R1 停线门控
+
+- 在 hook deny 入口对 VMCB 设置 `exception_intercepts=0xFFFFFFFF` +
+  HLT 拦截 + `g_v102_catchall=TRUE`（`svm_dispatch_exit` 对任何异常/HLT
+  退出即时落盘 `r1 catchall fault`）。构建 SHA256
+  `7E44C9AF18AF4ED365848E034221768D7341B3875112F16251F5A7B96BBB2901`，
+  归档 `D:\aaaaaavm\yuanguard_hv_r1exclude_catchall_20260813.sys`。
+- 实机结果：入口 1/2/3 PASS，入口 4 仍停在 `resident start` 后整机硬冻结，
+  **0 次 VMEXIT、无 `r1 catchall fault`、无 dump**。全异常 + HLT 全拦也
+  抓不到，确认 deny 路径为 SVM 不可拦截的机器级停机（与 OS-guest
+  v101/v102 同型）。
+- 结论：R1 私有页剔除在 Ryzen 5 5500 上无法通过现有 hook deny 自测完成
+  端到端验证，继续保持 `YGHV_R1_EXCLUDE_PRIVATE=0` 门控；guest 栈修复
+  （guest_stack 独立页 + RSP 指向）保留（对默认路径无害，且消除合成
+  guest 借用 host_stack 的问题）。`C:\yuanguard_hv.sys` 已恢复稳定默认版
+  （`A1E9743B...`）。
+- 建议下一步：转 P0 低风险项（VMMCALL 认证加固 / 控制面 CPL-CR3）；
+  R1 剔除如需继续，建议换平台或在能抓 MCE/机器级现场的硬件调试器上验证。

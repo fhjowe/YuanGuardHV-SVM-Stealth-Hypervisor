@@ -34,6 +34,9 @@ extern volatile uint64_t g_v101_gp_rsp;
 extern volatile uint64_t g_v101_gp_cr3;
 extern volatile uint64_t g_v101_gp_gs_base;
 extern volatile BOOLEAN g_v102_catchall;
+extern volatile BOOLEAN g_r1_diag;
+extern volatile ULONG g_r1_diag_count;
+extern volatile ULONG g_r1_entry_seq;
 extern void *g_v98_apic_shadow_va;
 extern void *g_v98_real_apic_va;
 extern volatile ULONG g_v98_last_tpr;
@@ -340,10 +343,24 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     uint64_t exitcode = vcpu->vmcb->control.exitcode;
 
     yghv_v100_record(vcpu);
+    if (g_r1_diag && g_r1_diag_count++ < 200) {
+        yghv_trace_u64("r1 entry", g_r1_entry_seq);
+        yghv_trace_u64("r1 deny exit", exitcode);
+        yghv_trace_u64("r1 deny info2", vcpu->vmcb->control.exitinfo2);
+        yghv_trace_u64("r1 deny rip", vcpu->vmcb->state.rip);
+    }
     if (g_v102_catchall &&
         (((exitcode >= SVM_EXIT_EXCEPTION_BASE) &&
           (exitcode < SVM_EXIT_EXCEPTION_BASE + 32)) ||
          (exitcode == SVM_EXIT_HLT))) {
+        yghv_trace("r1 catchall fault");
+        yghv_trace_u64("r1 catchall exit", exitcode);
+        yghv_trace_u64("r1 catchall err", vcpu->vmcb->control.exitinfo1);
+        yghv_trace_u64("r1 catchall info2", vcpu->vmcb->control.exitinfo2);
+        yghv_trace_u64("r1 catchall rip", vcpu->vmcb->state.rip);
+        yghv_trace_u64("r1 catchall cr3", vcpu->vmcb->state.cr3);
+        yghv_trace_u64("r1 catchall rsp", vcpu->vmcb->state.rsp);
+        yghv_trace_u64("r1 catchall gsbase", vcpu->vmcb->state.gs_base);
         g_v101_gp_exitcode = exitcode;
         g_v101_gp_err = vcpu->vmcb->control.exitinfo1;
         g_v101_gp_rip = vcpu->vmcb->state.rip;
