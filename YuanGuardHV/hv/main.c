@@ -20,6 +20,9 @@
 #ifndef YGHV_R1_EXCLUDE_PRIVATE
 #define YGHV_R1_EXCLUDE_PRIVATE 0
 #endif
+#ifndef YGHV_REAL_HOOK_TEST
+#define YGHV_REAL_HOOK_TEST 0
+#endif
 
 NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
@@ -545,6 +548,7 @@ static NTSTATUS yghv_hook_test(void) {
     uint64_t entry_before, entry_after;
     int ok = 1;
 
+    yghv_trace("hook test start");
     term = yghv_protect_find_func_pattern(L"ZwTerminateProcess", NULL, 0);
     LOG_ERROR("protect hook test: ZwTerminateProcess=0x%llx", term);
     open = yghv_protect_find_func_pattern(L"NtOpenProcess", NULL, 0);
@@ -568,7 +572,8 @@ static NTSTATUS yghv_hook_test(void) {
     }
     entry_after = npt_read_entry(&g_npt, gpa);
     if (!(entry_after & NPT_PERM_WRITABLE)) ok = 0;
-    if (memcmp((void *)dummy, &g_protect_hooks[0].original, YGHV_PROTECT_PATCH_LEN) != 0) ok = 0;
+    if (memcmp((void *)dummy, &g_protect_hooks[0].original,
+               g_protect_hooks[0].patch_len) != 0) ok = 0;
 
     dummy2 = (uint64_t)yghv_hook_test_dummy2;
     dummy2_page_va = dummy2 & ~(HV_PAGE_SIZE - 1);
@@ -589,10 +594,12 @@ static NTSTATUS yghv_hook_test(void) {
         }
         entry_after = npt_read_entry(&g_npt, gpa2);
         if (!(entry_after & NPT_PERM_WRITABLE)) ok = 0;
-        if (memcmp((void *)dummy2, &g_protect_hooks[1].original, YGHV_PROTECT_PATCH_LEN) != 0) ok = 0;
+        if (memcmp((void *)dummy2, &g_protect_hooks[1].original,
+                   g_protect_hooks[1].patch_len) != 0) ok = 0;
     }
 
     LOG_ERROR("protect hook test: %s", ok ? "PASS" : "FAIL");
+    yghv_trace(ok ? "hook test pass" : "hook test fail");
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
@@ -603,6 +610,7 @@ static NTSTATUS yghv_hook_resident_test(void) {
     NTSTATUS st;
     int ok = 1;
 
+    yghv_trace("hook resident start");
     st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("hook resident test: set_target FAILED 0x%x", st);
@@ -620,6 +628,7 @@ static NTSTATUS yghv_hook_resident_test(void) {
     v->vmcb->state.cr3 = real_cr3;
     v->vmcb->state.rip = (uint64_t)svm_trampoline_test_hook_guest;
     v->vmcb->state.rax = 0;
+    v->regs.rax = 0;
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
@@ -629,7 +638,8 @@ static NTSTATUS yghv_hook_resident_test(void) {
     }
     svm_core_enter_resident_current(0);
     LOG_ERROR("hook resident test: allow rdx=0x%llx", v->regs.rdx);
-    if (v->regs.rdx != 0)
+    yghv_trace_u64("hook resident allow", v->regs.rdx);
+    if (v->regs.rdx == 0xC0000022ULL)
         ok = 0;
 
     /* Deny: keep guest CR3 valid, shift g_protect.cr3 out of match. */
@@ -639,6 +649,7 @@ static NTSTATUS yghv_hook_resident_test(void) {
     v->vmcb->state.cr3 = real_cr3;
     v->vmcb->state.rip = (uint64_t)svm_trampoline_test_hook_guest;
     v->vmcb->state.rax = 0;
+    v->regs.rax = 0;
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     if (!NT_SUCCESS(svm_core_set_npt(0, g_npt.pml4_pa))) {
@@ -657,16 +668,19 @@ static NTSTATUS yghv_hook_resident_test(void) {
     g_v102_catchall = FALSE;
 #endif
     LOG_ERROR("hook resident test: deny rdx=0x%llx", v->regs.rdx);
+    yghv_trace_u64("hook resident deny", v->regs.rdx);
     if (v->regs.rdx != 0xC0000022ULL)
         ok = 0;
     g_protect.cr3 = real_cr3;
 
     st = yghv_protect_remove_hook(0);
+    yghv_trace_u64("hook resident remove", (uint64_t)st);
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("hook resident test: remove FAILED 0x%x", st);
         ok = 0;
     }
     LOG_ERROR("hook resident test: %s", ok ? "PASS" : "FAIL");
+    yghv_trace(ok ? "hook resident pass" : "hook resident fail");
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
 
@@ -675,6 +689,7 @@ static NTSTATUS yghv_hook_boundary_test(void) {
     uint64_t va;
     int ok = 1;
 
+    yghv_trace("hook boundary start");
     buf = MmAllocateContiguousMemory(
         HV_PAGE_SIZE * 2, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
     if (!buf)
@@ -682,28 +697,118 @@ static NTSTATUS yghv_hook_boundary_test(void) {
     RtlZeroMemory(buf, HV_PAGE_SIZE * 2);
     va = ((uint64_t)buf + HV_PAGE_SIZE - 1) & ~(uint64_t)(HV_PAGE_SIZE - 1);
 
-    /* valid target: 16 NOPs then ret */
+    /* valid target: 16 NOPs then ret -> 12-byte patch */
     RtlFillMemory((void *)va, 16, 0x90);
     *(uint8_t *)(va + 16) = 0xC3;
-    if (yghv_protect_validate_hook_target(va) != 0)
+    if (yghv_protect_validate_hook_target(va) != YGHV_PROTECT_PATCH_MIN)
+        ok = 0;
+
+    /* variable boundary: 11 NOPs + ret -> resume at offset 12 */
+    RtlZeroMemory((void *)va, 32);
+    RtlFillMemory((void *)va, 11, 0x90);
+    *(uint8_t *)(va + 11) = 0xC3;
+    if (yghv_protect_validate_hook_target(va) != YGHV_PROTECT_PATCH_MIN)
         ok = 0;
 
     /* patch region crossing the 4KB page boundary must be rejected */
-    if (yghv_protect_validate_hook_target(va + HV_PAGE_SIZE - 8) == 0)
+    if (yghv_protect_validate_hook_target(va + HV_PAGE_SIZE - 8) != -1)
         ok = 0;
 
-    /* instruction stream crossing offset 16 (13 NOPs + E9 rel32) rejected */
+    /* relative branch inside the copied region (11 NOPs + E9 rel32) rejected */
     RtlZeroMemory((void *)va, 32);
-    RtlFillMemory((void *)va, 13, 0x90);
-    *(uint8_t *)(va + 13) = 0xE9;
-    *(uint8_t *)(va + 17) = 0x01;
-    if (yghv_protect_validate_hook_target(va) == 0)
+    RtlFillMemory((void *)va, 11, 0x90);
+    *(uint8_t *)(va + 11) = 0xE9;
+    *(uint8_t *)(va + 15) = 0x01;
+    if (yghv_protect_validate_hook_target(va) != -1)
+        ok = 0;
+
+    /* RIP-relative first instruction rejected */
+    RtlZeroMemory((void *)va, 32);
+    ((uint8_t *)va)[0] = 0x48; ((uint8_t *)va)[1] = 0x8D;
+    ((uint8_t *)va)[2] = 0x05; ((uint8_t *)va)[3] = 0x01;
+    ((uint8_t *)va)[4] = 0x00; ((uint8_t *)va)[5] = 0x00;
+    ((uint8_t *)va)[6] = 0x00;
+    if (yghv_protect_validate_hook_target(va) != -1)
         ok = 0;
 
     LOG_ERROR("hook boundary test: %s", ok ? "PASS" : "FAIL");
+    yghv_trace(ok ? "hook boundary pass" : "hook boundary fail");
     MmFreeContiguousMemory(buf);
     return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 }
+
+#if YGHV_REAL_HOOK_TEST
+static NTSTATUS yghv_real_hook_test(void) {
+    uint64_t term, open;
+    uint64_t real_cr3;
+    NTSTATUS st, deny_st;
+    int ok = 1;
+
+    yghv_trace("real hook start");
+    term = yghv_protect_find_func_pattern(L"ZwTerminateProcess", NULL, 0);
+    open = yghv_protect_find_func_pattern(L"ZwOpenProcess", NULL, 0);
+    LOG_ERROR("real hook test: ZwTerminateProcess=0x%llx ZwOpenProcess=0x%llx",
+        term, open);
+    if (!term || !open) {
+        LOG_ERROR("real hook test: exported functions not found");
+        return STATUS_NOT_FOUND;
+    }
+
+    st = yghv_protect_set_target((uint32_t)(ULONG_PTR)PsGetCurrentProcessId());
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("real hook test: set_target FAILED 0x%x", st);
+        return st;
+    }
+    real_cr3 = g_protect.cr3;
+
+    /* install/remove validation on the handle-open function first. */
+    if (yghv_protect_install_hook(1, open)) {
+        LOG_ERROR("real hook test: install ZwOpenProcess FAILED");
+        ok = 0;
+    } else {
+        st = yghv_protect_remove_hook(1);
+        yghv_trace("real hook open ok");
+        if (!NT_SUCCESS(st)) {
+            LOG_ERROR("real hook test: remove ZwOpenProcess FAILED 0x%x", st);
+            ok = 0;
+        }
+    }
+
+    if (yghv_protect_install_hook(0, term)) {
+        LOG_ERROR("real hook test: install ZwTerminateProcess FAILED");
+        ok = 0;
+    } else {
+        NTSTATUS (*fn)(HANDLE) = (NTSTATUS (*)(HANDLE))term;
+
+        /* Allow: current process CR3 matches the protected target. */
+        st = fn((HANDLE)(ULONG_PTR)0xDEADBEEFULL);
+        LOG_ERROR("real hook test: allow st=0x%x", st);
+        yghv_trace_u64("real hook allow", (uint64_t)st);
+        if (st == 0xC0000022L)
+            ok = 0;
+
+        /* Deny: shift g_protect.cr3 out of match, guest CR3 stays real. */
+        g_protect.cr3 = real_cr3 + 0x1000;
+        deny_st = fn((HANDLE)(ULONG_PTR)0xDEADBEEFULL);
+        LOG_ERROR("real hook test: deny st=0x%x", deny_st);
+        yghv_trace_u64("real hook deny", (uint64_t)deny_st);
+        if (deny_st != 0xC0000022L)
+            ok = 0;
+        g_protect.cr3 = real_cr3;
+
+        st = yghv_protect_remove_hook(0);
+        if (!NT_SUCCESS(st)) {
+            LOG_ERROR("real hook test: remove ZwTerminateProcess FAILED 0x%x",
+                st);
+            ok = 0;
+        }
+    }
+
+    LOG_ERROR("real hook test: %s", ok ? "PASS" : "FAIL");
+    yghv_trace(ok ? "real hook pass" : "real hook fail");
+    return ok ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+}
+#endif
 
 static NTSTATUS yghv_cpuid_stealth_test(void) {
     svm_vcpu_t *v;
@@ -3765,6 +3870,22 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         KeRevertToUserAffinityThread();
         return STATUS_UNSUCCESSFUL;
     }
+
+#if YGHV_REAL_HOOK_TEST
+    if (!NT_SUCCESS(yghv_real_hook_test())) {
+        LOG_ERROR("real hook test failed");
+        if (npt_test_buf) MmFreeContiguousMemory(npt_test_buf);
+        npt_test_buf = NULL;
+        yghv_protect_cleanup();
+        npt_cleanup(&g_npt);
+        svm_core_cleanup();
+        if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+        g_guest_code_page = NULL;
+        yghv_trace_close();
+        KeRevertToUserAffinityThread();
+        return STATUS_UNSUCCESSFUL;
+    }
+#endif
 
     if (!NT_SUCCESS(yghv_cpuid_stealth_test())) {
         LOG_ERROR("cpuid stealth test failed");

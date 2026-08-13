@@ -465,6 +465,32 @@ BOOLEAN yghv_protect_on_target_exit(ULONG pid) {
 
 static uint8_t *g_hook_stub_pages[YGHV_PROTECT_MAX_HOOKS];
 
+static uint8_t *yghv_protect_map_writable_page(uint64_t page_va, PMDL *out_mdl) {
+    PMDL mdl;
+    PVOID map;
+
+    *out_mdl = NULL;
+    mdl = IoAllocateMdl((PVOID)page_va, HV_PAGE_SIZE, FALSE, FALSE, NULL);
+    if (!mdl)
+        return NULL;
+    MmBuildMdlForNonPagedPool(mdl);
+    map = MmMapLockedPagesSpecifyCache(mdl, KernelMode, MmCached, NULL,
+        HighPagePriority, NormalPagePriority);
+    if (!map) {
+        IoFreeMdl(mdl);
+        return NULL;
+    }
+    *out_mdl = mdl;
+    return (uint8_t *)map;
+}
+
+static void yghv_protect_unmap_writable_page(PMDL mdl, uint8_t *map) {
+    if (mdl && map)
+        MmUnmapLockedPages(map, mdl);
+    if (mdl)
+        IoFreeMdl(mdl);
+}
+
 static void yghv_emit_u8(uint8_t *p, uint8_t v) { *p = v; }
 static void yghv_emit_u64(uint8_t *p, uint64_t v) {
     for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
@@ -474,11 +500,12 @@ static void yghv_emit_rel32(uint8_t *p, uint64_t from, uint64_t to) {
     p[0] = 0xE9;
     for (int i = 0; i < 4; i++) p[1 + i] = (uint8_t)((uint64_t)d >> (i * 8));
 }
-static void yghv_emit_abs_jmp16(uint8_t *p, uint64_t target) {
-    p[0] = 0x49; p[1] = 0xBB;                  /* movabs r11, imm64 */
+static void yghv_emit_abs_jmp(uint8_t *p, size_t len, uint64_t target) {
+    p[0] = 0x48; p[1] = 0xB8;                  /* movabs rax, imm64 */
     yghv_emit_u64(p + 2, target);
-    p[10] = 0x41; p[11] = 0xFF; p[12] = 0xE3;  /* jmp r11 */
-    p[13] = 0x90; p[14] = 0x90; p[15] = 0x90;  /* nop padding to 16 bytes */
+    p[10] = 0xFF; p[11] = 0xE0;                /* jmp rax */
+    for (size_t i = 12; i < len; i++)
+        p[i] = 0x90;
 }
 
 static int yghv_decode_modrm(const uint8_t *p, size_t avail, size_t *pos) {
@@ -512,11 +539,14 @@ static int yghv_decode_modrm(const uint8_t *p, size_t avail, size_t *pos) {
 
 /* Conservative x86-64 instruction length decoder. Returns 0 on any form it
    cannot classify; callers reject such targets instead of guessing. */
-static int yghv_inst_len(const uint8_t *p, size_t avail) {
+static int yghv_inst_len(const uint8_t *p, size_t avail, int *rip_rel) {
     size_t pos = 0;
     int rex = 0;
     int prefixes = 0;
     uint8_t b, op;
+
+    if (rip_rel)
+        *rip_rel = 0;
 
     for (;;) {
         if (pos >= avail) return 0;
@@ -554,10 +584,12 @@ static int yghv_inst_len(const uint8_t *p, size_t avail) {
     }
     if ((op >= 0x70 && op <= 0x7F) || (op >= 0xE0 && op <= 0xE3) || op == 0xEB) {
         if (pos + 1 > avail) return 0;
+        if (rip_rel) *rip_rel = 1;
         return (int)(pos + 1);
     }
     if (op == 0xE8 || op == 0xE9) {
         if (pos + 4 > avail) return 0;
+        if (rip_rel) *rip_rel = 1;
         return (int)(pos + 4);
     }
     if (op >= 0xB0 && op <= 0xB7) {
@@ -603,6 +635,7 @@ static int yghv_inst_len(const uint8_t *p, size_t avail) {
         pos++;
         if (op2 >= 0x80 && op2 <= 0x8F) {
             if (pos + 4 > avail) return 0;
+            if (rip_rel) *rip_rel = 1;
             return (int)(pos + 4);
         }
         if (op2 == 0x05 || op2 == 0x07 || op2 == 0x08 || op2 == 0x09 ||
@@ -617,6 +650,8 @@ static int yghv_inst_len(const uint8_t *p, size_t avail) {
             op3 = p[pos];
             pos++;
             (void)op3;
+            if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
+                *rip_rel = 1;
             if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
             if (op2 == 0x3A) {
                 if (after + 1 > avail) return 0;
@@ -627,12 +662,16 @@ static int yghv_inst_len(const uint8_t *p, size_t avail) {
         if (op2 == 0x0F || op2 == 0xBA || op2 == 0xC0 || op2 == 0xC1 ||
             op2 == 0xC4 || op2 == 0xC5) {
             size_t after = pos;
+            if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
+                *rip_rel = 1;
             if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
             if (after + 1 > avail) return 0;
             return (int)(after + 1);
         }
         {
             size_t after = pos;
+            if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
+                *rip_rel = 1;
             if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
             return (int)after;
         }
@@ -644,6 +683,8 @@ static int yghv_inst_len(const uint8_t *p, size_t avail) {
         size_t after = pos;
         size_t imm = (op == 0x69 || op == 0x81 || op == 0xC7 || op == 0xF7)
                          ? 4 : 1;
+        if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
+            *rip_rel = 1;
         if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
         if (after + imm > avail) return 0;
         return (int)(after + imm);
@@ -651,6 +692,8 @@ static int yghv_inst_len(const uint8_t *p, size_t avail) {
 
     {
         size_t after = pos;
+        if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
+            *rip_rel = 1;
         if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
         return (int)after;
     }
@@ -663,19 +706,25 @@ int yghv_protect_validate_hook_target(uint64_t func_va) {
 
     if (!func_va)
         return -1;
-    if ((func_va & (HV_PAGE_SIZE - 1)) > HV_PAGE_SIZE - YGHV_PROTECT_PATCH_LEN)
+    avail = HV_PAGE_SIZE - (func_va & (HV_PAGE_SIZE - 1));
+    if (avail < YGHV_PROTECT_PATCH_MIN)
         return -1;
     p = (const uint8_t *)func_va;
-    avail = HV_PAGE_SIZE - (func_va & (HV_PAGE_SIZE - 1));
     while (off < YGHV_PROTECT_PATCH_LEN) {
-        int len = yghv_inst_len(p + off, avail - off);
+        int rip_rel = 0;
+        int len = yghv_inst_len(p + off, avail - off, &rip_rel);
         if (len <= 0)
             return -1;
-        if (off + (size_t)len > YGHV_PROTECT_PATCH_LEN)
+        if (rip_rel)
             return -1;
         off += (size_t)len;
+        if (off >= YGHV_PROTECT_PATCH_MIN &&
+            off <= YGHV_PROTECT_PATCH_LEN)
+            return (int)off;
+        if (off > YGHV_PROTECT_PATCH_LEN)
+            return -1;
     }
-    return off == YGHV_PROTECT_PATCH_LEN ? 0 : -1;
+    return -1;
 }
 
 NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
@@ -692,14 +741,17 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     uint64_t func_pa, page_va, page_pa;
     uint8_t *orig;
     uint8_t *wmap = NULL;
+    PMDL wmdl = NULL;
     yghv_protect_page_t *pp;
     yghv_protect_hook_t *h;
+    int patch_len;
     NTSTATUS st;
 
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
     h = &g_protect_hooks[hook_id];
     if (h->installed) return STATUS_ALREADY_COMMITTED;
-    if (yghv_protect_validate_hook_target(func_va)) {
+    patch_len = yghv_protect_validate_hook_target(func_va);
+    if (patch_len < 0) {
         LOG_ERROR("protect hook %u: invalid target va=0x%llx", hook_id, func_va);
         return STATUS_INVALID_PARAMETER;
     }
@@ -707,7 +759,8 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     func_pa = MmGetPhysicalAddress((PVOID)func_va).QuadPart;
     page_va = func_va & ~(HV_PAGE_SIZE - 1);
     page_pa = MmGetPhysicalAddress((PVOID)page_va).QuadPart;
-    RtlCopyMemory(h->original, (void *)func_va, YGHV_PROTECT_PATCH_LEN);
+    h->patch_len = (uint8_t)patch_len;
+    RtlCopyMemory(h->original, (void *)func_va, h->patch_len);
     h->func_va = func_va;
     h->func_pa = func_pa;
     h->hook_id = hook_id;
@@ -718,43 +771,45 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     RtlZeroMemory(stub, HV_PAGE_SIZE);
     g_hook_stub_pages[hook_id] = stub;
 
-    /* entry: push rax/rcx/rbx, mov rbx,hook_id, movabs rcx,cookie,
-       mov rax,HOOK_QUERY, vmmcall, test rax,rax, jnz deny */
+    /* entry: push rax/rcx/rbx; compare current CR3 with the protected target.
+       Native callers are not in guest mode, so the decision must not depend
+       on a VMMCALL VMEXIT. */
     uint8_t *p = stub;
     p[0]=0x50; p[1]=0x51; p[2]=0x53;               /* push rax,rcx,rbx */
-    p[3]=0x48; p[4]=0xC7; p[5]=0xC3;               /* mov rbx, imm32 */
-    p[6]=hook_id; p[7]=0; p[8]=0; p[9]=0;
-    p[10]=0x48; p[11]=0xB9;                        /* movabs rcx, imm64 */
-    yghv_emit_u64(p+12, g_vmmcall_auth_cookie);
-    p[20]=0x48; p[21]=0xB8;                        /* movabs rax, HOOK_QUERY */
-    yghv_emit_u64(p+22, YGHV_CMD_HOOK_QUERY);
-    p[30]=0x0F; p[31]=0x01; p[32]=0xD9;            /* vmmcall */
-    p[33]=0x48; p[34]=0x85; p[35]=0xC0;            /* test rax,rax */
-    p[36]=0x75; p[37]=0x08;                        /* jnz +8 -> deny at 0x2E */
-    p[38]=0x5B; p[39]=0x59; p[40]=0x58;            /* pop rbx,rcx,rax */
-    p[41]=0xE9;                                    /* jmp rel32 -> original slot */
+    p[3]=0x48; p[4]=0xBB;                           /* movabs rbx, &g_protect.cr3 */
+    yghv_emit_u64(p+5, (uint64_t)&g_protect.cr3);
+    p[13]=0x48; p[14]=0x8B; p[15]=0x1B;             /* mov rbx,[rbx] */
+    p[16]=0x48; p[17]=0x0F; p[18]=0x20; p[19]=0xD8; /* mov rax,cr3 */
+    p[20]=0x48; p[21]=0x25; p[22]=0x00; p[23]=0xF0;
+    p[24]=0xFF; p[25]=0xFF;                         /* and rax, ~0xFFF */
+    p[26]=0x48; p[27]=0x81; p[28]=0xE3; p[29]=0x00;
+    p[30]=0xF0; p[31]=0xFF; p[32]=0xFF;             /* and rbx, ~0xFFF */
+    p[33]=0x48; p[34]=0x39; p[35]=0xD8;             /* cmp rax,rbx */
+    p[36]=0x75; p[37]=0x08;                         /* jne deny at 0x2E */
+    p[38]=0x5B; p[39]=0x59; p[40]=0x58;             /* pop rbx,rcx,rax */
+    p[41]=0xE9;                                     /* jmp rel32 -> orig slot */
     /* rel32 patched below */
-    p[46]=0x5B; p[47]=0x59; p[48]=0x58;            /* deny: pop rbx,rcx,rax */
-    p[49]=0x48; p[50]=0xB8;                        /* movabs rax, STATUS_ACCESS_DENIED */
+    p[46]=0x5B; p[47]=0x59; p[48]=0x58;             /* deny: pop rbx,rcx,rax */
+    p[49]=0x48; p[50]=0xB8;                         /* movabs rax, STATUS_ACCESS_DENIED */
     yghv_emit_u64(p+51, 0xC0000022ULL);
-    p[59]=0xC3;                                    /* ret */
+    p[59]=0xC3;                                     /* ret */
 
     /* original slot at offset 0x40 */
     orig = stub + 0x40;
-    RtlCopyMemory(orig, h->original, YGHV_PROTECT_PATCH_LEN);
-    /* jump back to func_va+16 after original bytes */
-    orig[0x10] = 0x49; orig[0x11] = 0xBB;          /* movabs r11, imm64 */
-    yghv_emit_u64(orig + 0x12, func_va + YGHV_PROTECT_PATCH_LEN);
-    orig[0x1A] = 0x41; orig[0x1B] = 0xFF; orig[0x1C] = 0xE3;  /* jmp r11 */
+    RtlCopyMemory(orig, h->original, h->patch_len);
+    /* jump back to func_va + patch_len after the copied original bytes */
+    orig[h->patch_len] = 0x49; orig[h->patch_len+1] = 0xBB;
+    yghv_emit_u64(orig + h->patch_len + 2, func_va + h->patch_len);
+    orig[h->patch_len+10] = 0x41; orig[h->patch_len+11] = 0xFF;
+    orig[h->patch_len+12] = 0xE3;                   /* jmp r11 */
 
     yghv_emit_rel32(p + 41, (uint64_t)(p + 41), (uint64_t)orig);
 
-    /* patch function entry: 16-byte absolute jump -> stub */
-    yghv_emit_abs_jmp16(patch, (uint64_t)stub);
-    wmap = (uint8_t *)MmGetVirtualForPhysical(
-        (PHYSICAL_ADDRESS){ .QuadPart = page_pa });
+    /* patch function entry: variable-length absolute jump -> stub */
+    yghv_emit_abs_jmp(patch, h->patch_len, (uint64_t)stub);
+    wmap = yghv_protect_map_writable_page(page_va, &wmdl);
     if (!wmap) {
-        LOG_ERROR("protect hook %u: direct map of function page 0x%llx failed",
+        LOG_ERROR("protect hook %u: writable map of function page 0x%llx failed",
             hook_id, page_pa);
         st = STATUS_UNSUCCESSFUL;
         goto fail;
@@ -765,8 +820,8 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
         goto fail;
     }
     RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), patch,
-        YGHV_PROTECT_PATCH_LEN);
-    KeInvalidateRangeAllCaches((PVOID)func_va, YGHV_PROTECT_PATCH_LEN);
+        h->patch_len);
+    KeInvalidateRangeAllCaches((PVOID)func_va, h->patch_len);
     svm_core_resume_residents();
 
     /* write-protect the function's page in NPT */
@@ -807,20 +862,23 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     }
 
     h->installed = 1;
-    LOG_ERROR("protect hook %u installed: va=0x%llx pa=0x%llx", hook_id, func_va, func_pa);
+    LOG_ERROR("protect hook %u installed: va=0x%llx pa=0x%llx len=%u",
+        hook_id, func_va, func_pa, h->patch_len);
     return STATUS_SUCCESS;
 
 fail:
     npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
     if (wmap) {
         RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), h->original,
-            YGHV_PROTECT_PATCH_LEN);
-        KeInvalidateRangeAllCaches((PVOID)func_va, YGHV_PROTECT_PATCH_LEN);
+            h->patch_len);
+        KeInvalidateRangeAllCaches((PVOID)func_va, h->patch_len);
     }
+    yghv_protect_unmap_writable_page(wmdl, wmap);
     if (g_hook_stub_pages[hook_id]) {
         ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
         g_hook_stub_pages[hook_id] = NULL;
     }
+    h->patch_len = 0;
     return st;
 }
 
@@ -834,7 +892,8 @@ NTSTATUS yghv_protect_remove_hook(uint8_t hook_id) {
 
 static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     yghv_protect_hook_t *h;
-    uint8_t *wmap;
+    uint8_t *wmap = NULL;
+    PMDL wmdl = NULL;
     uint64_t page_pa;
     NTSTATUS st;
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
@@ -843,11 +902,11 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
 
     page_pa = MmGetPhysicalAddress(
         (PVOID)(h->func_va & ~(HV_PAGE_SIZE - 1))).QuadPart;
-    wmap = (uint8_t *)MmGetVirtualForPhysical(
-        (PHYSICAL_ADDRESS){ .QuadPart = page_pa });
+    wmap = yghv_protect_map_writable_page(
+        h->func_va & ~(HV_PAGE_SIZE - 1), &wmdl);
     if (!wmap) {
         LOG_ERROR(
-            "protect remove hook %u: direct map of function page 0x%llx failed",
+            "protect remove hook %u: writable map of function page 0x%llx failed",
             hook_id, page_pa);
         return STATUS_UNSUCCESSFUL;
     }
@@ -857,6 +916,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect remove hook %u: remove_page failed 0x%x",
             hook_id, st);
+        yghv_protect_unmap_writable_page(wmdl, wmap);
         return st;
     }
 
@@ -864,17 +924,20 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect remove hook %u: patch rendezvous failed 0x%x",
             hook_id, st);
+        yghv_protect_unmap_writable_page(wmdl, wmap);
         return st;
     }
     RtlCopyMemory(wmap + (h->func_va & (HV_PAGE_SIZE - 1)), h->original,
-        YGHV_PROTECT_PATCH_LEN);
-    KeInvalidateRangeAllCaches((PVOID)h->func_va, YGHV_PROTECT_PATCH_LEN);
+        h->patch_len);
+    KeInvalidateRangeAllCaches((PVOID)h->func_va, h->patch_len);
     svm_core_resume_residents();
+    yghv_protect_unmap_writable_page(wmdl, wmap);
     if (g_hook_stub_pages[hook_id]) {
         ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
         g_hook_stub_pages[hook_id] = NULL;
     }
     h->installed = 0;
+    h->patch_len = 0;
     LOG_ERROR("protect hook %u removed", hook_id);
     return STATUS_SUCCESS;
 }

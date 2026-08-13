@@ -7,6 +7,7 @@
 #define YGHV_PROTECT_MAX_PAGES 64
 #define YGHV_PROTECT_MAX_HOOKS 4
 #define YGHV_PROTECT_PATCH_LEN 16
+#define YGHV_PROTECT_PATCH_MIN 12
 
 typedef enum {
     YGHV_PROTECT_MEM     = 0x1,
@@ -35,6 +36,7 @@ typedef struct {
     uint64_t func_va;
     uint64_t func_pa;
     uint8_t  original[YGHV_PROTECT_PATCH_LEN];
+    uint8_t  patch_len;
     uint8_t  installed;
     uint8_t  hook_id;
 } yghv_protect_hook_t;

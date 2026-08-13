@@ -1560,3 +1560,75 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   在持久 resident 下未完全清理，下一窗口定位（与本次客户端改动无关）。
 - 构建说明：JNI DLL/.class 均在 .gitignore，不入库，仅源码入库；C 盘
   驱动未改动，仍为 `70888311...`。
+
+### 9.110 2026-08-13 Codex 再次重启后项目注册表恢复
+
+- 第二次重启后 `.codex-global-state.json` 的 `local-projects` 被应用重置为空，项目再次从侧边栏消失；`config.toml` 与 `state_5.sqlite` 会话记录仍完整。
+- 修复：将备份中的 yuanguard/mcmodwork 项目记录、`project-order`、projectless thread 元数据合并回 `.codex-global-state.json`，并同步 `.codex-global-state.json.bak`。
+- 新备份：`C:\Users\Administrator\.codex\backup-20260813-173415-restore-after-restart`。
+- 若再次重启后项目又消失，可用该备份里的 `.codex-global-state.json` 恢复，或重新执行合并。
+
+### 9.111 2026-08-13 Codex 运行时改写全局状态说明 + 一键恢复脚本
+
+- 第二次直接合并 `.codex-global-state.json` 后，运行中的 Codex 约 1 分钟内把 `local-projects` 又写回空（文件 mtime 17:34:58）。
+- 初步根因：应用以内存中的空项目列表覆盖磁盘状态；会话正文、state_5.sqlite 与 config.toml 均未损坏。
+- 新增恢复脚本：`C:\Users\Administrator\Documents\Codex\2026-08-13\w\restore-codex-projects.ps1`。
+- 使用方式：完全退出 Codex 后运行 `powershell -ExecutionPolicy Bypass -File C:\Users\Administrator\Documents\Codex\2026-08-13\w\restore-codex-projects.ps1`，再重新打开 Codex；脚本会从 `backup-20260813-160358-config-session-restore` 合并项目并同步 `.bak`。
+
+### 9.112 2026-08-13 Codex 项目恢复脚本修正（进程名检测）
+
+- 原因：桌面应用进程名是 `ChatGPT`，旧恢复脚本只检测 `Codex*`，导致在应用仍在运行时写入 `.codex-global-state.json`，随后被应用内存中的空项目列表覆盖。
+- 修复：`restore-codex-projects.ps1` 现在检测 `ChatGPT` / `Codex*` / `OpenAI.Codex*` 进程，应用未退出时直接拒绝写入；写入后还会自检 `local-projects` 非空。
+- 新增双击入口：`C:\Users\Administrator\Documents\Codex\2026-08-13\w\restore-codex-projects.cmd`。
+- 使用方式：完全退出 Codex（确认任务管理器无 ChatGPT 进程）→ 双击 `restore-codex-projects.cmd` 或运行 `powershell -ExecutionPolicy Bypass -File ...\restore-codex-projects.ps1` → 重新打开 Codex。
+
+### 9.113 2026-08-13 Windows PowerShell 5.1 UTF-8 读取修复
+
+- 用户运行脚本报 `ConvertFrom-Json : 传入的数组无效`；原因是 `powershell.exe`（5.1）默认按 ANSI/GBK 读取 UTF-8 的 `.codex-global-state.json`，`prompt-history` 中文被读坏。
+- 已确认文件本身是有效 UTF-8 JSON。
+- 脚本已改为用 `[System.IO.File]::ReadAllText(..., UTF8)` 读取、`WriteAllText(..., UTF8 no BOM)` 写入；Windows PowerShell 5.1 下模拟合并自检通过，恢复出 yuanguard/mcmodwork。
+- 使用方式不变：完全退出 Codex 后运行 `restore-codex-projects.cmd`。
+
+### 9.114 2026-08-13 桌面恢复工具（参考 Pankaj-1N 实现）
+
+- 参考 GitHub 上的 `Pankaj-1N/codex-desktop-windows-sidebar-recovery` 实现，把恢复工具放入桌面单独文件夹：`C:\Users\Administrator\Desktop\Codex-Project-Restore`。
+- 内容：`restore-codex-projects.cmd`、`restore-codex-projects.ps1`、`recovery_core.py`、`codex-sidebar-recovery.ps1`、`restore-backup.ps1`、`restore-thread-titles.py`、`codex-projects-backup.json`、README.md、LICENSE/NOTICE。
+- 改进：正式恢复会重建 `project-writable-roots`、`thread-project-assignments`、`sidebar-project-thread-orders`，强制项目视图模式，修复 `session_index.jsonl`，再合并备份中的 yuanguard/mcmodwork，保留后续新增项目。
+- 使用：双击 `restore-codex-projects.cmd`；若 Codex 仍在运行会等待退出，然后自动执行恢复，完成后重新打开 Codex。
+- 已做 dry-run 验证：sqlite_integrity=ok，active=17，real=13，recoverable_projects=3（yuanguard、mcmodwork、plugin-e2e），无写入。
+
+### 9.115 2026-08-13 真实 hook 加固：MDL 可写映射 + 原生 allow/deny 验证（PASS）
+
+- 蓝屏事件复盘：门控版真实 hook 首次实机在安装 `ZwOpenProcess` 时触发
+  `0x50 PAGE_FAULT_IN_NONPAGED_AREA`（17:28，dump 已归档
+  `D:\aaaaaavm\yghv_bsod_0x50_realhook_20260813_1728.dmp`）。根因：
+  `MmGetVirtualForPhysical` 对 ntoskrnl 映像物理页返回的是只读映像地址，
+  `RtlCopyMemory` 直接写入口即 0x50；不是 CR3 跳板逻辑错误。
+- 修复（用户已确认）：`protect.c` 新增
+  `yghv_protect_map_writable_page`（`IoAllocateMdl` +
+  `MmBuildMdlForNonPagedPool` + `MmMapLockedPagesSpecifyCache`）与
+  `yghv_protect_unmap_writable_page`，install/remove 一律通过 MDL 临时
+  可写映射写补丁/恢复原字节，写完立即 unmap；NPT 对函数页剔除写权限的
+  保护语义不变，临时写映射只在安装/移除瞬间存在。
+- 测试修正（用户已确认）：dump 反汇编确认 19045 上 `ZwTerminateProcess`
+  入口经 `KiServiceLinkage`/`KiServiceInternal` 进真实服务分发，guest 内
+  `call` 真实 `Zw*` 的模拟不成立（allow/deny 都返回同一怪值
+  `0x101bbcff`）。`main.c` 的 `yghv_real_hook_test` 改为原生调用
+  `ZwTerminateProcess((HANDLE)0xDEADBEEF)` 验证：allow 期望正常错误码
+  （实测 `0xC0000008`），deny 期望 `0xC0000022`（实测 PASS）。
+- 断言修正：`NTSTATUS` 为 32 位 `long`，比较常量改为 `0xC0000022L`；
+  此前 `0xC0000022ULL` 与 `long` 比较恒真/恒假，会导致 deny 永远 FAIL。
+- 实机验证（门控版 `YGHV_REAL_HOOK_TEST=1`，SHA256
+  `88D7D9866722C74CEE59E7909C9BC3E13F969AE3E2E11F6BA8DBAA7A31DE0CDC`，
+  归档 `D:\aaaaaavm\yuanguard_hv_realhook_mdl_native_20260813.sys`）：
+  服务 RUNNING，完整自测 PASS——hook test / hook resident allow+deny /
+  boundary / real hook open ok / real hook allow=0xC0000008 /
+  deny=0xC0000022 / 多核心 heartbeat / all stopped，无回归。
+- 收尾：`sc stop yuanguard` 后 `C:\yuanguard_hv.sys` 已恢复稳定默认版
+  `70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B`
+  （归档 `D:\aaaaaavm\yuanguard_hv_default_cpcr_20260813.sys`），服务
+  STOPPED。本轮提交 5 个文件（build.bat、protect.h、protect.c、main.c、
+  交接文档），保留上一轮遗留的 9.110-9.114 Codex 恢复记录。
+- 待续：阶段 2B 多目标/配置 IOCTL + 定位驱动启动自测后
+  `g_protect.page_count=2` 残留；阶段 2C 驱动服务持久化/防卸载与
+  `loader_stealth.c` 接线。
