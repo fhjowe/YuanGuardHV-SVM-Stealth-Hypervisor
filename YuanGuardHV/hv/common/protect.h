@@ -23,12 +23,18 @@ typedef struct {
 } yghv_protect_page_t;
 
 typedef struct {
+    ULONG auto_disarm;
+    ULONG deny_status;
+} yghv_protect_config_t;
+
+typedef struct {
     uint32_t pid;
     uint64_t cr3;
     PEPROCESS process;
     uint64_t flags;
     uint32_t page_count;
     yghv_protect_page_t pages[YGHV_PROTECT_MAX_PAGES];
+    yghv_protect_config_t config;
     volatile BOOLEAN active;
 } yghv_protect_state_t;
 
@@ -40,6 +46,42 @@ typedef struct {
     uint8_t  installed;
     uint8_t  hook_id;
 } yghv_protect_hook_t;
+
+typedef struct {
+    ULONG active;
+    ULONG pid;
+    ULONG page_count;
+    ULONG hook_count;
+    ULONG_PTR cr3;
+} yghv_protect_target_info_t;
+
+typedef struct {
+    uint64_t gpa;
+    uint64_t target_va;
+    uint8_t  flags;
+    uint8_t  armed;
+    uint8_t  reserved[6];
+} yghv_protect_page_info_t;
+
+typedef struct {
+    ULONG count;
+    ULONG returned;
+    yghv_protect_page_info_t pages[YGHV_PROTECT_MAX_PAGES];
+} yghv_protect_pages_info_t;
+
+typedef struct {
+    uint64_t func_va;
+    uint32_t hook_id;
+    uint32_t installed;
+    uint32_t patch_len;
+    uint32_t reserved;
+} yghv_protect_hook_info_t;
+
+typedef struct {
+    ULONG count;
+    ULONG returned;
+    yghv_protect_hook_info_t hooks[YGHV_PROTECT_MAX_HOOKS];
+} yghv_protect_hooks_info_t;
 
 typedef enum {
     YGHV_NPF_NONE = 0,
@@ -67,6 +109,13 @@ yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa);
 void yghv_protect_rearm(svm_vcpu_t *vcpu);
 void yghv_protect_get_state(ULONG *active, ULONG *pid, ULONG *page_count);
 void yghv_protect_get_heartbeat(uint64_t *page_va, uint64_t *hook_va);
+void yghv_protect_get_target(ULONG *active, ULONG *pid, ULONG_PTR *cr3,
+    ULONG *page_count, ULONG *hook_count);
+void yghv_protect_get_pages_info(yghv_protect_pages_info_t *info);
+void yghv_protect_get_hooks_info(yghv_protect_hooks_info_t *info);
+NTSTATUS yghv_protect_clear(void);
+NTSTATUS yghv_protect_set_config(const yghv_protect_config_t *cfg);
+void yghv_protect_get_config(yghv_protect_config_t *out);
 BOOLEAN yghv_protect_check_target_exited(void);
 BOOLEAN yghv_protect_on_target_exit(ULONG pid);
 int yghv_protect_validate_hook_target(uint64_t func_va);

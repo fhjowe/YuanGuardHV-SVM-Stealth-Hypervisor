@@ -100,6 +100,8 @@ NTSTATUS yghv_protect_init(void) {
     ExInitializeFastMutex(&g_protect_lock);
     RtlZeroMemory(&g_protect, sizeof(g_protect));
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
+    g_protect.config.auto_disarm = 1;
+    g_protect.config.deny_status = 0xC0000022;
     return STATUS_SUCCESS;
 }
 
@@ -363,15 +365,19 @@ yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa) {
     if (pp) {
         if (yghv_protect_is_target_cr3_locked(vcpu->vmcb->state.cr3) ||
             vcpu->vmcb->state.cpl == 0) {
-            st = yghv_protect_disarm_page_locked(pp);
-            if (st) {
-                LOG_ERROR("protect: disarm failed gpa=0x%llx st=0x%x",
-                    pp->gpa, st);
-                result = YGHV_NPF_DENY;
+            if (g_protect.config.auto_disarm) {
+                st = yghv_protect_disarm_page_locked(pp);
+                if (st) {
+                    LOG_ERROR("protect: disarm failed gpa=0x%llx st=0x%x",
+                        pp->gpa, st);
+                    result = YGHV_NPF_DENY;
+                } else {
+                    vcpu->rearm_gpa = pp->gpa;
+                    vcpu->rearm_pending = 1;
+                    result = YGHV_NPF_ALLOW;
+                }
             } else {
-                vcpu->rearm_gpa = pp->gpa;
-                vcpu->rearm_pending = 1;
-                result = YGHV_NPF_ALLOW;
+                result = YGHV_NPF_DENY;
             }
         } else {
             result = YGHV_NPF_DENY;
@@ -416,6 +422,113 @@ void yghv_protect_get_heartbeat(uint64_t *page_va, uint64_t *hook_va) {
         *page_va = g_protect.page_count ? g_protect.pages[0].target_va : 0;
     if (hook_va)
         *hook_va = g_protect_hooks[0].installed ? g_protect_hooks[0].func_va : 0;
+    ExReleaseFastMutex(&g_protect_lock);
+}
+
+void yghv_protect_get_target(ULONG *active, ULONG *pid, ULONG_PTR *cr3,
+    ULONG *page_count, ULONG *hook_count) {
+    ULONG i;
+    ExAcquireFastMutex(&g_protect_lock);
+    if (active) *active = g_protect.active ? 1 : 0;
+    if (pid) *pid = g_protect.pid;
+    if (cr3) *cr3 = g_protect.cr3;
+    if (page_count) *page_count = g_protect.page_count;
+    if (hook_count) {
+        ULONG n = 0;
+        for (i = 0; i < YGHV_PROTECT_MAX_HOOKS; i++) {
+            if (g_protect_hooks[i].installed)
+                n++;
+        }
+        *hook_count = n;
+    }
+    ExReleaseFastMutex(&g_protect_lock);
+}
+
+void yghv_protect_get_pages_info(yghv_protect_pages_info_t *info) {
+    ULONG i;
+    ULONG n;
+    ExAcquireFastMutex(&g_protect_lock);
+    n = g_protect.page_count;
+    if (info->count < n)
+        n = info->count;
+    info->returned = g_protect.page_count;
+    for (i = 0; i < n; i++) {
+        info->pages[i].gpa = g_protect.pages[i].gpa;
+        info->pages[i].target_va = g_protect.pages[i].target_va;
+        info->pages[i].flags = g_protect.pages[i].flags;
+        info->pages[i].armed = g_protect.pages[i].armed;
+        RtlZeroMemory(info->pages[i].reserved, sizeof(info->pages[i].reserved));
+    }
+    ExReleaseFastMutex(&g_protect_lock);
+}
+
+void yghv_protect_get_hooks_info(yghv_protect_hooks_info_t *info) {
+    ULONG i;
+    ULONG n;
+    ExAcquireFastMutex(&g_protect_lock);
+    n = 0;
+    for (i = 0; i < YGHV_PROTECT_MAX_HOOKS; i++) {
+        if (!g_protect_hooks[i].installed)
+            continue;
+        if (n < info->count) {
+            info->hooks[n].func_va = g_protect_hooks[i].func_va;
+            info->hooks[n].hook_id = g_protect_hooks[i].hook_id;
+            info->hooks[n].installed = 1;
+            info->hooks[n].patch_len = g_protect_hooks[i].patch_len;
+            info->hooks[n].reserved = 0;
+        }
+        n++;
+    }
+    info->returned = n;
+    ExReleaseFastMutex(&g_protect_lock);
+}
+
+NTSTATUS yghv_protect_clear(void) {
+    uint32_t i;
+    ExAcquireFastMutex(&g_protect_lock);
+    if (g_protect.active)
+        yghv_protect_stop_locked();
+    for (i = 0; i < YGHV_PROTECT_MAX_HOOKS; i++) {
+        if (g_protect_hooks[i].installed)
+            yghv_protect_remove_hook_locked(i);
+    }
+    g_protect.page_count = 0;
+    if (g_protect.process) {
+        ObDereferenceObject(g_protect.process);
+        g_protect.process = NULL;
+    }
+    g_protect.pid = 0;
+    g_protect.cr3 = 0;
+    g_protect.active = FALSE;
+    LOG_ERROR("protect clear: target/pages/hooks cleared");
+    ExReleaseFastMutex(&g_protect_lock);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS yghv_protect_set_config(const yghv_protect_config_t *cfg) {
+    if (!cfg)
+        return STATUS_INVALID_PARAMETER;
+    if (cfg->auto_disarm > 1 || cfg->deny_status == 0)
+        return STATUS_INVALID_PARAMETER;
+    ExAcquireFastMutex(&g_protect_lock);
+    /* Strict deny (auto_disarm=0) makes every write to an armed page inject
+       #PF. Persistent workload guests have no #PF handler, so reject the
+       combination while protection is active. */
+    if (cfg->auto_disarm == 0 && g_protect.active) {
+        ExReleaseFastMutex(&g_protect_lock);
+        return STATUS_ACCESS_DENIED;
+    }
+    g_protect.config.auto_disarm = cfg->auto_disarm;
+    g_protect.config.deny_status = cfg->deny_status;
+    LOG_ERROR("protect config: auto_disarm=%u deny_status=0x%x",
+        g_protect.config.auto_disarm, g_protect.config.deny_status);
+    ExReleaseFastMutex(&g_protect_lock);
+    return STATUS_SUCCESS;
+}
+
+void yghv_protect_get_config(yghv_protect_config_t *out) {
+    ExAcquireFastMutex(&g_protect_lock);
+    *out = g_protect.config;
     ExReleaseFastMutex(&g_protect_lock);
 }
 
@@ -790,9 +903,10 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     p[41]=0xE9;                                     /* jmp rel32 -> orig slot */
     /* rel32 patched below */
     p[46]=0x5B; p[47]=0x59; p[48]=0x58;             /* deny: pop rbx,rcx,rax */
-    p[49]=0x48; p[50]=0xB8;                         /* movabs rax, STATUS_ACCESS_DENIED */
-    yghv_emit_u64(p+51, 0xC0000022ULL);
-    p[59]=0xC3;                                     /* ret */
+    p[49]=0x48; p[50]=0xB8;                         /* movabs rax, &deny_status */
+    yghv_emit_u64(p+51, (uint64_t)&g_protect.config.deny_status);
+    p[59]=0x8B; p[60]=0x00;                         /* mov eax, [rax] */
+    p[61]=0xC3;                                     /* ret */
 
     /* original slot at offset 0x40 */
     orig = stub + 0x40;

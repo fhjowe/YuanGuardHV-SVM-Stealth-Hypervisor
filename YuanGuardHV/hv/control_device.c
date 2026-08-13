@@ -5,6 +5,8 @@
 #include "debug.h"
 
 NTKERNELAPI PEPROCESS IoGetRequestorProcess(PIRP Irp);
+NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
+                                        PIO_STATUS_BLOCK IoStatusBlock);
 
 static PDEVICE_OBJECT g_yghv_device = NULL;
 
@@ -12,6 +14,39 @@ typedef struct {
     PEPROCESS owner_process;
     uint64_t owner_cr3;
 } yghv_ctl_ctx_t;
+
+static void yghv_ioctl_log(const char *dir, ULONG code) {
+    static const char hex[] = "0123456789abcdef";
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h;
+    char buf[64];
+    size_t n = 0;
+    int i;
+    NTSTATUS st;
+
+    RtlInitUnicodeString(&name, L"\\SystemRoot\\yghv_ioctl.log");
+    InitializeObjectAttributes(&oa, &name,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    st = ZwCreateFile(&h, FILE_APPEND_DATA, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    if (!NT_SUCCESS(st))
+        return;
+    while (dir[n] && n < sizeof(buf) - 3)
+        buf[n++] = dir[n];
+    buf[n++] = ' ';
+    buf[n++] = 'i'; buf[n++] = 'o'; buf[n++] = 'c'; buf[n++] = 't';
+    buf[n++] = 'l'; buf[n++] = '='; buf[n++] = '0'; buf[n++] = 'x';
+    for (i = 7; i >= 0; i--)
+        buf[n++] = hex[(code >> (i * 4)) & 0xF];
+    buf[n++] = '\r';
+    buf[n++] = '\n';
+    ZwWriteFile(h, NULL, NULL, NULL, &iosb, buf, (ULONG)n, NULL, NULL);
+    ZwFlushBuffersFile(h, &iosb);
+    ZwClose(h);
+}
 
 static NTSTATUS yghv_control_complete(PIRP irp, NTSTATUS status, ULONG info) {
     irp->IoStatus.Status = status;
@@ -103,6 +138,8 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
     in_len = stack->Parameters.DeviceIoControl.InputBufferLength;
     out_len = stack->Parameters.DeviceIoControl.OutputBufferLength;
     buf = irp->AssociatedIrp.SystemBuffer;
+    yghv_trace_u64("ioctl code", code);
+    yghv_ioctl_log("in", code);
 
     switch (code) {
     case IOCTL_YGHV_SET_TARGET: {
@@ -152,6 +189,63 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         info = sizeof(*out);
         break;
     }
+    case IOCTL_YGHV_GET_TARGET: {
+        yghv_protect_target_info_t *out = (yghv_protect_target_info_t *)buf;
+        if (out_len < sizeof(*out)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        yghv_protect_get_target(&out->active, &out->pid, &out->cr3,
+            &out->page_count, &out->hook_count);
+        info = sizeof(*out);
+        break;
+    }
+    case IOCTL_YGHV_GET_PAGES: {
+        yghv_protect_pages_info_t *out = (yghv_protect_pages_info_t *)buf;
+        if (in_len < sizeof(*out) || out_len < sizeof(*out)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (out->count > YGHV_PROTECT_MAX_PAGES)
+            out->count = YGHV_PROTECT_MAX_PAGES;
+        yghv_protect_get_pages_info(out);
+        info = sizeof(*out);
+        break;
+    }
+    case IOCTL_YGHV_GET_HOOKS: {
+        yghv_protect_hooks_info_t *out = (yghv_protect_hooks_info_t *)buf;
+        if (in_len < sizeof(*out) || out_len < sizeof(*out)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        if (out->count > YGHV_PROTECT_MAX_HOOKS)
+            out->count = YGHV_PROTECT_MAX_HOOKS;
+        yghv_protect_get_hooks_info(out);
+        info = sizeof(*out);
+        break;
+    }
+    case IOCTL_YGHV_CLEAR:
+        status = yghv_protect_clear();
+        break;
+    case IOCTL_YGHV_SET_CONFIG: {
+        yghv_protect_config_t *in = (yghv_protect_config_t *)buf;
+        if (in_len < sizeof(*in)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        status = yghv_protect_set_config(in);
+        break;
+    }
+    case IOCTL_YGHV_GET_CONFIG: {
+        yghv_protect_config_t *out = (yghv_protect_config_t *)buf;
+        if (out_len < sizeof(*out)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        yghv_protect_get_config(out);
+        info = sizeof(*out);
+        break;
+    }
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;
@@ -159,6 +253,7 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
 
     if (!NT_SUCCESS(status))
         info = 0;
+    yghv_ioctl_log("out", code);
     return yghv_control_complete(irp, status, info);
 }
 

@@ -23,6 +23,9 @@
 #ifndef YGHV_REAL_HOOK_TEST
 #define YGHV_REAL_HOOK_TEST 0
 #endif
+#ifndef YGHV_HOOK_RENDEZVOUS_TEST
+#define YGHV_HOOK_RENDEZVOUS_TEST 0
+#endif
 
 NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
@@ -3447,6 +3450,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
     return st;
 }
 
+#if YGHV_HOOK_RENDEZVOUS_TEST
 static VOID yghv_hook_rendezvous_thread(PVOID context) {
     void *page;
     uint64_t target_va;
@@ -3505,6 +3509,7 @@ static void yghv_hook_rendezvous_join(void) {
     ZwClose(g_hook_rendezvous_thread);
     g_hook_rendezvous_thread = NULL;
 }
+#endif
 
 static NTSTATUS yghv_make_guest_code_executable(void) {
     uint64_t pa = MmGetPhysicalAddress(g_guest_code_page).QuadPart;
@@ -3523,7 +3528,9 @@ static void yghv_init_auth_cookie(void) {
 }
 
 void DriverUnload(struct _DRIVER_OBJECT *d) {
+#if YGHV_HOOK_RENDEZVOUS_TEST
     yghv_hook_rendezvous_join();
+#endif
     g_npt_test_active = 0;
     svm_core_stop_all_residents();
     svm_core_wait_all_stopped(g_vcpu_count);
@@ -4053,6 +4060,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
     svm_core_wait_remote_ready(online);
     g_persistent_mode = TRUE;
+#if YGHV_HOOK_RENDEZVOUS_TEST
     {
         NTSTATUS status = PsCreateSystemThread(
             &g_hook_rendezvous_thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
@@ -4062,6 +4070,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
             g_hook_rendezvous_thread = NULL;
         }
     }
+#endif
     LOG_ERROR("persistent protect mode active: %u cores", online);
     KeRevertToUserAffinityThread();
     return STATUS_SUCCESS;

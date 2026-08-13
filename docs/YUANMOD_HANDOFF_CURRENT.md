@@ -1632,3 +1632,47 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 待续：阶段 2B 多目标/配置 IOCTL + 定位驱动启动自测后
   `g_protect.page_count=2` 残留；阶段 2C 驱动服务持久化/防卸载与
   `loader_stealth.c` 接线。
+
+### 9.116 2026-08-13 阶段 2B-1：配置面 IOCTL + 客户端命令 + 冻结根因修复（PASS）
+
+- `page_count=2` 澄清：默认 `YGHV_RESIDENT_WORKLOAD_TEST=1`，稳定默认版
+  启动即进入持久保护模式（workload 页 + dummy hook 页 = 2 页），
+  `state` 显示 `page_count=2` 是设计行为，不是残留；9.114 记录为待办是
+  误判，本节修正。
+- 新增 IOCTL（`control_ioctl.h`）：`GET_TARGET 0x806`、
+  `GET_PAGES 0x807`、`GET_HOOKS 0x808`、`CLEAR 0x809`、
+  `SET_CONFIG 0x80A`、`GET_CONFIG 0x80B`；`protect.h` 新增
+  `yghv_protect_config_t`（auto_disarm/deny_status）与查询信息结构。
+- `protect.c`：新增目标/页/hook 查询、`yghv_protect_clear`、
+  `set/get_config`；NPF 写策略受 `config.auto_disarm` 控制（默认 1）；
+  hook stub deny 路径改为动态读取 `g_protect.config.deny_status`
+  （`movabs rax,&deny_status; mov eax,[rax]; ret`），deny 返回码可配置。
+- 客户端：`tools\yghv_ctl.ps1` 新增
+  `target/list-pages/list-hooks/clear/config` 命令，`selftest` 增加
+  `list-pages` 校验；`YghvCtl.java` 同步新增相同命令。
+- 冻结调查（本轮三次无 dump 硬冻结：18:26/18:32/18:46/18:54，Event
+  6008 意外关机）：稳定默认版 `70888311` 对照连续 IOCTL 不冻结；给
+  控制面新增独立运行期日志 `C:\Windows\yghv_ioctl.log` 后，最后一条
+  为 `SET_CONFIG (0x59472028)` 且无返回。根因：`auto_disarm=0` 时 NPF
+  对持久 workload guest 的受保护页写注入 `#PF`，裸机 guest 无异常处理，
+  平台级硬冻结（无 minidump）。
+- 修复（用户已确认）：`yghv_protect_set_config` 在 `g_protect.active`
+  时拒绝 `auto_disarm=0`（返回 `STATUS_ACCESS_DENIED`），停止保护后
+  才允许设置；同时默认关闭 `YGHV_HOOK_RENDEZVOUS_TEST`（原 persistent
+  模式 8 秒后后台 install/remove hook，持 `g_protect_lock` 全核心暂停，
+  与 NPF handler 存在 AB-BA 死锁风险，属自测残留，产品线不启用）。
+- 实机验证（新默认版 SHA256
+  `3F9B85B456C9884C4126B6792304A447BB350A7850417B11A1F0086EA1D36E0C`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_cfg_20260813.sys`）：只读 5 命令
+  序列、`GET_CONFIG`、active 下 `auto-disarm 0` 拒绝（error 0x5 不冻结）、
+  stop 后设置/恢复、`deny-status` 设置/恢复、新 `selftest`（含
+  list-pages 校验）PASS、`clear`、Java `config/target/list-pages/list-hooks`
+  及拒绝路径均 PASS；服务重启后持久保护恢复 2 页。
+- 已知限制（记录待办）：`clear` 后 `hook_count` 可能残留 1
+  （remove_hook 的全核心 pause 超时被忽略），需 `sc stop/start` 或后续
+  阶段 2B-2 优化 remove 的 pause/锁顺序；`auto_disarm=0` 只能在保护停止
+  时启用；运行期 IOCTL 日志写入 `C:\Windows\yghv_ioctl.log`。
+- 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
+  `70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B`，
+  服务 STOPPED。提交包含驱动、`control_ioctl.h`、PowerShell/Java 客户端
+  源码与交接文档；Java `.class`/JNI DLL 不入库。

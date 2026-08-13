@@ -15,6 +15,12 @@ public class YghvCtl {
     private static final int FN_START_PROTECT = 0x803;
     private static final int FN_STOP_PROTECT = 0x804;
     private static final int FN_GET_STATE = 0x805;
+    private static final int FN_GET_TARGET = 0x806;
+    private static final int FN_GET_PAGES = 0x807;
+    private static final int FN_GET_HOOKS = 0x808;
+    private static final int FN_CLEAR = 0x809;
+    private static final int FN_SET_CONFIG = 0x80A;
+    private static final int FN_GET_CONFIG = 0x80B;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);
@@ -83,6 +89,109 @@ public class YghvCtl {
         long[] s = state();
         System.out.printf("state: active=%d pid=%d page_count=%d%n",
                 s[0], s[1], s[2]);
+    }
+
+    private static void printTarget() {
+        byte[] out = new byte[24];
+        check(ioctl(handle, FN_GET_TARGET, null, out), "GET_TARGET");
+        ByteBuffer b = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
+        long active = Integer.toUnsignedLong(b.getInt());
+        long pid = Integer.toUnsignedLong(b.getInt());
+        long pageCount = Integer.toUnsignedLong(b.getInt());
+        long hookCount = Integer.toUnsignedLong(b.getInt());
+        long cr3 = b.getLong();
+        System.out.printf(
+                "target: active=%d pid=%d cr3=0x%X page_count=%d hook_count=%d%n",
+                active, pid, cr3, pageCount, hookCount);
+    }
+
+    private static void listPages() {
+        byte[] buf = new byte[4 + 4 + 64 * 24];
+        ByteBuffer in = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+        in.putInt(64);
+        byte[] out = new byte[buf.length];
+        System.arraycopy(buf, 0, out, 0, buf.length);
+        check(ioctl(handle, FN_GET_PAGES, out, out), "GET_PAGES");
+        ByteBuffer b = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
+        b.getInt(); /* count */
+        int returned = b.getInt();
+        System.out.printf("list-pages: returned=%d%n", returned);
+        for (int i = 0; i < returned; i++) {
+            long gpa = b.getLong();
+            long va = b.getLong();
+            int flags = b.get() & 0xFF;
+            int armed = b.get() & 0xFF;
+            b.get(new byte[6]);
+            System.out.printf("  gpa=0x%X va=0x%X flags=%d armed=%d%n",
+                    gpa, va, flags, armed);
+        }
+    }
+
+    private static void listHooks() {
+        byte[] buf = new byte[4 + 4 + 4 * 24];
+        ByteBuffer in = ByteBuffer.wrap(buf).order(ByteOrder.LITTLE_ENDIAN);
+        in.putInt(4);
+        byte[] out = new byte[buf.length];
+        System.arraycopy(buf, 0, out, 0, buf.length);
+        check(ioctl(handle, FN_GET_HOOKS, out, out), "GET_HOOKS");
+        ByteBuffer b = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
+        b.getInt(); /* count */
+        int returned = b.getInt();
+        System.out.printf("list-hooks: returned=%d%n", returned);
+        for (int i = 0; i < returned; i++) {
+            long va = b.getLong();
+            long hookId = Integer.toUnsignedLong(b.getInt());
+            long installed = Integer.toUnsignedLong(b.getInt());
+            long patchLen = Integer.toUnsignedLong(b.getInt());
+            b.getInt(); /* reserved */
+            System.out.printf("  id=%d va=0x%X installed=%d patch_len=%d%n",
+                    hookId, va, installed, patchLen);
+        }
+    }
+
+    private static void clear() {
+        check(ioctl(handle, FN_CLEAR, null, null), "CLEAR");
+        long[] s = state();
+        System.out.printf("clear: OK (active=%d pid=%d page_count=%d)%n",
+                s[0], s[1], s[2]);
+    }
+
+    private static void printConfig() {
+        byte[] out = new byte[8];
+        check(ioctl(handle, FN_GET_CONFIG, null, out), "GET_CONFIG");
+        ByteBuffer b = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN);
+        long autoDisarm = Integer.toUnsignedLong(b.getInt());
+        long denyStatus = Integer.toUnsignedLong(b.getInt());
+        System.out.printf("config: auto_disarm=%d deny_status=0x%X%n",
+                autoDisarm, denyStatus);
+    }
+
+    private static void setConfigAutoDisarm(long value) {
+        if (value > 1) {
+            fail("SET_CONFIG auto_disarm", 87 /* ERROR_INVALID_PARAMETER */);
+        }
+        byte[] cfg = new byte[8];
+        ByteBuffer b = ByteBuffer.wrap(cfg).order(ByteOrder.LITTLE_ENDIAN);
+        b.putInt((int) value);
+        byte[] cur = new byte[8];
+        check(ioctl(handle, FN_GET_CONFIG, null, cur), "GET_CONFIG");
+        b.putInt(ByteBuffer.wrap(cur).order(ByteOrder.LITTLE_ENDIAN).getInt(4));
+        check(ioctl(handle, FN_SET_CONFIG, cfg, null), "SET_CONFIG");
+        System.out.println("config: auto_disarm=" + value + " OK");
+    }
+
+    private static void setConfigDenyStatus(long value) {
+        if (value == 0) {
+            fail("SET_CONFIG deny_status", 87);
+        }
+        byte[] cfg = new byte[8];
+        ByteBuffer b = ByteBuffer.wrap(cfg).order(ByteOrder.LITTLE_ENDIAN);
+        byte[] cur = new byte[8];
+        check(ioctl(handle, FN_GET_CONFIG, null, cur), "GET_CONFIG");
+        b.putInt(ByteBuffer.wrap(cur).order(ByteOrder.LITTLE_ENDIAN).getInt(0));
+        b.putInt((int) value);
+        check(ioctl(handle, FN_SET_CONFIG, cfg, null), "SET_CONFIG");
+        System.out.printf("config: deny_status=0x%X OK%n", value);
     }
 
     private static void setTarget(long pid) {
@@ -174,6 +283,11 @@ public class YghvCtl {
         System.out.println("  YghvCtl remove-page <hex_va>");
         System.out.println("  YghvCtl start");
         System.out.println("  YghvCtl stop");
+        System.out.println("  YghvCtl target");
+        System.out.println("  YghvCtl list-pages");
+        System.out.println("  YghvCtl list-hooks");
+        System.out.println("  YghvCtl clear");
+        System.out.println("  YghvCtl config [auto-disarm <0|1> | deny-status <hex>]");
         System.out.println("  YghvCtl list-java");
         System.out.println("  YghvCtl protect <pid> [maxPages]");
     }
@@ -228,6 +342,54 @@ public class YghvCtl {
                     open();
                     try {
                         stop();
+                    } finally {
+                        close();
+                    }
+                    break;
+                case "target":
+                    open();
+                    try {
+                        printTarget();
+                    } finally {
+                        close();
+                    }
+                    break;
+                case "list-pages":
+                    open();
+                    try {
+                        listPages();
+                    } finally {
+                        close();
+                    }
+                    break;
+                case "list-hooks":
+                    open();
+                    try {
+                        listHooks();
+                    } finally {
+                        close();
+                    }
+                    break;
+                case "clear":
+                    open();
+                    try {
+                        clear();
+                    } finally {
+                        close();
+                    }
+                    break;
+                case "config":
+                    open();
+                    try {
+                        if (args.length == 1) {
+                            printConfig();
+                        } else if ("auto-disarm".equalsIgnoreCase(args[1])) {
+                            setConfigAutoDisarm(Long.parseLong(args[2]));
+                        } else if ("deny-status".equalsIgnoreCase(args[1])) {
+                            setConfigDenyStatus(Long.decode(args[2]));
+                        } else {
+                            usage();
+                        }
                     } finally {
                         close();
                     }

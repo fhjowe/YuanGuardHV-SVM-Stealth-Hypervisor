@@ -9,6 +9,11 @@ Commands:
   remove-page <hex_va>
   start
   stop
+  target
+  list-pages
+  list-hooks
+  clear
+  config [auto-disarm <0|1> | deny-status <hex>]
   selftest
   exit-test
 #>
@@ -183,6 +188,63 @@ function Read-YghvState {
     }
 }
 
+function Read-YghvTarget {
+    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x806)) -OutputLength 24
+    return @{
+        active    = [BitConverter]::ToUInt32($out, 0)
+        pid       = [BitConverter]::ToUInt32($out, 4)
+        pageCount = [BitConverter]::ToUInt32($out, 8)
+        hookCount = [BitConverter]::ToUInt32($out, 12)
+        cr3       = [BitConverter]::ToUInt64($out, 16)
+    }
+}
+
+function Read-YghvPages {
+    $buf = New-Object byte[] 1544
+    [BitConverter]::GetBytes([uint32]64).CopyTo($buf, 0)
+    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x807)) `
+        -InBytes $buf -OutputLength 1544
+    $returned = [BitConverter]::ToUInt32($out, 4)
+    $pages = @()
+    for ($i = 0; $i -lt $returned; $i++) {
+        $base = 8 + $i * 24
+        $pages += [pscustomobject]@{
+            gpa       = ('0x{0:X}' -f [BitConverter]::ToUInt64($out, $base))
+            targetVa  = ('0x{0:X}' -f [BitConverter]::ToUInt64($out, $base + 8))
+            flags     = $out[$base + 16]
+            armed     = $out[$base + 17]
+        }
+    }
+    return @{ returned = $returned; pages = $pages }
+}
+
+function Read-YghvHooks {
+    $buf = New-Object byte[] 104
+    [BitConverter]::GetBytes([uint32]4).CopyTo($buf, 0)
+    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x808)) `
+        -InBytes $buf -OutputLength 104
+    $returned = [BitConverter]::ToUInt32($out, 4)
+    $hooks = @()
+    for ($i = 0; $i -lt $returned; $i++) {
+        $base = 8 + $i * 24
+        $hooks += [pscustomobject]@{
+            funcVa   = ('0x{0:X}' -f [BitConverter]::ToUInt64($out, $base))
+            hookId   = [BitConverter]::ToUInt32($out, $base + 8)
+            installed = [BitConverter]::ToUInt32($out, $base + 12)
+            patchLen = [BitConverter]::ToUInt32($out, $base + 16)
+        }
+    }
+    return @{ returned = $returned; hooks = $hooks }
+}
+
+function Read-YghvConfig {
+    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80B)) -OutputLength 8
+    return @{
+        autoDisarm = [BitConverter]::ToUInt32($out, 0)
+        denyStatus = [BitConverter]::ToUInt32($out, 4)
+    }
+}
+
 try {
     switch ($Command.ToLower()) {
         'state' {
@@ -216,6 +278,62 @@ try {
             Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x804)) | Out-Null
             Write-Host 'stop: OK'
         }
+        'target' {
+            $t = Read-YghvTarget
+            Write-Host ("target: active={0} pid={1} cr3=0x{2:X} page_count={3} hook_count={4}" -f
+                $t.active, $t.pid, $t.cr3, $t.pageCount, $t.hookCount)
+        }
+        'list-pages' {
+            $r = Read-YghvPages
+            Write-Host ("list-pages: returned={0}" -f $r.returned)
+            foreach ($p in $r.pages) {
+                Write-Host ("  gpa={0} va={1} flags={2} armed={3}" -f
+                    $p.gpa, $p.targetVa, $p.flags, $p.armed)
+            }
+        }
+        'list-hooks' {
+            $r = Read-YghvHooks
+            Write-Host ("list-hooks: returned={0}" -f $r.returned)
+            foreach ($h in $r.hooks) {
+                Write-Host ("  id={0} va={1} installed={2} patch_len={3}" -f
+                    $h.hookId, $h.funcVa, $h.installed, $h.patchLen)
+            }
+        }
+        'clear' {
+            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x809)) | Out-Null
+            $st = Read-YghvState
+            Write-Host ("clear: OK (active={0} pid={1} page_count={2})" -f
+                $st.active, $st.pid, $st.pageCount)
+        }
+        'config' {
+            if ($null -eq $Arg1) {
+                $c = Read-YghvConfig
+                Write-Host ("config: auto_disarm={0} deny_status=0x{1:X}" -f
+                    $c.autoDisarm, $c.denyStatus)
+            } elseif ($Arg1.ToLower() -eq 'auto-disarm') {
+                $val = [uint32]::Parse($Arg2)
+                if ($val -gt 1) { throw 'config: auto-disarm must be 0 or 1' }
+                $cfg = New-Object byte[] 8
+                [BitConverter]::GetBytes($val).CopyTo($cfg, 0)
+                $cur = Read-YghvConfig
+                [BitConverter]::GetBytes([uint32]$cur.denyStatus).CopyTo($cfg, 4)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80A)) `
+                    -InBytes $cfg | Out-Null
+                Write-Host ("config: auto_disarm={0} OK" -f $val)
+            } elseif ($Arg1.ToLower() -eq 'deny-status') {
+                $val = [uint32]([Convert]::ToUInt64($Arg2, 16))
+                if ($val -eq 0) { throw 'config: deny-status must be non-zero' }
+                $cfg = New-Object byte[] 8
+                $cur = Read-YghvConfig
+                [BitConverter]::GetBytes([uint32]$cur.autoDisarm).CopyTo($cfg, 0)
+                [BitConverter]::GetBytes($val).CopyTo($cfg, 4)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80A)) `
+                    -InBytes $cfg | Out-Null
+                Write-Host ("config: deny_status=0x{0:X} OK" -f $val)
+            } else {
+                throw ("config: unknown option {0}" -f $Arg1)
+            }
+        }
         'selftest' {
             $bytes = New-Object byte[] 4096
             $gc = [Runtime.InteropServices.GCHandle]::Alloc(
@@ -245,6 +363,13 @@ try {
                     throw ("selftest: add-page did not register (page_count={0})" -f
                         $st.pageCount)
                 }
+                $pages = Read-YghvPages
+                if ($pages.returned -lt 1 -or
+                    $pages.pages[0].targetVa -ne ('0x{0:X}' -f $addr)) {
+                    throw ("selftest: list-pages mismatch (returned={0})" -f
+                        $pages.returned)
+                }
+                Write-Host 'selftest: list-pages OK'
 
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x803)) | Out-Null
                 Write-Host 'selftest: start OK'
@@ -271,6 +396,11 @@ try {
                 if ($st.active -ne 0 -or $st.pageCount -ne 0) {
                     throw ("selftest: state mismatch after stop (active={0} page_count={1})" -f
                         $st.active, $st.pageCount)
+                }
+                $pages = Read-YghvPages
+                if ($pages.returned -ne 0) {
+                    throw ("selftest: list-pages not empty after stop (returned={0})" -f
+                        $pages.returned)
                 }
                 Write-Host 'selftest: PASS'
             } finally {
