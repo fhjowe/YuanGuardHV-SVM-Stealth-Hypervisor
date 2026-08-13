@@ -177,6 +177,8 @@ typedef struct {
        end so earlier fixed offsets used by the trampoline stay stable. */
     void *guest_stack;
     uint64_t guest_stack_pa;
+    /* Per-vcpu VMMCALL control key (P0 auth hardening). */
+    volatile uint64_t auth_key;
 } svm_vcpu_t;
 
 extern svm_vcpu_t *g_vcpus[SVM_MAX_CORES];

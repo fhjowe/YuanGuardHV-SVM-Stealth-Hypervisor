@@ -1474,3 +1474,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   （`A1E9743B...`）。
 - 建议下一步：转 P0 低风险项（VMMCALL 认证加固 / 控制面 CPL-CR3）；
   R1 剔除如需继续，建议换平台或在能抓 MCE/机器级现场的硬件调试器上验证。
+
+### 9.111 2026-08-13 VMMCALL 认证加固实现 + 冻结根因修正（guest_stack 门控）
+
+- 实现：`svm_vcpu_t` 末尾新增 `auth_key`（svm_alloc_vcpu 用系统时间 +
+  私有 PA + core_id 派生）；`yghv_vmmcall_authorized(vcpu, cmd)` 分层：
+  运行时命令（HEARTBEAT/VERSION/STATS）开放；Cookie 命令
+  （HOOK_QUERY/STOP_INTERNAL/SHUTDOWN）要求 `rcx==cookie`；控制命令
+  （SET_TARGET/ADD_PAGE/REMOVE_PAGE/START/STOP_PROTECT/GET_STATE）额外
+  要求 `r8==vcpu->auth_key`。
+- 构建：认证默认版 SHA256
+  `1BD333E22C4A382FD318688DFD0E6020E12B94BCBFEF6E201AAEEACB8DECE47B`，
+  归档 `D:\aaaaaavm\yuanguard_hv_default_auth2_20260813.sys`，已复制
+  `C:\yuanguard_hv.sys`。
+- 实机验证：服务 RUNNING，默认流程完整走完（NPT → protect/hook 含
+  deny → 多核心跳 → `all stopped`），认证加固无回归。
+- 冻结根因修正：此前认证默认版（`7E25457C...`）在 hook deny 整机冻结，
+  定位为 `svm_core_enter_resident_current` **无条件把 guest RSP 指向
+  guest_stack** 的行为改动；已改为仅在 `YGHV_R1_EXCLUDE_PRIVATE` 下
+  设置 RSP，默认路径恢复原行为（与已验证稳定版一致）。R1 门控版仍
+  存在 deny 机器级停机（见 9.108-9.110），保持门控。

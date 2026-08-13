@@ -182,6 +182,18 @@ int svm_alloc_vcpu(uint32_t core_id, svm_vcpu_t **out) {
     RtlZeroMemory(vcpu->iopm, SVM_IOPM_PAGES * HV_PAGE_SIZE);
     vcpu->iopm_pa = MmGetPhysicalAddress(vcpu->iopm).QuadPart;
 
+    /* Per-vcpu control key: derived from boot time + private PA so stealing
+       the global cookie alone does not grant control commands. */
+    {
+        LARGE_INTEGER now;
+        KeQuerySystemTime(&now);
+        vcpu->auth_key = (uint64_t)now.QuadPart ^ vcpu->vmcb_pa ^
+                         vcpu->host_vmcb_pa ^ (uint64_t)core_id ^
+                         0x59475648ULL;
+        if (!vcpu->auth_key)
+            vcpu->auth_key = 0x59475648ULL ^ (uint64_t)core_id;
+    }
+
     LOG_ERROR("alloc vcpu core=%u: vmcb=0x%llx host_vmcb=0x%llx hsave=0x%llx host_stack=0x%llx msrpm=0x%llx iopm=0x%llx",
         core_id, vcpu->vmcb_pa, vcpu->host_vmcb_pa, vcpu->hsave_pa,
         MmGetPhysicalAddress(vcpu->host_stack).QuadPart,
@@ -598,10 +610,12 @@ int svm_core_enter_resident_current(uint32_t index) {
 
     LOG_INFO("Resident loop starting on core %u", (unsigned)index);
     yghv_trace("resident start");
+#ifdef YGHV_R1_EXCLUDE_PRIVATE
     if (vcpu->guest_stack_pa) {
         vcpu->vmcb->state.rsp =
             vcpu->guest_stack_pa + HV_PAGE_SIZE - 0x10;
     }
+#endif
 #ifdef YGHV_R1_EXCLUDE_PRIVATE
     g_r1_entry_seq++;
     g_r1_diag = TRUE;
