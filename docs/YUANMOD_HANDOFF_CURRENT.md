@@ -2058,3 +2058,16 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 同步 `docs/YUANMOD_NEXT_WINDOW_PROMPT.md` 到 HEAD `d4079bc`/9.133。
 - 收尾：未加载驱动、未跑 hook 路径；`YuanGuardHV/bin` 为构建验证
   产物（忽略文件，未清理）；提交。
+
+### 9.135 2026-08-13 全链路隐藏审计与痕迹自查（只读）
+
+- 目标确认：以“抗人工取证”优先，ACE 类反作弊尽力而为但不保证；
+  合规说明已写入审计文档。
+- 新增 `docs/YGHV_STEALTH_AUDIT_20260813.md`：六层隐藏矩阵（加载/
+  运行/处理器/交互/反卸载/自查）、当前可见痕迹清单与阶段路线。
+- 新增 `YuanGuardHV/tools/yghv_stealth_check.ps1`：只读检查服务、
+  内核驱动、注册表、文件、日志与控制设备，不加载驱动、不写日志。
+- 本机实测：可见 5 项（kernel driver、注册表服务键、
+  `C:\yuanguard_hv.sys`、`yghv_progress.log`、`yghv_ioctl.log`）；
+  服务停止时设备对象与 `yghv_hook.log` 不可见。
+- 收尾：未加载驱动、未改任何隐藏门控；提交文档与自查脚本。

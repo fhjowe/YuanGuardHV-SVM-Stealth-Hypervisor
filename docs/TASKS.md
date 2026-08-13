@@ -35,6 +35,10 @@
 > `tests/run_static_checks.ps1`，失败即中止（详见
 > `YUANMOD_HANDOFF_CURRENT.md` 9.134）。
 
+> 2026-08-13 9.135 全链路隐藏审计与痕迹自查：新增隐藏矩阵文档和
+> `yghv_stealth_check.ps1`，本机实测可见 5 项痕迹（详见
+> `YUANMOD_HANDOFF_CURRENT.md` 9.135）。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）
