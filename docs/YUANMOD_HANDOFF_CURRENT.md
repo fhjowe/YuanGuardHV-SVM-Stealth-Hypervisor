@@ -1982,3 +1982,24 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `docs/YUANMOD_NEXT_WINDOW_PROMPT.md`（HEAD 0268a81、9.128 状态、
   9.129 更新版）。
 - 收尾：未加载驱动、未跑 hook 路径、无代码改动；提交文档。
+
+### 9.130 2026-08-13 Java/JNI 非 hook 产品化：unprotect/scan（PASS）
+
+- 用户确认执行：给 Java 客户端补 `unprotect` 与 `scan`，全程不碰
+  install/remove-hook/clear，不改驱动与 JNI 逻辑。
+- 代码改动：`YghvCtl.java` 新增 `unprotect`（stop + 当前 JVM
+  set-target 清页，不触碰 hooks）与 `scan <pid> [maxPages]`（复用现有
+  `enumeratePages`，只打印已提交页候选）；README 同步用法。
+- 构建：`cmd /c build.bat` SUCCESS；JNI DLL 与 .class 为忽略产物，
+  本轮保留未清理。
+- 实机回归（最新默认版 `7B19EF022B8944BB3055AF91D2C14FBA21D25145D4A2441F5862F386BEDDB5A0`）：
+  Java `state` active=1 pid=4；`list-targets` returned=1（System 槽）；
+  `list-pages` returned=2；`list-hooks` returned=1（id=0 installed）；
+  `config` 默认 `auto_disarm=1 deny_status=0xC0000022`。
+- `scan` PASS：pid=10480，cap=8，enumerated=64，仅打印不保护；
+  `unprotect` PASS：set-target pid=2588 OK、state active=0、unprotect
+  OK；Java 进程退出后自身槽自动清为 pid=0/cr3=0，hooks 未变化。
+- 收尾：`sc stop yuanguard`，`C:\yuanguard_hv.sys` 恢复稳定默认版
+  `70888311...`，服务 STOPPED；本轮无 hook 路径、无冻结。
+- 下一步不变：hook 路径换平台/kd；R1 与 loader_stealth 复核分别待
+  裸机/KVM 与内核调试会话。

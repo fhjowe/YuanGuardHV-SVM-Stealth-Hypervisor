@@ -18,6 +18,10 @@
 > `70888311...`，服务 STOPPED（详见 `YUANMOD_HANDOFF_CURRENT.md`
 > 9.128）。
 
+> 2026-08-13 9.130 Java/JNI 非 hook 产品化 PASS：新增 `unprotect` 与
+> `scan`，实机回归通过；C 盘恢复稳定默认版 `70888311...`，服务
+> STOPPED（详见 `YUANMOD_HANDOFF_CURRENT.md` 9.130）。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）

@@ -17,10 +17,15 @@ run.bat start
 run.bat stop
 run.bat list-java
 run.bat protect <pid> [maxPages]
+run.bat unprotect
+run.bat scan <pid> [maxPages]
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,
 adds up to `maxPages` (driver cap is 64), starts protection and prints state.
+`unprotect` stops protection and clears the calling process's target pages
+without touching hooks. `scan` only enumerates committed pages and prints them;
+it does not arm or protect anything.
 
 Boundary: the current hypervisor runs a synthetic resident guest; real process
 code still executes natively, so NPT/vmmcall interception of the real process

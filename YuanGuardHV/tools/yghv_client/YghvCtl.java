@@ -324,6 +324,30 @@ public class YghvCtl {
         }
     }
 
+    private static void unprotect() {
+        long pid = ProcessHandle.current().pid();
+        ioctl(handle, FN_STOP_PROTECT, null, null);
+        setTarget(pid);
+        printState();
+        System.out.println("unprotect: OK");
+    }
+
+    private static void scan(long pid, int maxPages) {
+        int err = enableSeDebug();
+        if (err != 0) {
+            fail("enable SeDebugPrivilege", err);
+        }
+        long[] pages = enumeratePages((int) pid, maxPages);
+        if (pages == null) {
+            fail("OpenProcess/enumerate", lastError());
+        }
+        System.out.printf("scan: pid=%d enumerated=%d (cap=%d)%n",
+                pid, pages.length, maxPages);
+        for (long va : pages) {
+            System.out.printf("  va=0x%X%n", va);
+        }
+    }
+
     private static void usage() {
         System.out.println("Usage:");
         System.out.println("  YghvCtl state");
@@ -342,6 +366,8 @@ public class YghvCtl {
         System.out.println("  YghvCtl config [auto-disarm <0|1> | deny-status <hex>]");
         System.out.println("  YghvCtl list-java");
         System.out.println("  YghvCtl protect <pid> [maxPages]");
+        System.out.println("  YghvCtl unprotect");
+        System.out.println("  YghvCtl scan <pid> [maxPages]");
     }
 
     public static void main(String[] args) {
@@ -488,6 +514,22 @@ public class YghvCtl {
                             ? Math.min(Integer.parseInt(args[2]), 64)
                             : 64;
                     protect(pid, maxPages);
+                    break;
+                }
+                case "unprotect":
+                    open();
+                    try {
+                        unprotect();
+                    } finally {
+                        close();
+                    }
+                    break;
+                case "scan": {
+                    long pid = Long.parseLong(args[1]);
+                    int maxPages = args.length > 2
+                            ? Math.min(Integer.parseInt(args[2]), 64)
+                            : 64;
+                    scan(pid, maxPages);
                     break;
                 }
                 default:
