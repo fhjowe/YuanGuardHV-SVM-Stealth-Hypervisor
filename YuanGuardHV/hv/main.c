@@ -161,7 +161,8 @@ void yghv_trace_u64(const char *label, uint64_t v) {
     char buf[64];
     size_t n = 0;
     int i;
-    while (label[n] && n < sizeof(buf) - 1) {
+    size_t max_label = sizeof(buf) - 20;   /* '=' + "0x" + 16 hex + NUL */
+    while (label[n] && n < max_label) {
         buf[n] = label[n];
         n++;
     }

@@ -2071,3 +2071,58 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `C:\yuanguard_hv.sys`、`yghv_progress.log`、`yghv_ioctl.log`）；
   服务停止时设备对象与 `yghv_hook.log` 不可见。
 - 收尾：未加载驱动、未改任何隐藏门控；提交文档与自查脚本。
+
+### 9.136 2026-08-14 全面代码审查 + 任务修复清单（只读）
+
+- 背景：接管后首次完整全面审查。只读，未改任何代码，未实机加载驱动
+  （本机硬冻结史，见 9.118/9.125）。
+- 方法：本人通读全部正式构建源码（main.c 4090 行 / protect.c 1298 行 /
+  svm_core.c / svm_trampoline.S / vmexit.c / npt_core.c / vmmcall.c /
+  control_device.c / multi_core.c / loader_stealth.c + 全部 common 头文件）；
+  5 个模块子代理（SVM 核心 / NPT+vmexit / 控制面 / 客户端+测试 / protect 层）
+  并行深审，报告逐条对照源码核实；`cmd /c build.bat` 构建验证 SUCCESS
+  （SHA256 `F411C929C1114773BEBB6B7C541B82607AA3CB0A5FB051D7C733200C3A0CC106`）。
+- 完整报告：`docs/YGHV_FULL_REVIEW_20260814.md`（验证正确清单 + 问题清单 +
+  任务修复清单，问题 ID `YGHV-REV-001..043`）。
+- 结论：默认构建路径无 CRITICAL；关键机制（VMCB 布局、trampoline、NPT 数学、
+  IOCTL 面、认证分层、结构体 ABI）验证正确。
+- 发现汇总：**9 MAJOR / 21 MINOR / 13 INFO-NIT**。MAJOR：
+  - REV-001 持 `g_protect_lock` 跨全核 pause 死锁（已知，9.118/9.125，换平台）；
+  - REV-002 `npt_set_page_perm_range` 2MB 步进语义错误；
+  - REV-003 `stop_all_residents` 不唤醒暂停 resident（卸载死锁，一行修复）；
+  - REV-004 `get_pages_info` `returned` 超上限 → 客户端越界读；
+  - REV-005 `yghv_trace_u64` 栈缓冲区溢出（潜在，当前不可达）；
+  - REV-006 `check_target_exited` EPROCESS 裸指针 UAF 竞态（多核 + 目标退出窗口）；
+  - REV-036 `yghv_hook_diag` 在 FAST_MUTEX 锁内（APC_LEVEL）调 `ZwCreateFile` IRQL 违规；
+  - REV-037 x86-64 指令解码器误解码（B8-BF imm64、0F 38/3A 差一、F6/F7 立即数）→ 错误补丁边界；
+  - REV-038 `remove_hook` pause 超时后不恢复原始字节 → hook 永久残留 + stub 泄漏。
+- 独立复核修正 2 处子代理误报：exit-test 不可用（漏看 main.c:4075
+  `g_persistent_mode=TRUE`，默认构建实际 PASS）；INTR 拦截"惰性"（与 step11
+  实测 15 次 INTR 退出矛盾，留 REV-035 待 kd）。
+- 新发现文档/工具间隙：交接文档本文件 line 1886 仍残留 `` `ERROR_BUSY (0x5AA)` ``
+  过时标注，且 `tests/safety_checks.ps1` 检查清单未含本文件（漏检）；
+  C 盘稳定默认版 `70888311...`（9.112 构建）与 HEAD 源码构建 `F411C929...` 不同源。
+- 下一步：任务清单见审查报告第 4 节（P0 低风险项可本机验证，P3 锁序/hook 路径
+  需换平台/kd）；本机继续停止 hook 路径实验。
+
+### 9.137 2026-08-14 P0 低风险修复 4 项（REV-003/004/005/006，已确认实施）
+
+- 用户确认按审查报告 P0 方案实施，仅改 5 个文件，未动 hook 路径：
+  - **REV-003** `hv/svm_core.c` `svm_core_stop_all_residents`：对 `pause_requested`
+    vcpu 补 `KeSetEvent(resume_event)`，避免卸载时 `wait_all_stopped` 死锁。
+  - **REV-004** `hv/protect.c` `get_pages_info`：`returned` 改为实际写入条数 `n`
+    （原跨目标累加可到 256 超 64 项缓冲，客户端越界读）；`tools/yghv_ctl.ps1`
+    `Read-YghvPages` 与 `tools/yghv_client/YghvCtl.java` `listPages` 循环上限
+    收敛 `min(returned,64)`（防御旧驱动）。
+  - **REV-005** `hv/main.c` `yghv_trace_u64`：label 拷贝上限收紧为
+    `sizeof(buf)-20`（固定后缀 `=`+`0x`+16hex+NUL=20B），杜绝栈溢出（潜在）。
+  - **REV-006** `hv/protect.c` `check_target_exited`：锁内对捕获 EPROCESS
+    `ObReferenceObject`，等待后 `ObDereferenceObject`；进程已退出且调
+    `on_target_exit` 前锁内复核槽的 pid+process 仍匹配（防 pid 复用误清新目标）。
+- 构建：`cmd /c build.bat` → 静态校验 PASS + 编译/链接/签名 SUCCESS，
+  新 SHA256 `57fed86a03aa5af1c48be5b72449382dcf5dc893880afd70681ead3ef2ce531d`
+  （归档 `D:\aaaaaavm\yuanguard_hv_p0fix_20260814.sys` 待复制）。
+- 验证：尚未实机加载（本机加载需用户许可）；建议按 9.128 非 hook 回归清单
+  （sc start → state/list-pages/selftest/exit-test → sc stop）。
+- 提交：本轮代码（svm_core.c、protect.c、main.c、yghv_ctl.ps1、YghvCtl.java）
+  + 审查文档勾选 + 本记录。

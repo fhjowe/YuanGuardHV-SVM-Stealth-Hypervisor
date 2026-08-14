@@ -586,10 +586,8 @@ void yghv_protect_get_target(ULONG *active, ULONG *pid, ULONG_PTR *cr3,
 void yghv_protect_get_pages_info(yghv_protect_pages_info_t *info) {
     ULONG t, i, n = 0;
     ULONG cap = info->count;
-    ULONG total = 0;
     ExAcquireFastMutex(&g_protect_lock);
     for (t = 0; t < g_protect.target_count; t++) {
-        total += g_protect.targets[t].page_count;
         for (i = 0; i < g_protect.targets[t].page_count && n < cap; i++) {
             info->pages[n].gpa = g_protect.targets[t].pages[i].gpa;
             info->pages[n].target_va = g_protect.targets[t].pages[i].target_va;
@@ -600,7 +598,10 @@ void yghv_protect_get_pages_info(yghv_protect_pages_info_t *info) {
             n++;
         }
     }
-    info->returned = total;
+    /* returned = number of entries actually written (≤ cap); the previous
+       uncapped cross-target total could exceed the 64-entry buffer and cause
+       a userland over-read. */
+    info->returned = n;
     ExReleaseFastMutex(&g_protect_lock);
 }
 
@@ -715,6 +716,10 @@ BOOLEAN yghv_protect_check_target_exited(void) {
         if (g_protect.targets[i].process) {
             procs[n] = g_protect.targets[i].process;
             pids[n] = g_protect.targets[i].pid;
+            /* Hold our own reference so the object stays alive across the
+               poll; otherwise a concurrent on_target_exit/clear can free it
+               between the snapshot and KeWaitForSingleObject (UAF). */
+            ObReferenceObject(procs[n]);
             n++;
         }
     }
@@ -726,9 +731,22 @@ BOOLEAN yghv_protect_check_target_exited(void) {
         st = KeWaitForSingleObject(procs[i], Executive, KernelMode, FALSE,
                                    &timeout);
         if (st == STATUS_SUCCESS) {
-            if (yghv_protect_on_target_exit(pids[i]))
+            BOOLEAN match = FALSE;
+            /* Re-check under the lock that this slot still owns this pid and
+               this process before clearing, so a pid-reuse + retarget between
+               snapshot and poll cannot clear the new target's slot. */
+            ExAcquireFastMutex(&g_protect_lock);
+            {
+                yghv_protect_target_t *t =
+                    yghv_protect_find_target_by_pid_locked(pids[i]);
+                if (t && t->process == procs[i])
+                    match = TRUE;
+            }
+            ExReleaseFastMutex(&g_protect_lock);
+            if (match && yghv_protect_on_target_exit(pids[i]))
                 handled = TRUE;
         }
+        ObDereferenceObject(procs[i]);
     }
     return handled;
 }

@@ -752,6 +752,12 @@ void svm_core_stop_all_residents(void) {
         if (g_vcpus[i]) {
             InterlockedExchange((volatile LONG *)&g_vcpus[i]->resident_state,
                                 SVM_RESIDENT_STOPPING);
+            if (g_vcpus[i]->pause_requested) {
+                /* Wake a resident parked in the pause wait so it can observe
+                   STOPPING and exit; otherwise svm_core_wait_all_stopped
+                   deadlocks on unload. */
+                KeSetEvent(&g_vcpus[i]->resume_event, IO_NO_INCREMENT, FALSE);
+            }
             LOG_INFO("Core %u marked STOPPING", i);
         }
     }

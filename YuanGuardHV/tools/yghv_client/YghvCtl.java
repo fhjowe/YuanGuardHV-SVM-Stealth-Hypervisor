@@ -120,7 +120,8 @@ public class YghvCtl {
         b.getInt(); /* count */
         int returned = b.getInt();
         System.out.printf("list-pages: returned=%d%n", returned);
-        for (int i = 0; i < returned; i++) {
+        int cap = Math.min(returned, 64); /* guard against over-large returned */
+        for (int i = 0; i < cap; i++) {
             long gpa = b.getLong();
             long va = b.getLong();
             int flags = b.get() & 0xFF;

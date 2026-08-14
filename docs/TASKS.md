@@ -39,6 +39,11 @@
 > `yghv_stealth_check.ps1`，本机实测可见 5 项痕迹（详见
 > `YUANMOD_HANDOFF_CURRENT.md` 9.135）。
 
+> 2026-08-14 接管后全面代码审查（只读）：默认构建无 CRITICAL，关键机制验证
+> 正确；发现 9 MAJOR / 21 MINOR / 13 INFO-NIT，完整报告与任务修复清单见
+> `docs/YGHV_FULL_REVIEW_20260814.md`（问题 ID YGHV-REV-001..043）。
+> 本机继续停止 hook 路径实验（REV-001）；P0 低风险项可本机验证（详见 9.136）。
+
 ## 0. 调试路径（先打通验证通道）
 
 - [x] 修复 `build.bat`（for 块改子程序、路径加引号）

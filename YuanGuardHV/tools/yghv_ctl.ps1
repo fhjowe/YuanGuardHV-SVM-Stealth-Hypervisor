@@ -266,7 +266,7 @@ function Read-YghvPages {
         -InBytes $buf -OutputLength 1544
     $returned = [BitConverter]::ToUInt32($out, 4)
     $pages = @()
-    for ($i = 0; $i -lt $returned; $i++) {
+    for ($i = 0; $i -lt [Math]::Min($returned, 64); $i++) {
         $base = 8 + $i * 24
         $pages += [pscustomobject]@{
             gpa       = ('0x{0:X}' -f [BitConverter]::ToUInt64($out, $base))
