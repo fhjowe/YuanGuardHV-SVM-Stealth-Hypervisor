@@ -34,3 +34,6 @@ YuanGuardHV/logs_archive/
 *.user
 Thumbs.db
 .DS_Store
+
+# DSH harness probe files (not project artifacts)
+_dsh_probe*.js
