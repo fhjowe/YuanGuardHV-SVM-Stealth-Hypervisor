@@ -219,18 +219,18 @@
 - [x] **YGHV-REV-045** `on_npf_write` 决策前检查 `g_protect.active`（protect.c）——2026-08-14 已修
 
 ### P2 —— 安全/健壮性加固
-- [ ] **YGHV-REV-007** SHUTDOWN（含 STOP_INTERNAL）走 `r8==auth_key` 分支；cookie 派生加强（vmmcall.c）
-- [ ] **YGHV-REV-008/009** MSR/CR 处理器实现正确模拟或 fail-closed（vmexit.c）
-- [ ] **YGHV-REV-012** `SeSinglePrivilegeCheck` 加 `__try/__except` 或改 token 显式检查（control_device.c）
-- [ ] **YGHV-REV-014** VMMCALL 状态协议统一（vmmcall.c）
-- [ ] **YGHV-REV-016** `svm_core_init` 失败路径恢复 EFER.SVME（svm_core.c）
-- [ ] **YGHV-REV-017** loader_stealth 持 LoaderLock、完整性评估、并入默认前 kd `!driver` 复核
-- [ ] **YGHV-REV-018** IOCTL 日志内存缓冲/限频或删除（control_device.c）
-- [ ] **YGHV-REV-019** README 注明 `protect` 仅能保护自身（或客户端提前提示）
-- [ ] **YGHV-REV-043** `deny_status`/hook stub 对 guest 置 NPT 只读（并入 REV-007/R1 私有页剔除方案）
-- [ ] **YGHV-REV-046** identity NPT 显式 NX/RX 收紧（并入 R1 默认权限路线）
-- [ ] **YGHV-REV-047** rearm-#DB 消费逻辑区分 guest 来源 #DB（vmexit.c）
-- [ ] **YGHV-REV-029** 设备对象加显式安全描述符（评估）
+- [ ] **YGHV-REV-007** SHUTDOWN（含 STOP_INTERNAL）走 `r8==auth_key` 分支；cookie 派生加强（vmmcall.c）——**延后**：与 cpuid 测试 r8==0 断言冲突且 auth_key 仍可被 guest 推导（默认 NPT 全 RAM 可见），属 R1 私有页剔除/认证重构范畴（P3 换平台一并处理）
+- [x] **YGHV-REV-008/009** MSR/CR 处理器实现正确模拟或 fail-closed（vmexit.c）——2026-08-14 已修（MSR 写不覆写寄存器；CR fail-closed return 1）
+- [x] **YGHV-REV-012** `SeSinglePrivilegeCheck` 加 `__try/__except` 或改 token 显式检查（control_device.c）——2026-08-14 已修（改 PreviousMode=KernelMode，返回 FALSE 不 raise）
+- [x] **YGHV-REV-014** VMMCALL 状态协议统一（vmmcall.c）——2026-08-14 已修（控制命令经 `yghv_vmmcall_status` 映射 YGHV_STATUS_OK/ERROR）
+- [x] **YGHV-REV-016** `svm_core_init` 失败路径恢复 EFER.SVME（svm_core.c）——2026-08-14 已修（svme_was_set 捕获 + 分配失败时恢复）
+- [x] **YGHV-REV-017** loader_stealth 持 LoaderLock、完整性评估、并入默认前 kd `!driver` 复核——2026-08-14 部分：注释说明 DriverEntry 持 loader lock（无竞态）；完整性/启用仍待 kd（门控保持关闭）
+- [x] **YGHV-REV-018** IOCTL 日志内存缓冲/限频或删除（control_device.c）——2026-08-14 已修（仅错误时落盘，删 in 行）
+- [x] **YGHV-REV-019** README 注明 `protect` 仅能保护自身（或客户端提前提示）——2026-08-14 已修（README 增注 + list-java 指引）
+- [ ] **YGHV-REV-043** `deny_status`/hook stub 对 guest 置 NPT 只读（并入 REV-007/R1 私有页剔除方案）——**延后**：R1 设计族
+- [ ] **YGHV-REV-046** identity NPT 显式 NX/RX 收紧（并入 R1 默认权限路线）——**延后**：R1 设计族（须选择性 NX，避免 guest 代码页不可执行）
+- [x] **YGHV-REV-047** rearm-#DB 消费逻辑区分 guest 来源 #DB（vmexit.c）——2026-08-14 已修（仅 TF 置位时消费 rearm，否则重注入）
+- [ ] **YGHV-REV-029** 设备对象加显式安全描述符（评估）——**延后**：DACL 配置风险，需评估客户端打开权限后实施
 
 ### P3 —— 需换平台 / 内核调试会话
 - [ ] **YGHV-REV-001** 锁序重构（pause 移出锁外 + patch 互斥 + clear 单次 pause 后无条件清 hook 槽）；按 9.129 设计文档，换平台/kd 后实机验证

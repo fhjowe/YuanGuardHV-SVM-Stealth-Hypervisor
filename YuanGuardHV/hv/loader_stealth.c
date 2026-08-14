@@ -60,6 +60,12 @@ static void yghv_unlink_module(PDRIVER_OBJECT DriverObject) {
 
 NTSTATUS yghv_loader_stealth(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath) {
     (void)RegistryPath;
+    /* REV-017: DriverEntry is invoked while the system holds the loader lock,
+       so the PsLoadedModuleList traversal/unlink in yghv_unlink_module is
+       serialized against concurrent module load/unload.  Still only partial
+       stealth (unlinks InLoadOrderLinks; name buffers are zeroed but the
+       underlying strings remain, and other module lists are untouched) —
+       keep gated; enabling it requires a kd `!driver` verification (P3). */
     yghv_unlink_module(DriverObject);
     return STATUS_SUCCESS;
 }

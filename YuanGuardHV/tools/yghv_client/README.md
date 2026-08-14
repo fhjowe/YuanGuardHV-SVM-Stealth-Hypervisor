@@ -60,6 +60,12 @@ adds up to `maxPages` (driver cap is 64), starts protection and prints state.
 without touching hooks. `scan` only enumerates committed pages and prints them;
 it does not arm or protect anything.
 
+> REV-019: `protect <pid>` only works when `pid` is the YghvCtl process's own
+> PID — the driver binds ADD_PAGE to the *caller's* CR3 (P0 self-targeting), so
+> protecting an arbitrary enumerated PID returns ACCESS_DENIED on every page.
+> Use `list-java` to find this process's PID, or `scan <pid>` (read-only) for
+> other processes.
+
 Boundary: the current hypervisor runs a synthetic resident guest; real process
 code still executes natively, so NPT/vmmcall interception of the real process
 requires the later OS-as-guest milestone. This client validates the real-target

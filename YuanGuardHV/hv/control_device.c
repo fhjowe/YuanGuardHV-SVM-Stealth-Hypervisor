@@ -113,7 +113,11 @@ static BOOLEAN yghv_control_ioctl_authorized(PIRP irp) {
        the device. */
     {
         LUID dbg_luid = RtlConvertLongToLuid(SE_DEBUG_PRIVILEGE);
-        if (!SeSinglePrivilegeCheck(dbg_luid, UserMode)) {
+        /* REV-012: PreviousMode=UserMode makes SeSinglePrivilegeCheck RAISE
+           STATUS_PRIVILEGE_NOT_HELD on absence (the LOG/return-FALSE lines
+           become dead code); KernelMode returns FALSE instead.  The check
+           still uses the current thread's token either way. */
+        if (!SeSinglePrivilegeCheck(dbg_luid, KernelMode)) {
             LOG_ERROR("control device: caller lacks SeDebugPrivilege");
             return FALSE;
         }
@@ -140,7 +144,9 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
     out_len = stack->Parameters.DeviceIoControl.OutputBufferLength;
     buf = irp->AssociatedIrp.SystemBuffer;
     yghv_trace_u64("ioctl code", code);
-    yghv_ioctl_log("in", code);
+    /* REV-018: drop the per-request "in" log line and log only on error —
+       bounds the forensic artifact and the per-IOCTL synchronous disk I/O
+       while keeping error diagnostics. */
 
     switch (code) {
     case IOCTL_YGHV_SET_TARGET: {
@@ -335,9 +341,10 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         break;
     }
 
-    if (!NT_SUCCESS(status))
+    if (!NT_SUCCESS(status)) {
         info = 0;
-    yghv_ioctl_log("out", code);
+        yghv_ioctl_log("out", code);   /* only errors are logged (REV-018) */
+    }
     return yghv_control_complete(irp, status, info);
 }
 

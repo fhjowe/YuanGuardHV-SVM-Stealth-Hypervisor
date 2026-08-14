@@ -455,6 +455,7 @@ int svm_core_init(void) {
 
     /* Enable SVM if not already set (firmware/L0 may have set it). Save old state. */
     efer = yg_read_msr(MSR_EFER);
+    BOOLEAN svme_was_set = (efer & EFER_SVME) ? TRUE : FALSE;
     if (efer & EFER_SVME) {
         LOG_INFO("EFER.SVME already set");
     } else {
@@ -470,6 +471,16 @@ int svm_core_init(void) {
     /* Allocate and prepare VCPU for current core */
     status = (NTSTATUS)svm_alloc_vcpu(core_id, &g_vcpus[core_id]);
     if (!NT_SUCCESS(status)) {
+        /* REV-016: alloc failed -> g_vcpus[core_id] is NULL so the cleanup
+           IPI cannot restore EFER.SVME on this core; restore it here (only
+           if we are the ones who set it). */
+        if (!svme_was_set) {
+            uint64_t now = yg_read_msr(MSR_EFER);
+            if (now & EFER_SVME) {
+                now &= ~EFER_SVME;
+                yg_write_msr(MSR_EFER, now);
+            }
+        }
         svm_core_cleanup();
         return status;
     }

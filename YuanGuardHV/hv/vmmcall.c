@@ -62,6 +62,12 @@ static BOOLEAN yghv_vmmcall_target_matches_cr3(uint32_t pid, uint64_t cr3) {
     return base && base == (cr3 & ~0xFFFULL);
 }
 
+/* REV-014: normalize control-command results into the YGHV_STATUS_* space so
+   RAX is uniformly interpretable alongside auth-failure DENIED/ERROR. */
+static uint64_t yghv_vmmcall_status(NTSTATUS st) {
+    return NT_SUCCESS(st) ? YGHV_STATUS_OK : YGHV_STATUS_ERROR;
+}
+
 int vmmcall_dispatch(svm_vcpu_t *vcpu) {
     uint64_t cmd = vcpu->regs.rax;
 
@@ -144,7 +150,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             return 0;
         }
         vcpu->regs.rax =
-            (uint64_t)yghv_protect_set_target((uint32_t)vcpu->regs.rdx);
+            yghv_vmmcall_status(yghv_protect_set_target((uint32_t)vcpu->regs.rdx));
         return 0;
 
     case YGHV_CMD_ADD_PAGE:
@@ -158,8 +164,8 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
         }
         /* Resolve the target slot by the caller CR3 (matches the IOCTL path)
            instead of hardcoding targets[0]. */
-        vcpu->regs.rax = (uint64_t)yghv_protect_add_page_for(
-            vcpu->vmcb->state.cr3, vcpu->regs.rdx);
+        vcpu->regs.rax = yghv_vmmcall_status(
+            yghv_protect_add_page_for(vcpu->vmcb->state.cr3, vcpu->regs.rdx));
         return 0;
 
     case YGHV_CMD_REMOVE_PAGE:
@@ -171,8 +177,8 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
-        vcpu->regs.rax = (uint64_t)yghv_protect_remove_page_for(
-            vcpu->vmcb->state.cr3, vcpu->regs.rdx);
+        vcpu->regs.rax = yghv_vmmcall_status(
+            yghv_protect_remove_page_for(vcpu->vmcb->state.cr3, vcpu->regs.rdx));
         return 0;
 
     case YGHV_CMD_START_PROTECT:
@@ -180,7 +186,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
-        vcpu->regs.rax = (uint64_t)yghv_protect_start();
+        vcpu->regs.rax = yghv_vmmcall_status(yghv_protect_start());
         return 0;
 
     case YGHV_CMD_STOP_PROTECT: {
@@ -189,7 +195,7 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             return 0;
         }
         NTSTATUS st = yghv_protect_stop();
-        vcpu->regs.rax = (uint64_t)st;
+        vcpu->regs.rax = yghv_vmmcall_status(st);
         return 0;
     }
 

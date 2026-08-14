@@ -407,7 +407,11 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         return 0;
 
     case SVM_EXIT_EXCEPTION_DB:
-        if (vcpu->rearm_pending) {
+        /* REV-047: only consume the #DB for our single-step rearm when TF is
+           set (the ALLOW path sets TF before re-VMRUN).  A guest hardware-
+           breakpoint #DB inside the rearm window has TF clear and must be
+           re-injected instead of being silently consumed. */
+        if (vcpu->rearm_pending && (vcpu->vmcb->state.rflags & 0x100ULL)) {
             yghv_protect_rearm(vcpu);
             vcpu->vmcb->state.rflags &= ~0x100ULL;
             return 0;
@@ -612,6 +616,10 @@ static int svm_handle_msr(svm_vcpu_t *vcpu) {
         return 0;
     }
 
+    if (write)
+        return 0; /* REV-008: drop guest writes to un-emulated MSRs without
+                     clobbering guest RAX/RDX with a host read value */
+
     data = svm_host_read_msr(msr);
     vcpu->regs.rax = (uint32_t)data;
     vcpu->regs.rdx = (uint32_t)(data >> 32);
@@ -621,6 +629,9 @@ static int svm_handle_msr(svm_vcpu_t *vcpu) {
 
 static int svm_handle_cr(svm_vcpu_t *vcpu) {
     vcpu->resident_cr_exits++;
-    (void)vcpu;
-    return 0;
+    /* REV-009: CR intercepts are not currently enabled; if they ever are, fail
+       closed (stop the resident loop) instead of silently dropping the access,
+       which would leave the guest CR state corrupt. */
+    LOG_ERROR("CR intercept not emulated (exit=0x%llx)", vcpu->vmcb->control.exitcode);
+    return 1;
 }

@@ -2192,3 +2192,43 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   auto-disarm/rearm 时序快照，非回归；未执行 hook 路径。）
 - 提交：4 驱动文件（npt_core.c / main.c / vmmcall.c / protect.c）+ 审查文档 P0
   补勾 REV-039 + P1 全部勾选 + 本记录。
+
+### 9.140 2026-08-14 P2 安全/健壮性加固 9 项（用户"继续"直接修复）
+
+- 用户指示"继续"，按 P1 同模式直接修复 P2 安全项。共改 5 驱动文件 + README，
+  构建 + 实机非 hook 回归全部 PASS。
+- **REV-008** `vmexit.c` `svm_handle_msr`：非 VM_CR 的 MSR **写**直接丢弃，不再
+  把宿主 MSR 值覆写进 guest RAX/RDX（潜在路径，默认仅拦截 VM_CR）。
+- **REV-009** `vmexit.c` `svm_handle_cr`：改为 fail-closed（`return 1` 停常驻
+  循环 + LOG），不再静默丢弃（CR 拦截未启用，属潜在）。
+- **REV-012** `control_device.c` `SeSinglePrivilegeCheck` PreviousMode 改
+  `KernelMode`：缺权限时返回 FALSE（原 UserMode 会 raise，LOG/return FALSE
+  成死代码）；仍按当前线程 token 检查，无 SEH/clang 风险。
+- **REV-014** `vmmcall.c` 新增 `yghv_vmmcall_status`，控制命令（SET_TARGET/
+  ADD_PAGE/REMOVE_PAGE/START/STOP_PROTECT）RAX 统一映射 YGHV_STATUS_OK/ERROR，
+  与认证失败 DENIED/ERROR 一致（无当前消费方，行为兼容）。
+- **REV-016** `svm_core.c` `svm_core_init`：捕获 `svme_was_set`，vcpu 分配失败时
+  若 SVME 由本驱动设置则恢复清除（修 cleanup IPI 无法恢复该核 EFER.SVME）。
+- **REV-017** `loader_stealth.c`：注释说明 DriverEntry 在 loader lock 下执行，
+  摘链无并发竞态；完整性/启用仍待 kd（门控保持关闭）。
+- **REV-018** `control_device.c` `yghv_ioctl_log`：删除每请求 "in" 行，仅错误时
+  落盘 "out" 行——收敛取证痕迹 + 削减每 IOCTL 同步磁盘 I/O，保留错误诊断。
+- **REV-019** `tools/yghv_client/README.md`：增注 `protect <pid>` 仅当 pid==自身
+  PID 才生效（ADD_PAGE 按调用者 CR3），指引 `list-java`/`scan`。
+- **REV-047** `vmexit.c` `SVM_EXIT_EXCEPTION_DB`：仅当 RFLAGS.TF 置位（本驱动
+  ALLOW 单步设置）时消费 rearm；guest 硬件断点 #DB（TF 未置）重注入，不再吞。
+- 延后 4 项（R1/设计族或风险项，标注于审查文档）：
+  - REV-007（auth_key 与 cpuid 测试 r8==0 断言冲突、且默认 NPT 下仍可被 guest
+    推导，并入 R1 认证重构）；
+  - REV-029（设备 SD，DACL 配置需评估后再实施）；
+  - REV-043（deny_status/stub NPT 只读，R1 私有页剔除族）；
+  - REV-046（identity NPT NX 收紧，须选择性 NX 避免 guest 代码页不可执行，R1 族）。
+- 构建：`cmd /c build.bat` SUCCESS，SHA256
+  `b337bfc6079b2586eb4c887eb3e6746c9560da8640c3b589083dfa1d4a4953ea`
+  （归档 `D:\aaaaaavm\yuanguard_hv_p2fix_20260814.sys`）。
+- 实机回归：部署 → RUNNING；自测全过；state/list-pages（双 armed=1）/config
+  PASS；selftest PASS；exit-test PASS；`sc stop` 干净 STOPPED；C 盘恢复稳定
+  默认版 `70888311...`。未执行 hook 路径。
+- 提交：5 驱动文件（vmexit.c / control_device.c / vmmcall.c / svm_core.c /
+  loader_stealth.c）+ README + 审查文档 P2 勾选（9 项完成、4 项标注延后）+
+  本记录。
