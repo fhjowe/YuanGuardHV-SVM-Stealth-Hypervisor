@@ -2547,3 +2547,61 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：C 盘稳定默认版 `70888311`，电源已恢复（IDLEDISABLE=0），服务
   STOPPED。看门狗日志 `C:\Windows\yghv_watchdog.log` 为诊断产物。
 - 提交：死代码清理 + 本记录。
+
+### 9.157 2026-08-14 新窗口接管：本机试探性重开 OS-as-guest（有界试点全 PASS + 常驻根因代码级核实）
+
+- **背景**：新窗口按 `docs/YUANMOD_HANDOFF_NEXT_WINDOW.md` 接管，用户选择
+  "B：本机试探性重开 OS-as-guest"。本会话先修复 harness pwsh 工具不可用
+  （0xC0000142，切 danger-full-access 后恢复正常，7.4.6）。
+- **基线**：HEAD `3e92057`，工作区干净；服务 yuanguard STOPPED（DEMAND_START）；
+  C 盘 `70888311...` 稳定版（已额外备份 `D:\yuanguard\backup_stable_70888311.sys`）。
+- **有界试点重开验证（全部 PASS，构建门控版加载后 DriverEntry 自测 + 日志核对）**：
+  | step | 形态 | 构建 SHA | 结果 |
+  |---|---|---|---|
+  | 12 | 单核 OS-guest 有界（5000 轮） | `76777A2C` | PASS：counter=0x1388（5000） |
+  | 14 | 全核 12 核有界（每核 5000） | `843B0C22` | PASS：12 核 enter+host done 齐，每核 exits=0x2710，counter=0xea60（60000） |
+  | 16 | 全核 12 核无缝有界 | `41501B06` | PASS：12 核无缝 enter+done 齐，每核 exits=0x2710，counter=0xea60 |
+  - 每步 `sc stop` 干净 STOPPED、恢复 C 盘 `70888311`。无冻结、无蓝屏。
+- **关键代码级核实（常驻线为何本机不可行）**：
+  - 9.152 独立 guest CR3 修复**只用于合成 resident**（main.c 4221-4269）；OS-as-guest
+    路径（`svm_prepare_vcpu`：`np_enable=0`、`cr3=yg_read_cr3()`、`guest_asid=1`
+    直通，各 `yghv_os_guest_*_thread` 仅 `svm_core_set_npt` 不覆写 CR3）仍是
+    **共享宿主 CR3** → 正是 9.152 判定的 TLB 冲突冻结根因场景。9.156 称"另一个
+    机制"不准确，实为**同一共享 CR3 机制**，只是 guest 需跑整个 Windows 地址空间、
+    无法用独立最小页表替代。
+  - **step20（spin 常驻）加载后不可干净卸载**：multi_core.c 的 stop/join 只针对
+    合成 resident 线程；OS-as-guest spin 线程 `for(;;) cpuid` 不检查停止标志，
+    `DriverUnload` 不等它 → `sc stop` 无法安全卸载，需重启清除（同 9.121 记载）。
+    故 step20 未实机加载（需付重启成本），构建 `6B006769...` 已产出。
+- **结论**：本机 OS-as-guest **可达成边界 = 有界试点（12-16 全 PASS，机制完好）**；
+  常驻线（17+/99/100）本机仍会冻结（共享 CR3 TLB 冲突未消除），且 spin 形态
+  无法干净卸载。与交接文档"换平台重开 OS-as-guest"结论一致，现补上代码级证据。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.158 2026-08-14 step20 spin 常驻实机验证：运行 PASS + 卸载 0xCE 蓝屏（转储实证）
+
+- **背景**：承 9.157，用户确认"试 step20（接受重启成本）"。部署 step20 构建
+  `6B006769...` 加载。
+- **运行验证 PASS**：`os resident spin enter=1 → bm os resident spin host-isr
+  running → bm done`，`resident alive` 每 5s 递增至 35s+，机器全程响应。即
+  **历史唯一 PASS 的常驻形态（自旋+INTR/NMI 拦截+宿主 ISR）在 HEAD 上仍可运行**。
+- **卸载 0xCE 蓝屏（18:16:31，转储 `081426-14453-01.dmp`）**：`sc stop` 触发
+  DriverUnload，蓝屏 **0xCE DRIVER_UNLOADED_WITHOUT_CANCELLING_PENDING_OPERATIONS**，
+  模块 `yuanguard_hv`。
+  - 栈：System 线程 `PspSystemThreadStartup → KiStartSystemThread` 执行在
+    `<Unloaded_yuanguard_hv>+0xd4fe`（已卸载模块内）→ KiPageFault → 0xCE。
+  - **根因（与 9.157 代码级预测完全一致）**：step17+ OS-as-guest 线程在
+    `yghv_baremetal_step_test` 直接创建、**未注册**到 multi_core.c 的
+    `g_resident_threads`；`DriverUnload` 的 `svm_core_stop_all_residents()` /
+    `svm_core_wait_all_stopped()` 对它们是**空操作**；spin guest `for(;;) cpuid`
+    永不检查停止标志 → 模块卸载后线程仍执行驱动代码页 → 0xCE。
+  - **修复方向（后续/换平台）**：① OS-as-guest 线程注册进多核 join 表 + 提供
+    guest 停止标志（host_done 退出）；② 或 `sc stop` 前先置停止标志并等线程
+    PsTerminateSystemThread；③ 常驻形态本就"需重启清除"（9.121 已载），本机不
+    建议承载。
+- **实证价值**：本次 0xCE 是**首个带转储的 OS-as-guest 卸载失败**（此前都是无
+  转储硬冻结），为修复/换平台提供了可分析样本。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`（备份 `D:\yuanguard\backup_stable_70888311.sys`），
+  服务 STOPPED，机器安全。
+- 提交：本记录。
