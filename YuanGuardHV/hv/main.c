@@ -184,47 +184,6 @@ static void yghv_trace_close(void) {
     }
 }
 
-static void yghv_patch_rel_jump(uint8_t *code, size_t resume_off, size_t start_off) {
-    uint8_t *p = code + resume_off;
-    if (p[0] == 0xE9) {
-        int32_t disp = (int32_t)((code + start_off) - (p + 5));
-        *(int32_t *)(p + 1) = disp;
-    } else if (p[0] == 0xEB) {
-        char disp = (char)((code + start_off) - (p + 2));
-        *(char *)(p + 1) = disp;
-    } else {
-        LOG_ERROR("yghv_patch_rel_jump: unexpected opcode 0x%x", p[0]);
-    }
-}
-
-static NTSTATUS yghv_prepare_guest_code(void) {
-    uint8_t *page;
-    size_t hb_size, npt_size;
-    uint8_t *npt_dst;
-
-    page = (uint8_t *)MmAllocateContiguousMemory(
-        HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
-    if (!page) return STATUS_INSUFFICIENT_RESOURCES;
-    RtlZeroMemory(page, HV_PAGE_SIZE);
-
-    hb_size = (size_t)(svm_trampoline_test_guest_end - svm_trampoline_test_guest);
-    npt_size = (size_t)(svm_trampoline_test_npt_guest_end - svm_trampoline_test_npt_guest);
-
-    RtlCopyMemory(page, svm_trampoline_test_guest, hb_size);
-    yghv_patch_rel_jump(page,
-        (size_t)(svm_trampoline_test_guest_resume - svm_trampoline_test_guest), 0);
-
-    npt_dst = page + 0x100;
-    RtlCopyMemory(npt_dst, svm_trampoline_test_npt_guest, npt_size);
-    yghv_patch_rel_jump(npt_dst,
-        (size_t)(svm_trampoline_test_npt_guest_resume - svm_trampoline_test_npt_guest), 0);
-
-    g_guest_code_page = page;
-    g_guest_hb_va = (uint64_t)page;
-    g_guest_npt_va = (uint64_t)npt_dst;
-    return STATUS_SUCCESS;
-}
-
 static NTSTATUS yghv_npt_map_ram(npt_mgr_t *m) {
     PPHYSICAL_MEMORY_RANGE ranges;
     ULONG i;
@@ -3573,13 +3532,6 @@ static void yghv_hook_rendezvous_join(void) {
 }
 #endif
 
-static NTSTATUS yghv_make_guest_code_executable(void) {
-    uint64_t pa = MmGetPhysicalAddress(g_guest_code_page).QuadPart;
-    NTSTATUS st = npt_split_2mb_to_4kb(&g_npt, pa);
-    if (st) return st;
-    return npt_set_page_perm(&g_npt, pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-}
-
 static void yghv_init_auth_cookie(void) {
     LARGE_INTEGER st, ticks;
     KeQuerySystemTime(&st);
@@ -3692,7 +3644,6 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     yghv_control_device_cleanup(d);
     KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_protect_cleanup();
-    if (g_guest_code_page)
     if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
     g_guest_code_page = NULL;
     if (g_resident_workload_page) MmFreeContiguousMemory(g_resident_workload_page);

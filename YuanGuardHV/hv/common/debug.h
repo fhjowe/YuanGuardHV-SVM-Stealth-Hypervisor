@@ -3,7 +3,7 @@
 
 #include <ntddk.h>
 
-#define YGHV_TAG 'vhGY'  /* ponytail: unique tag — change to common pool tag before release */
+#define YGHV_TAG 'vhGY'  /* pool tag for YuanGuardHV allocations */
 
 #ifdef YGHV_DEBUG_LOG
 #define LOG_INFO(fmt, ...)  DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_INFO_LEVEL, "[YGHV] " fmt "\n", ##__VA_ARGS__)

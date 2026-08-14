@@ -3,7 +3,7 @@
 #include "svm_vcpu.h"
 #include "vmcb.h"
 #include "debug.h"
-#define YGHV_DEBUG_LOG  /* development only */
+/* YGHV_DEBUG_LOG is provided by build.bat; do not redefine locally. */
 
 NTKERNELAPI NTSTATUS ZwYieldExecution(void);
 
@@ -579,7 +579,7 @@ svm_vcpu_t *svm_core_get_vcpu(uint32_t index) {
 int svm_core_set_npt(uint32_t core_id, uint64_t ncr3) {
     svm_vcpu_t *vcpu = svm_core_get_vcpu(core_id);
     if (!vcpu) return STATUS_NOT_FOUND;
-    /* ponytail: enable NPT with identity-map covering all phys memory */
+    /* enable NPT with identity-map covering all phys memory */
     vcpu->vmcb->control.np_enable = SVM_NP_ENABLE;
     vcpu->vmcb->control.ncr3 = ncr3;
     vcpu->resident_index = core_id;

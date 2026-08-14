@@ -19,6 +19,7 @@ static const uint64_t YGHV_PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
 
 static void yghv_hook_diag(const char *stage, NTSTATUS st) {
     static const char hex[] = "0123456789abcdef";
+    static ULONG diag_lines = 0;
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK iosb;
@@ -26,6 +27,10 @@ static void yghv_hook_diag(const char *stage, NTSTATUS st) {
     char buf[96];
     size_t n = 0;
     int i;
+
+    /* REV-048: cap the diagnostic log so it cannot grow without bound. */
+    if (++diag_lines > 4096)
+        return;
 
     RtlInitUnicodeString(&name, L"\\SystemRoot\\yghv_hook.log");
     InitializeObjectAttributes(&oa, &name,
@@ -935,6 +940,12 @@ static int yghv_inst_len(const uint8_t *p, size_t avail, int *rip_rel) {
 
     if (op == 0x62 || op == 0xC4 || op == 0xC5)
         return 0;  /* EVEX/VEX prefixes: reject unknown forms */
+
+    /* REV-048: DAA/DAS (0x27/0x2F) and far call/jmp (0x9A/0xEA) are invalid in
+       x86-64; reject them instead of falling into the generic ModRM branch and
+       mis-decoding. */
+    if (op == 0x27 || op == 0x2F || op == 0x9A || op == 0xEA)
+        return 0;
 
     if ((op >= 0x50 && op <= 0x5F) || (op >= 0x90 && op <= 0x9F) ||
         (op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF) ||

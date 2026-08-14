@@ -2355,3 +2355,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED，机器安全。HEAD 驱动含
   看门狗（被动诊断），无多核改动。
 - 提交：main.c 回退 + 本记录。
+
+### 9.146 2026-08-14 P4 驱动清理重应用（构建验证，本机未加载）
+
+- 背景：P4 冻结（9.141）已证实为平台间歇性（9.144 阶段 3 未复现、9.145 多核
+  挂起与清理无关）→ P4 驱动清理重新应用（REV-023/024/025/026/048 代码部分）。
+- 内容（与首次相同，均无运行时路径影响）：
+  - REV-023 移除死代码（yghv_patch_rel_jump / yghv_prepare_guest_code /
+    yghv_make_guest_code_executable，main.c）；
+  - REV-024 去重复 if（main.c DriverUnload）；
+  - REV-025 去冗余 YGHV_DEBUG_LOG（svm_core.c / npt_core.c，build.bat 全局传）；
+  - REV-026 清 ponytail 注释（debug.h / loader_stealth.c×2 / svm_core.c）；
+  - REV-048 解码器拒绝 0x27/2F/9A/EA + hook.log 4096 行上限（protect.c）。
+- 构建：`cmd /c build.bat` SUCCESS（静态校验含扩展 ioctl_parity 全过），
+  SHA `F428969F...`（归档 `D:\aaaaaavm\yuanguard_hv_p4reapply_20260814.sys`）。
+- **本机未加载**（本机 hypervisor 负载敏感，实机验证延后/换平台）。HEAD 现 =
+  P2 + 看门狗 + P4 清理。
+- 提交：6 驱动文件（main.c / svm_core.c / npt_core.c / loader_stealth.c /
+  protect.c / common/debug.h）+ 审查文档 P4 勾选 + 本记录。

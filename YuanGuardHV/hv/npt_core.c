@@ -1,8 +1,7 @@
 #include <ntddk.h>
 #include "npt.h"
 #include "debug.h"
-
-#define YGHV_DEBUG_LOG
+/* YGHV_DEBUG_LOG is provided by build.bat; do not redefine locally. */
 
 typedef struct { npt_entry_t *pdpt_va[512]; npt_entry_t *pd_va[512]; } npt_cached_t;
 static npt_cached_t *g_cache = NULL;

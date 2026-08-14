@@ -3,11 +3,11 @@
 #include "debug.h"
 
 /*
- * ponytail: minimal stealth. Unlink from PsLoadedModuleList.
+ * minimal stealth. Unlink from PsLoadedModuleList.
  * Skip SCM key deletion (requires registry handle). Add when audit demands it.
  */
 
-/* ponytail: forward-declare only the fields we need from LDR_DATA_TABLE_ENTRY.
+/* forward-declare only the fields we need from LDR_DATA_TABLE_ENTRY.
    Avoids ntifs.h / ntddk.h include conflict. Exact layout must match kernel. */
 typedef struct _KLDR_DATA_TABLE_ENTRY {
     LIST_ENTRY InLoadOrderLinks;
