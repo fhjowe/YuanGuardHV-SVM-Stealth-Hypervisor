@@ -3750,6 +3750,21 @@ static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
             yghv_wd_hex(line, sizeof(line), &off,
                 g_vcpus[i] ? g_vcpus[i]->last_cr3 : 0xEE);
         }
+        /* 9.165 diag: per-core guest GS base / KERNEL_GS_BASE at the last
+           VMEXIT — capture the KPCR/swapgs state before a context-switch
+           freeze (v100/v100b 0x139 = MISSING_GSFRAME_STACKPTR_ERROR). */
+        line[off++] = ' '; line[off++] = 'G'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? g_vcpus[i]->last_gs_base : 0xEE);
+        }
+        line[off++] = ' '; line[off++] = 'K'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? g_vcpus[i]->last_kgs_base : 0xEE);
+        }
         line[off] = 0;
         yghv_watchdog_log(line);
     }

@@ -346,6 +346,14 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     vcpu->last_rip = vcpu->vmcb->state.rip;   /* 9.153 diag */
     vcpu->last_rsp = vcpu->vmcb->state.rsp;   /* 9.153 diag */
     vcpu->last_cr3 = vcpu->vmcb->state.cr3;   /* 9.153 diag */
+    /* 9.165 diag: GS base / KERNEL_GS_BASE at the last VMEXIT — Windows
+       context-switch/exception-dispatch uses GS base (KPCR) to find the
+       exception stack; the v100/v100b 0x139 dumps both fault in
+       KiAbProcessContextSwitch -> KiAbEntryGetLockedHeadEntry with
+       MISSING_GSFRAME_STACKPTR_ERROR.  Recording the guest GS state lets the
+       watchdog capture what GS base was live right before a freeze. */
+    vcpu->last_gs_base = vcpu->vmcb->state.gs_base;
+    vcpu->last_kgs_base = vcpu->vmcb->state.kernel_gs_base;
 
     /* 9.162: clean-unload for OS-as-guest resident.  Once stop is requested
        (sc stop -> DriverUnload), every OS-as-guest VMEXIT returns 1 so the

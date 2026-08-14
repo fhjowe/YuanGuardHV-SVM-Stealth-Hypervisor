@@ -168,6 +168,8 @@ typedef struct {
     volatile uint64_t last_rip;        /* 9.153 diag: guest RIP at last VMEXIT */
     volatile uint64_t last_rsp;        /* 9.153 diag: guest RSP at last VMEXIT */
     volatile uint64_t last_cr3;        /* 9.153 diag: guest CR3 at last VMEXIT */
+    volatile uint64_t last_gs_base;    /* 9.165 diag: guest GS base at last VMEXIT */
+    volatile uint64_t last_kgs_base;   /* 9.165 diag: guest KERNEL_GS_BASE at last VMEXIT */
     volatile LONG npt_flush_pending;
     volatile LONG rearm_pending;
     volatile uint64_t rearm_gpa;

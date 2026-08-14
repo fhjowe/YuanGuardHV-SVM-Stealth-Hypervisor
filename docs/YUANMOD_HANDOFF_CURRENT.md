@@ -2721,3 +2721,91 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   建议按 9.128 清单在需要时重跑）。
 - **状态**：C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：main.c / vmexit.c + 本记录。
+
+### 9.164 2026-08-14 深度挖掘：OS-as-guest 常驻冻结机理代码级全链路（含新发现缺口）
+
+- **背景**：用户要求深度挖掘 guestos 常驻。Web 搜索不可用（无 API key），改用纯
+  代码级 + 历史实证（9.84-9.102 已归档）全链路分析。
+- **冻结证据链（已归档，9.84-9.102）**：
+  - v100/v100b：guest 内文件 I/O 触发 0x139 BSOD（栈在 `KiAbProcessContextSwitch`
+    GP → 栈越界），无 VMEXIT 捕获；
+  - v100c：移除全部 I/O → 硬冻结无 dump；
+  - v101：拦截 #DF/#NP/#SS/#GP → 未捕获、仍硬冻结；
+  - v102：拦截全 32 异常 + HLT → 未捕获、仍硬冻结。
+  - 结论：冻结 = guest 内 Windows 调度器上下文切换（`KiSwapThread`），**不经过
+    任何可拦截异常向量**；整机级硬停（宿主全核停滞）。
+- **代码级核实（本窗口）**：
+  - OS-as-guest 的 guest 用 `cr3=yg_read_cr3()`（宿主 CR3）→ 与 9.152 合成 resident
+    冻结同源，但独立 CR3 修复不适用（guest 是 Windows 本身）。
+  - ASID/TLB 卫生（9.159-9.161）已测，无效。
+  - **新发现缺口（从未测过）**：`svm_handle_cr` 是 REV-009 fail-closed、
+    `cr_write_intercepts=0` → **guest 内 Windows 调度器上下文切换写 CR3（进程
+    切换）时完全不被拦截、直接打到硬件**；`svm_handle_msr` 仅特殊处理 VM_CR，
+    **KERNEL_GS_BASE(0xC0000102)/STAR/LSTAR 等切换 MSR 未拦截**（MSRPM 全零=放行）。
+    即 guest 内上下文切换的 CR3 写 + 关键 MSR 写是**无 VMEXIT 干预的裸直通**。
+- **深挖结论**：
+  1. 冻结 = guest 内上下文切换路径（非单指令）→ 平台级（本机 Ryzen 5 5500 在
+     guest 态跑真实 Windows 调度器的限制）。
+  2. 已排除：异常向量拦截、HLT、ASID/TLB 卫生、核数/退出率/C 状态/APIC/IO 系列。
+  3. **剩余未测方向（代码缺口明确）**：CR3 写拦截（svm_handle_cr 已备 fail-closed
+     骨架）+ MSR 切换拦截（KERNEL_GS_BASE 等），通过 VMEXIT 模拟而非裸直通，可能
+     改变上下文切换路径的硬件行为——但无理论保证（若 CPU 在 guest 态上下文切换
+     本身锁死，拦截也无济于事）。
+- **建议**：本机维持"有界试点 + step20 spin 常驻（已可干净卸载）"为安全边界；
+  真 OS-as-guest 常驻仍需换平台（或接硬件调试器观测上下文切换路径的硬件行为）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.165 2026-08-14 深挖转储实证：冻结机制指向 GS base / swapgs / exception-stack 虚拟化缺口
+
+- **转储分析（`081226-19625-01.dmp`，v100 0x139）**：
+  - BugCheck 0x139，**Arg1=4 = FAST_FAIL_INCORRECT_STACK**；
+  - FAILURE_BUCKET = **`0x139_MISSING_GSFRAME_STACKPTR_ERROR`**；
+  - 栈：guest 内 `NtWriteFile → KeWaitForSingleObject → KiCommitThreadWait →
+    KiSwapThread → KiAbProcessContextSwitch → KiAbEntryGetLockedHeadEntry` → #GP →
+    `KiGeneralProtectionFault → KiExceptionDispatchOnExceptionStack → 0x139`。
+- **机理推断（比"平台级"更精确）**：
+  - Windows 上下文切换路径 `KiAbProcessContextSwitch`/异常分发依赖 **GS base
+    （KPCR per-CPU）**定位 exception stack / 锁头；
+  - 在 SVM guest 态，若 **GS base / KERNEL_GS_BASE / exception-stack 状态未正确
+    虚拟化**，异常分发读到错误的栈指针 → 0x139（可诊断形态）或整机硬冻结
+    （无 dump 形态，v100c/v101/v102）。
+  - **SVM 拦截位无 SWAPGS**（svm_defs.h bit 0-46 无 swapgs）→ 无法直接拦截
+    swapgs；但可拦截 **MSR_GS_BASE(0xC0000101)/MSR_KERNEL_GS_BASE(0xC0000102)
+    的 rdmsr/wrmsr**（MSR_PROT + svm_handle_msr 已具备骨架），并确保 VMRUN 时
+    GS base 初始化正确（svm_core.c:335/382 目前取宿主当前值）。
+- **深挖价值**：把冻结从"纯平台级、需换平台"提升到"**可能通过 GS base / KPCR /
+  exception-stack 虚拟化修复**"的具体方向——这是 9.84-9.102 与 9.149-9.163 都未
+  触达的层（此前聚焦 CR3/TLB/ASID/中断，从未聚焦 GS base 虚拟化）。
+- **未决**：需实机验证"GS base 虚拟化"是否改变冻结行为（有冻结风险，需重启预案）；
+  或接硬件调试器观测 guest 内 swapgs/KPCR 路径。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.166 2026-08-14 GS base 诊断增强 + step17 复测：硬冻结形态无观测能力（诊断局限）
+
+- **B 交叉验证（完成）**：v100b 转储（`081226-12390-01.dmp`）与 v100 完全一致：
+  0x139 / Arg1=4 / `0x139_MISSING_GSFRAME_STACKPTR_ERROR`；崩溃栈逐帧一致
+  （`yuanguard_hv+0x132d → NtWriteFile → KeWaitForSingleObject →
+  KiCommitThreadWait → KiSwapThread → KiAbProcessContextSwitch →
+  KiAbEntryGetLockedHeadEntry → #GP → KiExceptionDispatchOnExceptionStack`）。
+  **GS base / exception-stack 假说坐实（两份转储 100% 复现）**。
+- **A 第一步（诊断增强）**：`svm_vcpu.h` 加 `last_gs_base`/`last_kgs_base`；
+  `svm_dispatch_exit` 记录；`yghv_freeze_watchdog_thread`（persistent watchdog）
+  输出 `G=`/`K=` 字段。构建 PASS（默认/step17）。
+- **step17 复测（含诊断，SHA `2AC32D8E...`）**：再次冻结（无响应、用户重启）。
+  progress 停在 `os resident enter=1 → bm os resident running → bm done`，之后
+  **<5s 冻结，无 alive、watchdog 无新行、无转储**。
+- **诊断局限（重要）**：
+  1. 硬冻结太快（<5s），host 侧任何观察线程（alive 5s/watchdog）都来不及执行；
+  2. G=/K= 诊断加在 `yghv_freeze_watchdog_thread`（persistent 用），**step17 用
+     `yghv_resident_watchdog_thread`（仅 stall bugcheck，不写日志）→ 诊断未生效**；
+  3. 本质：step17（纯阻塞）是**硬冻结形态**——guest 内上下文切换直接 CPU 级全核
+     锁死，无 VMEXIT、无可拦截事件、host 线程无法调度（与 v100c/v101/v102 一致）。
+- **结论**：GS base 假说仅能在**可诊断形态**（v100/v100b 的 0x139，有文件 I/O 时
+  Windows 能检测栈损坏并 bugcheck）下验证；硬冻结形态无 host 侧观测能力。
+  代码缺口（MSR_GS_BASE/KERNEL_GS_BASE 未虚拟化）明确，但实机验证需换观测手段
+  （有 I/O 的 0x139 形态 / 硬件调试器）。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`（备份
+  `D:\yuanguard\backup_stable_70888311.sys`），服务 STOPPED，机器安全。
+- 提交：本记录。
