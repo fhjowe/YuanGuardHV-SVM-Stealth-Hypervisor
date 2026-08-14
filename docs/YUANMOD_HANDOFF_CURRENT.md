@@ -2487,7 +2487,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   路径故障），需后续修复 runtime NPF 演示；当前持久模式为纯心跳（保护功能
   仍有效，只是合成 guest 不再每轮演示写保护）。
 - **新增诊断**：看门狗现含每核 last_exitcode（x= 列表，0x81=VMMCALL、
-  0x7F=SHUTDOWN、0x400=NPF）；缓冲加大到 800。
+  0x7F=SHUTDOWN、0x400=NPF）+ last_rip/last_rsp/last_cr3（r=/p=/g= 列表）；
+  缓冲加大到 1600（原 800 时行长超限导致 RtlStringCchLengthA 失败、看门狗空；
+  yghv_wd_hex 边界 `off+18 > bufsz` 会越界写，已修为 `> bufsz-1`）。
 - **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED。
 - 提交：svm_vcpu.h / vmexit.c / vmmcall.c / protect.c / protect.h / main.c +
   本记录。
+
+### 9.154 2026-08-14 hook 调用链隔离发现 + 稳定版最终确认（SHA 8A78809F）
+
+- **隔离实验**（独立 CR3 下 c0 工作负载）：c0 仅 workload 写（rdi，rsi=0）→
+  **ACTIVE 稳定（无故障）**；c0 完整工作负载（写 + hook 调用 rsi=dummy）→
+  **三重重置**（x=0x7F SHUTDOWN，故障 RIP = `call rsi`，RSP/CR3 均正常）。
+- **结论**：workload 写/NPF/rearm 在独立 CR3 下**正常**；故障在 **hook 调用链**
+  （guest → hooked dummy → stub → g_protect），映射仍未定位（dummy/stub/
+  g_protect 两页/栈均已映射仍复现）——作为已知后续项，需换平台或更深入调试。
+- **最终稳定配置**：persistent 全核纯心跳 + 独立 guest CR3，SHA `8A78809F...`
+  （归档 `D:\aaaaaavm\yuanguard_hv_freezefix_20260814.sys` 为 D6F0A6DD 版；
+  本版含诊断增强）。验证：selftest PASS + c0 ACTIVE + 干净卸载。
+- **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED。
+- 提交：main.c 稳定配置 + 诊断增强（svm_vcpu.h/vmexit.c/main.c）+ 本记录。

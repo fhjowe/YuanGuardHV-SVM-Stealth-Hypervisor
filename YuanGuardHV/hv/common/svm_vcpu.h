@@ -165,6 +165,9 @@ typedef struct {
     uint64_t resident_cr_exits;
     uint64_t resident_interrupt_exits;
     volatile uint64_t last_exitcode;   /* 9.152 diag: last VMEXIT code handled */
+    volatile uint64_t last_rip;        /* 9.153 diag: guest RIP at last VMEXIT */
+    volatile uint64_t last_rsp;        /* 9.153 diag: guest RSP at last VMEXIT */
+    volatile uint64_t last_cr3;        /* 9.153 diag: guest CR3 at last VMEXIT */
     volatile LONG npt_flush_pending;
     volatile LONG rearm_pending;
     volatile uint64_t rearm_gpa;

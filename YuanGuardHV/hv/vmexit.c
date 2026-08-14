@@ -342,6 +342,9 @@ static void yghv_v98_apic_scan_forward(void) {
 int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     uint64_t exitcode = vcpu->vmcb->control.exitcode;
     vcpu->last_exitcode = exitcode;   /* 9.152 diag: for freeze/stop localization */
+    vcpu->last_rip = vcpu->vmcb->state.rip;   /* 9.153 diag */
+    vcpu->last_rsp = vcpu->vmcb->state.rsp;   /* 9.153 diag */
+    vcpu->last_cr3 = vcpu->vmcb->state.cr3;   /* 9.153 diag */
 
     yghv_v100_record(vcpu);
     if (g_r1_diag && g_r1_diag_count++ < 200) {

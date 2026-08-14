@@ -3550,7 +3550,7 @@ static void yghv_watchdog_log(const char *line) {
     IO_STATUS_BLOCK iosb;
     HANDLE h;
     size_t len = 0;
-    char buf[800];
+    char buf[1600];
 
     RtlInitUnicodeString(&name, L"\\SystemRoot\\yghv_watchdog.log");
     InitializeObjectAttributes(&oa, &name,
@@ -3573,7 +3573,7 @@ static void yghv_watchdog_log(const char *line) {
 static void yghv_wd_hex(char *buf, size_t bufsz, size_t *off, uint64_t v) {
     static const char hex[] = "0123456789abcdef";
     int i;
-    if (*off + 18 > bufsz)
+    if (*off + 18 > bufsz - 1)   /* reserve 1 byte for the trailing NUL */
         return;
     buf[(*off)++] = '0';
     buf[(*off)++] = 'x';
@@ -3652,7 +3652,7 @@ static uint64_t yghv_build_guest_cr3(uint64_t *vas, ULONG count) {
 static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
     LARGE_INTEGER delay;
     LARGE_INTEGER tick;
-    char line[800];
+    char line[1600];
     size_t off;
     ULONG n, i;
     (void)ctx;
@@ -3689,6 +3689,26 @@ static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
             if (i) line[off++] = ',';
             yghv_wd_hex(line, sizeof(line), &off,
                 g_vcpus[i] ? g_vcpus[i]->last_exitcode : 0xEE);
+        }
+        /* per-core guest RIP at the last VMEXIT (where a fault/stop occurred) */
+        line[off++] = ' '; line[off++] = 'r'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? g_vcpus[i]->last_rip : 0xEE);
+        }
+        /* per-core guest RSP and CR3 at the last VMEXIT (fault localization) */
+        line[off++] = ' '; line[off++] = 'p'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? g_vcpus[i]->last_rsp : 0xEE);
+        }
+        line[off++] = ' '; line[off++] = 'g'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? g_vcpus[i]->last_cr3 : 0xEE);
         }
         line[off] = 0;
         yghv_watchdog_log(line);
@@ -4227,13 +4247,12 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
-        /* 9.152: all persistent guests run the pure heartbeat under the
-           dedicated guest CR3 — the stable, freeze-free configuration
-           (shared-CR3 configs froze 15-60 s; this ran 5+ min stable).  The
-           full workload guest (NPF/rearm demonstration) triple-faults under
-           the dedicated CR3 (HEARTBEAT zeroes rdi/rsi because the dedicated
-           CR3 is not a target CR3, and the workload write path faults) — a
-           follow-up to restore the runtime NPF demonstration. */
+        /* 9.152/9.153: all persistent guests run the pure heartbeat under the
+           dedicated guest CR3 — the stable, freeze-free configuration.  The
+           full workload hook-call (guest -> hooked dummy -> stub) triple-faults
+           under the dedicated CR3 (unresolved mapping in the hook-call chain;
+           the workload WRITE alone is fine, verified 9.153) — a follow-up to
+           restore the runtime NPF/hook demonstration. */
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
         g_vcpus[i]->regs.rdi = 0;
         g_vcpus[i]->regs.rsi = 0;
