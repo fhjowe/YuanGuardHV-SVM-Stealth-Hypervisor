@@ -68,6 +68,21 @@ typedef struct __attribute__((packed)) {
 yghv_idtr_desc_t g_avic_eoi_idtr;
 yghv_idtr_desc_t g_avic_old_idtr;
 volatile BOOLEAN g_os_guest_delay_quiet = FALSE;
+/* 9.159: OS-as-guest ASID/TLB hygiene switch.  Default ON.  When set, every
+   OS-as-guest vcpu gets a per-core unique guest ASID (host keeps ASID 0) and
+   requests FLUSH_BY_ASID on each VMRUN, testing whether the guest/host TLB
+   aliasing behind the 9.152 shared-CR3 freeze can be avoided for OS-as-guest
+   (which cannot use a dedicated minimal guest CR3). */
+volatile BOOLEAN g_os_guest_tlb_hygiene = TRUE;
+/* 9.162: clean-unload for OS-as-guest resident (fixes 0xCE).  When
+   g_os_guest_stop_requested is set, svm_dispatch_exit returns 1 so the
+   trampoline's jnz host_done terminates the guest thread on its next VMEXIT
+   (spin guests VMEXIT on every CPUID).  The resident thread handles are owned
+   by DriverUnload so sc stop can join them before tearing down. */
+volatile BOOLEAN g_os_guest_stop_requested = FALSE;
+HANDLE g_os_guest_resident_thread = NULL;   /* spin/block OS-as-guest thread */
+HANDLE g_os_guest_alive_thread = NULL;      /* resident alive logger */
+HANDLE g_os_guest_watchdog_thread = NULL;   /* resident watchdog (0xE2 guard) */
 volatile BOOLEAN g_v96_apic_tpr_stress = FALSE;
 void *g_v96_apic_tpr_va = NULL;
 volatile BOOLEAN g_v97_hlt_intercept = FALSE;
@@ -880,6 +895,19 @@ static __declspec(noinline) void yghv_os_guest_main(void) {
     }
 }
 
+/* 9.159: OS-as-guest ASID/TLB hygiene helper.  Called right after
+   svm_core_set_npt() in every yghv_os_guest_*_thread so the guest runs under
+   a per-core unique ASID with a by-ASID TLB flush requested on every VMRUN.
+   The goal is to decouple the guest TLB (ASID != 0) from the host TLB (ASID 0)
+   that both translate the same host kernel addresses — the aliasing that the
+   9.152 shared-CR3 freeze implicated.  gated by g_os_guest_tlb_hygiene. */
+static void yghv_os_guest_tlb_hygiene_apply(svm_vcpu_t *v, uint32_t core) {
+    if (!v || !g_os_guest_tlb_hygiene)
+        return;
+    v->vmcb->control.guest_asid = core + 1;   /* per-core unique; host keeps 0 */
+    v->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;  /* FLUSH_BY_ASID */
+}
+
 __declspec(noinline) __declspec(noreturn)
 void yghv_os_guest_host_done(svm_vcpu_t *vcpu) {
     uint32_t core = vcpu ? vcpu->resident_index : 0;
@@ -928,6 +956,7 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_trace_u64("os guest thread enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Trampoline exits via yghv_os_guest_host_done; this is a fallback. */
@@ -963,6 +992,7 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_trace_u64("os seamless enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Seamless continuation: this caller now runs in guest mode. */
@@ -1013,6 +1043,7 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    yghv_os_guest_tlb_hygiene_apply(v, core);
     if (g_v96_apic_tpr_stress && !g_v96_apic_tpr_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
@@ -1044,6 +1075,8 @@ static VOID yghv_resident_alive_thread(PVOID ctx) {
     KeSetSystemAffinityThread((KAFFINITY)1);
     delay.QuadPart = -5LL * 10000000LL;
     for (;;) {
+        if (g_os_guest_stop_requested)
+            break;
         KeDelayExecutionThread(KernelMode, FALSE, &delay);
         seconds += 5;
         yghv_trace_u64("resident alive", seconds);
@@ -1059,6 +1092,8 @@ static VOID yghv_resident_watchdog_thread(PVOID ctx) {
     KeSetSystemAffinityThread((KAFFINITY)1);
     delay.QuadPart = -1LL * 10000000LL;
     for (;;) {
+        if (g_os_guest_stop_requested)
+            break;
         KeDelayExecutionThread(KernelMode, FALSE, &delay);
         if (!g_os_resident_mode)
             continue;
@@ -1206,6 +1241,7 @@ static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    yghv_os_guest_tlb_hygiene_apply(v, core);
     g_os_resident_mode = TRUE;
     yghv_trace_u64("os resident spin enter", core);
     if (core < SVM_MAX_CORES)
@@ -1250,6 +1286,7 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    yghv_os_guest_tlb_hygiene_apply(v, core);
     g_os_resident_mode = TRUE;
 
     InterlockedIncrement(&g_v99_allcore_ready);
@@ -1326,6 +1363,7 @@ static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    yghv_os_guest_tlb_hygiene_apply(v, core);
     if (g_v98_apic_shadow && !g_v98_apic_shadow_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
@@ -2237,9 +2275,11 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         }
         KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
                               KernelMode, FALSE, NULL);
-        ZwClose(thread);
-        ZwClose(alive);
-        ZwClose(watchdog);
+        /* 9.162: transfer handles to globals so DriverUnload can request stop
+           and join the threads before teardown (fixes 0xCE on sc stop). */
+        g_os_guest_resident_thread = thread;
+        g_os_guest_alive_thread = alive;
+        g_os_guest_watchdog_thread = watchdog;
         yghv_trace("bm os resident spin host-isr running");
         return STATUS_SUCCESS;
     }
@@ -3715,11 +3755,44 @@ static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
     }
 }
 
+/* 9.162: join a system thread by its HANDLE — wait on the thread OBJECT (via
+   ObReferenceObjectByHandle), never on the raw handle (raw handle is not a
+   dispatcher object and bugchecks 0xA — the 2EA24641 diagnostic build). */
+static void yghv_join_system_thread(HANDLE h) {
+    PETHREAD thread_obj = NULL;
+    NTSTATUS jst;
+
+    if (!h)
+        return;
+    jst = ObReferenceObjectByHandle(h, SYNCHRONIZE, *PsThreadType, KernelMode,
+                                    (PVOID *)&thread_obj, NULL);
+    if (NT_SUCCESS(jst)) {
+        KeWaitForSingleObject(thread_obj, Executive, KernelMode, FALSE, NULL);
+        ObDereferenceObject(thread_obj);
+    } else {
+        LOG_ERROR("join thread: ObReferenceObjectByHandle failed 0x%x", jst);
+    }
+    ZwClose(h);
+}
+
 void DriverUnload(struct _DRIVER_OBJECT *d) {
 #if YGHV_HOOK_RENDEZVOUS_TEST
     yghv_hook_rendezvous_join();
 #endif
     g_npt_test_active = 0;
+    /* 9.162: clean-unload for OS-as-guest resident.  Request guest stop first —
+       the spin/block guest exits on its next VMEXIT (svm_dispatch_exit returns 1
+       -> trampoline jnz host_done -> yghv_os_guest_host_done -> thread exits).
+       alive/watchdog threads break out on the same flag.  Join all three before
+       any teardown so no thread runs in the unloaded module (fixes 0xCE). */
+    g_os_guest_stop_requested = TRUE;
+    yghv_join_system_thread(g_os_guest_resident_thread);
+    yghv_join_system_thread(g_os_guest_alive_thread);
+    yghv_join_system_thread(g_os_guest_watchdog_thread);
+    g_os_guest_resident_thread = NULL;
+    g_os_guest_alive_thread = NULL;
+    g_os_guest_watchdog_thread = NULL;
+    g_os_guest_stop_requested = FALSE;
     svm_core_stop_all_residents();
     svm_core_wait_all_stopped(g_vcpu_count);
     yghv_control_device_cleanup(d);

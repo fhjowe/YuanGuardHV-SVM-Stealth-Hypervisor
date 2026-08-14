@@ -2605,3 +2605,119 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：重启后 C 盘恢复稳定版 `70888311`（备份 `D:\yuanguard\backup_stable_70888311.sys`），
   服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.159 2026-08-14 OS-as-guest 常驻可行性研究（代码级，零机器风险）
+
+- **产出**：`docs/YGHV_OS_AS_GUEST_RESEARCH_20260814.md`（完整研究）。
+- **结论**：
+  1. OS-as-guest 常驻本机必然冻结：guest 必须共享宿主 CR3（`svm_prepare_vcpu`
+     `cr3=yg_read_cr3()`）→ 与 9.152 相同 TLB 别名 CPU 锁死；9.152 独立 CR3
+     修复对 OS-as-guest 不可用（guest 是 Windows 本身，需完整地址空间）。
+  2. 有界试点（12-16）本机可安全验证，已全 PASS；常驻线上限在本机不可达。
+  3. **唯一未测驱动级杠杆 = ASID/TLB 卫生**：当前 `guest_asid=1`（全核共享）、
+     `tlb_control=0`、全程无 INVLPGA。9.149-9.152 均未隔离该变量。可测假设：
+     每核唯一 ASID + 每 VMRUN FLUSH_BY_ASID，能否避免 TLB 别名锁死。
+  4. 换平台重开顺序：有界试点 → ASID/TLB 卫生实验 → 修 0xCE 卸载（OS-as-guest
+     线程注册 join 表 + spin 停止标志）→ 阻塞常驻。若卫生仍冻结 → 需影子页表/
+     NPT 非 identity（大幅重写）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.160 2026-08-14 ASID/TLB 卫生实验（阶段 0-2 PASS，阶段 3 待重启后执行）
+
+- **背景**：承 9.159，用户确认目标为**本机运行 OS-as-guest 常驻（不换平台）**，
+  按阶段推进 ASID/TLB 卫生实验。
+- **代码改动（main.c，仅 OS-as-guest 门控路径）**：
+  - 新增 `g_os_guest_tlb_hygiene`（默认 TRUE）+ `yghv_os_guest_tlb_hygiene_apply(v, core)`：
+    每核唯一 `guest_asid = core+1`（host 保留 ASID 0）+ 每 VMRUN `tlb_control =
+    SVM_TLB_CONTROL_FLUSH`（FLUSH_BY_ASID）。
+  - 6 个 OS-as-guest 线程（thread/seamless/resident/spin/allcore/delay）的
+    `svm_core_set_npt` 后统一调用。**不改 svm_core_set_npt 本身**，合成 resident
+    不受影响。
+- **实验进度**：
+  | 阶段 | 内容 | 结果 |
+  |---|---|---|
+  | 0 | 构建验证（默认/16/20/17） | ✅ 全 PASS |
+  | 1 | step16 全核无缝有界 + 卫生 | ✅ PASS（12 核×10000，counter=0xea60） |
+  | 2 | step20 spin 常驻 + 卫生 | ✅ PASS（resident alive 65s+，超 9.154 的 60s 基线） |
+  | 3 | step17 阻塞常驻 + 卫生（guest 内调度器切换） | ⏳ 待重启后执行（决定性） |
+- **当前机器状态**：step20 常驻仍在运行且无法干净卸载（0xCE 已知），
+  `C:\yuanguard_hv.sys` 被锁定 → **需用户手动重启清除**。重启后服务 DEMAND_START
+  不自启，再部署 step17 构建 `140779BF...`（已在 `bin\`）并加载测试。
+- **风险**：step17 为历史冻结形态（0x139×2、整机硬停），即使有卫生也可能冻结；
+  冻结则再次重启并恢复 `70888311`。
+- 提交：本记录。
+
+### 9.161 2026-08-14 ASID/TLB 卫生决定性实验：step17 阻塞常驻仍冻结（结论）
+
+- **执行**：用户重启清除 step20 常驻后，部署 step17+卫生（`140779BF...`）加载。
+- **结果：❌ 冻结**（用户手动重启）。progress 日志最后时刻：
+  `bm os resident start → os resident enter=1 → bm os resident running → bm done`，
+  **无任何 `resident alive` 条目** → guest 进入后 <5s（首次 guest 内 Windows 调度器
+  上下文切换）即整机冻结。对比 step20（spin）alive 到 65s。
+- **结论（实证）**：**ASID/TLB 卫生未能阻止 OS-as-guest 阻塞常驻冻结**。
+  - 排除了 9.159 研究的"唯一未测驱动级杠杆"（每核唯一 ASID + FLUSH_BY_ASID）。
+  - 与历史模式一致（guest 内调度器切换 → 平台级整机硬停，0x139×2/硬冻结史），
+    确认 **OS-as-guest 常驻在本机是平台级限制，非 ASID/TLB 处理缺陷**。
+  - 9.152 独立 CR3 修复对 OS-as-guest 不可用（guest 需完整 Windows 地址空间）。
+- **实验边界定格**：本机 OS-as-guest = 有界试点（12/14/16 全 PASS）可达；
+  常驻不可达（阻塞冻结、spin 可运行但卸载 0xCE 需重启）。
+- **ASID 卫生代码**：`g_os_guest_tlb_hygiene`（默认 TRUE）在 main.c 中，仅影响
+  OS-as-guest 门控路径，合成 resident 不受影响。**实验证明对常驻无效**；是否保留
+  该改动（作为换平台时的负结果记录/备选）待用户决定。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`（备份
+  `D:\yuanguard\backup_stable_70888311.sys`），服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.162 2026-08-14 本机目标下的研究转向：spin 常驻卸载 0xCE 可修复（方案）
+
+- **背景**：用户明确目标 = **本机运行 OS-as-guest（不换平台）**，并选"先继续研究"
+  （ASID 卫生代码暂保留，9.161 已证对常驻无效）。
+- **关键区分（实证后）**：
+  - 真正 OS-as-guest（guest 内 Windows 调度器真实切换）= 阻塞常驻（step17/99/100）
+    → 本机**平台级冻结**（9.161 实证，ASID 卫生亦无效）。
+  - spin 常驻（step20）= guest 内自旋（永不阻塞/不调度）→ 本机能跑 65s+，
+    属"无缝 VM 常驻"形态（非真 OS-as-guest 调度），但**卸载 0xCE 需重启**。
+- **新研究结论：0xCE 卸载可修复**（让 spin 常驻本机可用、干净卸载）：
+  1. `svm_dispatch_exit` 顶部检查新标志 `g_os_guest_stop_requested`：置位即
+     `return 1` → trampoline `os_enter_dispatch_default` 的 `jnz
+     svm_os_guest_host_done` → `yghv_os_guest_host_done` → 线程退出。
+  2. spin guest 每轮 `cpuid` VMEXIT 都经 dispatch（汇编链路已核实）→ 下一次
+     VMEXIT 即响应停止，无需等待阻塞。
+  3. `DriverUnload`：置停止标志 → `ObReferenceObjectByHandle` join OS-as-guest
+     线程（沿用 9.142 看门狗 join 模式）→ 再 teardown。
+  - 需同时处理：OS-as-guest 线程句柄保存（当前 step17+ 局部句柄已 ZwClose）、
+    多线程 join 表。
+- **意义**：修复后 step20 spin 常驻 = 本机**可加载/稳定运行/干净卸载**的无缝
+  常驻形态（虽非真 OS-as-guest 调度，但提供持续 guest 模式虚拟化 + 可逆性），
+  是本机目标下最现实的落点；真 OS-as-guest 需换平台（已实证平台级限制）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.163 2026-08-14 0xCE 卸载修复实机验证：step20 spin 常驻干净卸载（重大突破）
+
+- **实现（main.c + vmexit.c，9.162 方案落地）**：
+  1. 全局 `g_os_guest_stop_requested` + `g_os_guest_resident_thread` /
+     `g_os_guest_alive_thread` / `g_os_guest_watchdog_thread` 句柄。
+  2. `svm_dispatch_exit` 顶部：stop 置位即 `return 1` → trampoline
+     `os_enter_dispatch_default` 的 `jnz svm_os_guest_host_done` →
+     `yghv_os_guest_host_done` → 线程退出（spin guest 每 CPUID VMEXIT 即响应）。
+  3. `yghv_resident_alive_thread` / `yghv_resident_watchdog_thread` 循环加
+     stop 检查 break（防 watchdog 在 guest 停后误判 stall 触发 0xE2 bugcheck）。
+  4. step20 线程句柄**转移给全局**（不再 ZwClose）；新增 `yghv_join_system_thread`
+     （ObReferenceObjectByHandle + KeWaitForSingleObject，沿用 9.142 看门狗 join
+     模式）；`DriverUnload` 先置 stop → join 三线程 → 再 teardown。
+- **构建**：默认版 + step20 门控版全 PASS（静态校验含扩展 ioctl_parity）。
+- **实机验证（step20 + ASID 卫生 + 卸载修复，SHA `45569885...`）**：
+  - 加载 → RUNNING，`resident alive` 持续到 30s+，机器响应。
+  - **`sc stop` → 干净 STOPPED（WIN32_EXIT_CODE=0），无蓝屏、无冻结、无重启**；
+    最新转储仍为旧的 `081426-14453-01.dmp`（18:16，修复前 0xCE）。
+- **意义**：**0xCE 卸载问题已修复**。step20 spin 常驻现为本机**可加载 / 稳定运行 /
+  干净卸载**的无缝常驻形态（持续 guest 模式虚拟化 + 可逆），达成"本机运行
+  OS-as-guest 形态"的最现实落点（真 OS-as-guest 调度仍需换平台，平台级限制）。
+- **遗留**：ASID 卫生（9.159）对常驻无效但保留（门控，不影响合成 resident）；
+  step17 阻塞常驻仍冻结（9.161）；其他 step17+/99/100 未做卸载修复（仅 step20
+  验证）。控制面非 hook 回归未重跑（卸载修复不触碰 control/NPT/protect 路径，
+  建议按 9.128 清单在需要时重跑）。
+- **状态**：C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：main.c / vmexit.c + 本记录。

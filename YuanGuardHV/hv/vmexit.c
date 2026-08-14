@@ -25,6 +25,7 @@ extern volatile BOOLEAN g_os_resident_mode;
 extern volatile ULONG64 g_os_resident_exits;
 extern volatile BOOLEAN g_os_guest_avic_timer_emu;
 extern volatile BOOLEAN g_v98_apic_shadow;
+extern volatile BOOLEAN g_os_guest_stop_requested;
 extern volatile BOOLEAN g_v100_monitor_active;
 extern volatile BOOLEAN g_v101_gp_seen;
 extern volatile uint64_t g_v101_gp_exitcode;
@@ -345,6 +346,15 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     vcpu->last_rip = vcpu->vmcb->state.rip;   /* 9.153 diag */
     vcpu->last_rsp = vcpu->vmcb->state.rsp;   /* 9.153 diag */
     vcpu->last_cr3 = vcpu->vmcb->state.cr3;   /* 9.153 diag */
+
+    /* 9.162: clean-unload for OS-as-guest resident.  Once stop is requested
+       (sc stop -> DriverUnload), every OS-as-guest VMEXIT returns 1 so the
+       trampoline's jnz svm_os_guest_host_done terminates the guest thread on
+       its next exit.  Spin guests VMEXIT on every CPUID, so they respond
+       immediately; this also stops the resident exit counter so the watchdog
+       does not keep it pinned. */
+    if (g_os_guest_stop_requested)
+        return 1;
 
     yghv_v100_record(vcpu);
     if (g_r1_diag && g_r1_diag_count++ < 200) {
