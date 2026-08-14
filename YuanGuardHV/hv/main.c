@@ -45,6 +45,8 @@ volatile BOOLEAN g_persistent_mode = FALSE;
 void *g_guest_code_page = NULL;
 void *g_resident_workload_page = NULL;
 HANDLE g_hook_rendezvous_thread = NULL;
+volatile BOOLEAN g_watchdog_stop = FALSE;
+HANDLE g_watchdog_thread = NULL;
 uint64_t g_guest_hb_va = 0;
 uint64_t g_guest_npt_va = 0;
 HANDLE g_trace_file = NULL;
@@ -3587,6 +3589,27 @@ static void yghv_init_auth_cookie(void) {
         g_vmmcall_auth_cookie = 0x59484756ULL;
 }
 
+/* 9.141 freeze watchdog: a host-side observer that logs the per-core resident
+   VMEXIT counts every 5 s while the driver is loaded.  On a hard freeze the
+   last marker tells us whether host code was still running (markers continue
+   on the free cores) or every core was stuck in guest mode (markers stop),
+   localizing the stall.  Purely observational; it does not touch the
+   resident/NPF/VMMCALL paths. */
+static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
+    LARGE_INTEGER delay;
+    (void)ctx;
+    delay.QuadPart = -5LL * 10 * 1000 * 1000;   /* 5 s */
+    while (!g_watchdog_stop) {
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        if (g_watchdog_stop)
+            break;
+        yghv_trace_u64("wd core0 exits", g_vcpus[0] ? g_vcpus[0]->resident_exits : 0);
+        yghv_trace_u64("wd core1 exits", g_vcpus[1] ? g_vcpus[1]->resident_exits : 0);
+        yghv_trace_u64("wd core2 exits", g_vcpus[2] ? g_vcpus[2]->resident_exits : 0);
+        yghv_trace_u64("wd core3 exits", g_vcpus[3] ? g_vcpus[3]->resident_exits : 0);
+    }
+}
+
 void DriverUnload(struct _DRIVER_OBJECT *d) {
 #if YGHV_HOOK_RENDEZVOUS_TEST
     yghv_hook_rendezvous_join();
@@ -3605,6 +3628,26 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     npt_cleanup(&g_npt);
     svm_core_cleanup();
     KeRevertToUserAffinityThread();
+    g_watchdog_stop = TRUE;
+    if (g_watchdog_thread) {
+        /* Wait on the thread OBJECT (via the handle), never on the raw handle:
+           passing the HANDLE to KeWaitForSingleObject treats it as a dispatcher
+           pointer and bugchecks 0xA (seen in the 2EA24641 diagnostic build). */
+        PETHREAD thread_obj = NULL;
+        NTSTATUS jst = ObReferenceObjectByHandle(
+            g_watchdog_thread, SYNCHRONIZE, *PsThreadType, KernelMode,
+            (PVOID *)&thread_obj, NULL);
+        if (NT_SUCCESS(jst)) {
+            KeWaitForSingleObject(thread_obj, Executive, KernelMode, FALSE,
+                                  NULL);
+            ObDereferenceObject(thread_obj);
+        } else {
+            LOG_ERROR("watchdog join: ObReferenceObjectByHandle failed 0x%x",
+                      jst);
+        }
+        ZwClose(g_watchdog_thread);
+        g_watchdog_thread = NULL;
+    }
     LOG_INFO("DriverUnload");
 }
 
@@ -4125,6 +4168,14 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         return (NTSTATUS)sv;
     }
     svm_core_wait_remote_ready(online);
+    {
+        /* 9.141: start the freeze watchdog as persistent mode begins. */
+        NTSTATUS wst = PsCreateSystemThread(
+            &g_watchdog_thread, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+            yghv_freeze_watchdog_thread, NULL);
+        if (!NT_SUCCESS(wst))
+            g_watchdog_thread = NULL;
+    }
     g_persistent_mode = TRUE;
 #if YGHV_HOOK_RENDEZVOUS_TEST
     {

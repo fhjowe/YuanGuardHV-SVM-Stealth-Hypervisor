@@ -2270,3 +2270,29 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
     进行中；冻结未留下可分析转储。
 - 提交：脚本/文档 P4 改进（ioctl_parity / safety_checks / stealth_check /
   build_jni / README / TASKS / 审查文档 / 本记录）+ 驱动回退说明。
+
+### 9.142 2026-08-14 蓝屏根因定位：看门狗 join 把线程句柄当对象指针（已修复）
+
+- **事件**：诊断构建（`2EA24641` = P2 + 冻结看门狗）实机阶段 0 验证后 `sc stop`
+  卸载时蓝屏 0xA，用户再次手动重启（11:03:54）。
+- **转储分析**（`C:\Windows\Minidump\081426-10250-01.dmp`，cdb !analyze）：
+  - BugCheck **0x0000000A IRQL_NOT_LESS_OR_EQUAL**，Arg1=0xffffffff800010c8
+    （访问地址）、Arg2=2（IRQL=DISPATCH）、Arg3=1（写）、Arg4=nt!KeWaitForSingleObject+0x18e。
+  - 栈：`nt!KeWaitForSingleObject+0x18e ← yuanguard_hv+0x1605`；
+    MODULE_NAME=**yuanguard_hv**，PROCESS_NAME=System（卸载路径）。
+  - 反汇编（llvm-objdump，崩溃二进制）：0x1605 恰为 **DriverUnload 内看门狗
+    join**：`mov rcx,[g_watchdog_thread]; call KeWaitForSingleObject; ...`
+    ——**把 PsCreateSystemThread 返回的线程 HANDLE 直接当 WaitObject 传给
+    KeWaitForSingleObject**（非法指针）→ 0xA。
+- **结论**：本次蓝屏 100% 由诊断构建新增的看门狗 join 代码导致（P0-P2 无此
+  代码，卸载干净 4 次）。与 9.141 的 P4 硬冻结（无看门狗、无转储）是**两个独立
+  事件**——P4 冻结仍属平台级超载/时序，蓝屏是明确的驱动 bug。
+- **修复**：join 改 `ObReferenceObjectByHandle(g_watchdog_thread, SYNCHRONIZE,
+  *PsThreadType, ...)` → 对线程**对象** `KeWaitForSingleObject` →
+  `ObDereferenceObject` → `ZwClose`（与 multi_core.c `wait_all_stopped` 已验证
+  模式一致）。重建 SHA `1C659E3C...`（归档
+  `D:\aaaaaavm\yuanguard_hv_watchdogfix_20260814.sys`）。
+- **状态**：C 盘恢复稳定默认版 `70888311...`，服务 STOPPED，机器安全。
+- **看门狗说明**：修复后为被动观察线程（每 5s 记录 4 核 VMEXIT 计数到进度日志），
+  供后续冻结定位；继续保留在 HEAD 驱动中（P2 基础上仅此一处新增）。
+- 提交：main.c 看门狗 join 修复 + 本记录。
