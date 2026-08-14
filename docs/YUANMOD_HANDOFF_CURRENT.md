@@ -2318,3 +2318,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 下一步：用工作看门狗复现 P4 冻结场景（阶段 3：selftest）定位冻结时 c0 是否
   停止 VMEXIT / 标记是否全停，区分 guest 卡死 vs 宿主级卡死。
 - 提交：main.c 看门狗增强（每核状态）+ 本记录。
+
+### 9.144 2026-08-14 阶段 3：P4 冻结点复现——未复现（冻结为间歇性）
+
+- 用 P2+看门狗构建（`ED7303A5`，无 P4 清理改动）跑 P4 冻结的完整操作序列：
+  start → state/list-pages → **selftest PASS** → exit-test PASS → `sc stop`
+  干净 STOPPED。看门狗全程 c0 持续 VMEXIT（增长到 ~86M 次）、c1-c3 STOPPED，
+  **未冻结**。
+- 结论：P4 硬冻结（10:44，C014E8BB）为**间歇性**（selftest 5 次运行中 1 次冻结，
+  本次第 6 次未冻结）。当前无复现，无法从转储/标记定位；看门狗已就位于 HEAD
+  驱动（`ED7303A5`/后续），下次任何冻结会留下每核标记。
+- 澄清：P4 冻结与 P4 清理改动无确认机制（本构建无 P4 改动也未复现）；与看门狗
+  join 蓝屏（9.142，已修）无关。倾向平台级超载/时序（文档记载本机 hypervisor
+  负载硬冻结史）。
+- c1-c3 单核 persistent 发现（9.143）根因未定位：`pause_residents_for_patch`
+  不置 STOPPING（已核实 svm_core.c:795-807）；`try_activate` 对 STOPPING 放弃
+  线程的语义与 persistent 启动前 vcpu 状态需进一步按核诊断（独立问题）。
+- 状态：C 盘稳定默认版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
