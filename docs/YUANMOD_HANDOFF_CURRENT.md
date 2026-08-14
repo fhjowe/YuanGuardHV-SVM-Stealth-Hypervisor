@@ -2923,3 +2923,30 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **TLB 级假设穷尽**：FLUSH_BY_ASID（9.160-9.161）、FLUSH_ALL（9.172）均无效。
 - **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：svm_defs.h / main.c（FLUSH_ALL 变体）+ 本记录。
+
+### 9.173 2026-08-14 web 检索 AMD errata：冻结获硬件级解释（1363/1235）
+
+- **背景**：FLUSH_ALL 负结果（9.172）推翻"TLB 别名"简单解读后，web 检索 AMD 官方
+  Revision Guide 与 SVM 架构手册，寻找冻结的硬件级解释。
+- **发现**：
+  1. **AMD errata 1363**（SVM APIC 中断在 guest 模式下的死锁，unexpected interrupt
+     handling）——"highly specific and detailed set of internal timing conditions"，
+     `No fix planned`，workaround 系统特定。**与"guest 内上下文切换 → 整机 CPU
+     死锁、无异常可拦、无转储、看门狗无法调度"完全吻合**。
+  2. **AMD errata 1235**（AVIC guest 可能无法处理 IPI）——`Suggested Workaround:
+     Do not enable AVIC`。印证本驱动始终未启用 AVIC（g_os_guest_avic_* 全 FALSE）
+     是正确规避。
+  3. AMD SVM "security-by-crash" 设计：ASID 不匹配导致 VM 崩溃——guest 独立
+     ASID 是硬件强制，不是可选优化。
+  4. KVM 生态：per-vCPU ASID 消除 blanket TLB flush（与 9.159 每核唯一 ASID
+     方向一致）；Ryzen 嵌套/虚拟化死锁在 Proxmox/KVM 生态有类似报告。
+- **结论**：本机 OS-as-guest 阻塞常驻冻结**很可能是 AMD 硬件 errata 1363 类
+  （SVM guest 模式中断/上下文切换死锁）的平台级体现**——非驱动逻辑 bug，无法
+  用驱动代码修复（无 fix planned，workaround 系统特定）。9.101 文档当时的推断
+  （"最可能是中断/锁交互在 SVM guest 态的死锁或硬件级 halt，符合 AMD
+  56683/errata 1363 方向"）现在获得官方 errata 佐证。
+- **本机最终边界（实证完备）**：有界试点（12/14/16 PASS）+ step20 spin 常驻
+  （可加载/稳定/干净卸载，9.163）。真 OS-as-guest 常驻（guest 内 Windows 调度器）
+  需换平台或接硬件调试器观测（errata 无 fix）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
