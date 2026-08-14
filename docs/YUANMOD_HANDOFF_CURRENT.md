@@ -2296,3 +2296,25 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **看门狗说明**：修复后为被动观察线程（每 5s 记录 4 核 VMEXIT 计数到进度日志），
   供后续冻结定位；继续保留在 HEAD 驱动中（P2 基础上仅此一处新增）。
 - 提交：main.c 看门狗 join 修复 + 本记录。
+
+### 9.143 2026-08-14 看门狗工作 + 重大发现：持久模式实际单核（c0 only）
+
+- **看门狗修复验证**：join 修复（9.142）后重建 `ED7303A5...` 加载，标记正常
+  （独立 `yghv_watchdog.log`，绕过 trace_close 后 g_trace_file=NULL 的丢写
+  问题），`sc stop` 干净 STOPPED 无蓝屏。看门狗现为可用诊断工具。
+- **重大发现（每核 resident_state 观察）**：持久模式下
+  `c0=0x5c0ece s0=0x2(ACTIVE)`、`c1=c2=c3=0 s1..s3=0x4(STOPPED)`——
+  **只有 CPU0 的 resident guest 在跑，c1-c3 的 persistent resident 线程在
+  `svm_resident_try_activate` 时 vcpu 处于 STOPPING（自测多核心心跳 teardown
+  的残留态）→ 返回 0 → 线程当场终止**（`yghv_resident_thread` multi_core.c:25-32）。
+- 影响：
+  - **持久保护实际为单核（c0）**；c1-c3 不虚拟化、是自由宿主核。文档中
+    "多核心常驻"描述与实际不符（既有行为，P0-P2 同，非本轮改动引入）。
+  - 因 c1-c3 是宿主核（不在 guest 模式），P4 硬冻结若为"c0 guest 卡死"则
+    不会整机冻结（c1-c3 仍服务宿主）→ **P4 冻结应是影响全部 4 核的宿主级
+    事件**（NPT 篡改/锁/中断风暴/时序），而非单核 guest 卡死。
+  - `try_activate` 对 STOPPING 直接放弃线程的语义值得复核（应为等待/重试或
+    persistent 启动前确保 vcpu 已 STOPPED）。
+- 下一步：用工作看门狗复现 P4 冻结场景（阶段 3：selftest）定位冻结时 c0 是否
+  停止 VMEXIT / 标记是否全停，区分 guest 卡死 vs 宿主级卡死。
+- 提交：main.c 看门狗增强（每核状态）+ 本记录。

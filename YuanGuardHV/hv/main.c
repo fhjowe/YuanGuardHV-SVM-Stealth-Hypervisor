@@ -3589,6 +3589,46 @@ static void yghv_init_auth_cookie(void) {
         g_vmmcall_auth_cookie = 0x59484756ULL;
 }
 
+/* Write one diagnostic line to \SystemRoot\yghv_watchdog.log (append).  Uses its
+   own handle so it works after yghv_trace_close() has NULLed g_trace_file
+   (yghv_trace would silently drop the line). */
+static void yghv_watchdog_log(const char *line) {
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    IO_STATUS_BLOCK iosb;
+    HANDLE h;
+    size_t len = 0;
+    char buf[256];
+
+    RtlInitUnicodeString(&name, L"\\SystemRoot\\yghv_watchdog.log");
+    InitializeObjectAttributes(&oa, &name,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    if (!NT_SUCCESS(ZwCreateFile(&h, FILE_APPEND_DATA, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0)))
+        return;
+    if (NT_SUCCESS(RtlStringCchLengthA(line, sizeof(buf) - 2, &len))) {
+        RtlCopyMemory(buf, line, len);
+        buf[len] = '\r'; buf[len + 1] = '\n';
+        ZwWriteFile(h, NULL, NULL, NULL, &iosb, buf, (ULONG)(len + 2), NULL, NULL);
+        ZwFlushBuffersFile(h, &iosb);
+    }
+    ZwClose(h);
+}
+
+/* Append a 64-bit value as lowercase hex (0x...) to a buffer; no CRT printf
+   is available in this kernel driver link. */
+static void yghv_wd_hex(char *buf, size_t bufsz, size_t *off, uint64_t v) {
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    if (*off + 18 > bufsz)
+        return;
+    buf[(*off)++] = '0';
+    buf[(*off)++] = 'x';
+    for (i = 15; i >= 0; i--)
+        buf[(*off)++] = hex[(v >> (i * 4)) & 0xF];
+}
+
 /* 9.141 freeze watchdog: a host-side observer that logs the per-core resident
    VMEXIT counts every 5 s while the driver is loaded.  On a hard freeze the
    last marker tells us whether host code was still running (markers continue
@@ -3597,16 +3637,48 @@ static void yghv_init_auth_cookie(void) {
    resident/NPF/VMMCALL paths. */
 static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
     LARGE_INTEGER delay;
+    LARGE_INTEGER tick;
+    char line[256];
+    size_t off;
     (void)ctx;
     delay.QuadPart = -5LL * 10 * 1000 * 1000;   /* 5 s */
     while (!g_watchdog_stop) {
         KeDelayExecutionThread(KernelMode, FALSE, &delay);
         if (g_watchdog_stop)
             break;
-        yghv_trace_u64("wd core0 exits", g_vcpus[0] ? g_vcpus[0]->resident_exits : 0);
-        yghv_trace_u64("wd core1 exits", g_vcpus[1] ? g_vcpus[1]->resident_exits : 0);
-        yghv_trace_u64("wd core2 exits", g_vcpus[2] ? g_vcpus[2]->resident_exits : 0);
-        yghv_trace_u64("wd core3 exits", g_vcpus[3] ? g_vcpus[3]->resident_exits : 0);
+        KeQueryTickCount(&tick);
+        off = 0;
+        line[off++] = 'w'; line[off++] = 'd';
+        line[off++] = ' '; line[off++] = 't'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off, (uint64_t)tick.QuadPart);
+        line[off++] = ' '; line[off++] = 'c'; line[off++] = '0'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[0] ? g_vcpus[0]->resident_exits : 0);
+        line[off++] = ' '; line[off++] = 'c'; line[off++] = '1'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[1] ? g_vcpus[1]->resident_exits : 0);
+        line[off++] = ' '; line[off++] = 'c'; line[off++] = '2'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[2] ? g_vcpus[2]->resident_exits : 0);
+        line[off++] = ' '; line[off++] = 'c'; line[off++] = '3'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[3] ? g_vcpus[3]->resident_exits : 0);
+        /* per-core resident_state to see whether a core is ACTIVE (in VMRUN
+           loop) or STOPPED/STOPPING (thread terminated early). */
+        line[off++] = ' '; line[off++] = 's'; line[off++] = '0'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[0] ? (uint64_t)(LONG)g_vcpus[0]->resident_state : 0xEE);
+        line[off++] = ' '; line[off++] = 's'; line[off++] = '1'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[1] ? (uint64_t)(LONG)g_vcpus[1]->resident_state : 0xEE);
+        line[off++] = ' '; line[off++] = 's'; line[off++] = '2'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[2] ? (uint64_t)(LONG)g_vcpus[2]->resident_state : 0xEE);
+        line[off++] = ' '; line[off++] = 's'; line[off++] = '3'; line[off++] = '=';
+        yghv_wd_hex(line, sizeof(line), &off,
+            g_vcpus[3] ? (uint64_t)(LONG)g_vcpus[3]->resident_state : 0xEE);
+        line[off] = 0;
+        yghv_watchdog_log(line);
     }
 }
 
