@@ -180,6 +180,18 @@ int svm_alloc_vcpu(uint32_t core_id, svm_vcpu_t **out) {
     RtlZeroMemory(vcpu->guest_stack, HV_PAGE_SIZE);
     vcpu->guest_stack_pa = MmGetPhysicalAddress(vcpu->guest_stack).QuadPart;
 
+    /* 9.171: dedicated guest TSS page (copy of the host TSS).  OS-as-guest
+       Windows context switch writes TSS.RSP0; if the guest TR shares the host
+       TSS that pollutes the host RSP0 and the host faults on the next
+       interrupt -> whole-machine freeze.  The guest TR is repointed to this
+       page by yghv_os_guest_tss_isolate(); synthetic residents keep the host
+       TR.  Allocated here so it is per-vcpu and freed with the vcpu. */
+    vcpu->guest_tss = MmAllocateContiguousMemory(
+        HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (!vcpu->guest_tss) goto fail_guest_tss;
+    RtlZeroMemory(vcpu->guest_tss, HV_PAGE_SIZE);
+    vcpu->guest_tss_pa = MmGetPhysicalAddress(vcpu->guest_tss).QuadPart;
+
     /* MSRPM — 2 pages, zero = allow MSR access (bit=1 means intercept) */
     vcpu->msrpm = MmAllocateContiguousMemory(SVM_MSRPM_PAGES * HV_PAGE_SIZE,
         (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
@@ -218,6 +230,8 @@ int svm_alloc_vcpu(uint32_t core_id, svm_vcpu_t **out) {
 fail_iopm:
     MmFreeContiguousMemory(vcpu->msrpm);
 fail_msrpm:
+    if (vcpu->guest_tss) MmFreeContiguousMemory(vcpu->guest_tss);
+fail_guest_tss:
     MmFreeContiguousMemory(vcpu->host_stack);
 fail_guest_stack:
     if (vcpu->guest_stack) MmFreeContiguousMemory(vcpu->guest_stack);
@@ -238,6 +252,7 @@ static void svm_free_vcpu(svm_vcpu_t *vcpu) {
     if (!vcpu) return;
     if (vcpu->iopm)  MmFreeContiguousMemory(vcpu->iopm);
     if (vcpu->msrpm) MmFreeContiguousMemory(vcpu->msrpm);
+    if (vcpu->guest_tss) MmFreeContiguousMemory(vcpu->guest_tss);
     if (vcpu->guest_stack) MmFreeContiguousMemory(vcpu->guest_stack);
     if (vcpu->host_stack) MmFreeContiguousMemory(vcpu->host_stack);
     if (vcpu->hsave) MmFreeContiguousMemory(vcpu->hsave);

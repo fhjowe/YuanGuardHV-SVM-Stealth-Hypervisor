@@ -908,6 +908,30 @@ static void yghv_os_guest_tlb_hygiene_apply(svm_vcpu_t *v, uint32_t core) {
     v->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;  /* FLUSH_BY_ASID */
 }
 
+/* 9.171: give OS-as-guest a DEDICATED TSS so the guest Windows context switch
+   (KiSwapThread writes TSS.RSP0) never pollutes the HOST TSS.  With the guest
+   TR sharing the host TSS, the guest's RSP0 write lands in the host TSS, so the
+   very next host interrupt/exception uses a corrupted RSP0 -> whole-machine
+   freeze.  This is exactly what real hypervisors do (per-vCPU TSS).  The guest
+   TR base is repointed at a per-vcpu copy of the host TSS; selector/attrib/
+   limit are kept (the VMCB provides the base directly, so the GDT descriptor
+   base is irrelevant to VMRUN).  Guest RSP0 writes then go to the guest TSS
+   only. */
+static void yghv_os_guest_tss_isolate_apply(svm_vcpu_t *v) {
+    ULONG copy_len;
+
+    if (!v || !v->guest_tss)
+        return;
+    /* copy the host TSS contents (RSP0, IST, I/O map base, etc.) so the guest
+       starts with a valid task state; cap at one page.  tr_limit is bytes. */
+    copy_len = (ULONG)v->vmcb->state.tr_limit + 1;
+    if (copy_len > HV_PAGE_SIZE)
+        copy_len = HV_PAGE_SIZE;
+    RtlCopyMemory(v->guest_tss, (void *)v->vmcb->state.tr_base, copy_len);
+    v->vmcb->state.tr_base = (uint64_t)v->guest_tss;
+    yghv_trace_u64("os guest tss isolated", v->guest_tss_pa);
+}
+
 __declspec(noinline) __declspec(noreturn)
 void yghv_os_guest_host_done(svm_vcpu_t *vcpu) {
     uint32_t core = vcpu ? vcpu->resident_index : 0;
@@ -957,6 +981,7 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
+    yghv_os_guest_tss_isolate_apply(v);
     yghv_trace_u64("os guest thread enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Trampoline exits via yghv_os_guest_host_done; this is a fallback. */
@@ -993,6 +1018,7 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
+    yghv_os_guest_tss_isolate_apply(v);
     yghv_trace_u64("os seamless enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Seamless continuation: this caller now runs in guest mode. */
@@ -1044,6 +1070,7 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
+    yghv_os_guest_tss_isolate_apply(v);
     if (g_v96_apic_tpr_stress && !g_v96_apic_tpr_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
@@ -1242,6 +1269,7 @@ static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
+    yghv_os_guest_tss_isolate_apply(v);
     g_os_resident_mode = TRUE;
     yghv_trace_u64("os resident spin enter", core);
     if (core < SVM_MAX_CORES)
@@ -1287,6 +1315,7 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
+    yghv_os_guest_tss_isolate_apply(v);
     g_os_resident_mode = TRUE;
 
     InterlockedIncrement(&g_v99_allcore_ready);
@@ -1364,6 +1393,7 @@ static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
+    yghv_os_guest_tss_isolate_apply(v);
     if (g_v98_apic_shadow && !g_v98_apic_shadow_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;

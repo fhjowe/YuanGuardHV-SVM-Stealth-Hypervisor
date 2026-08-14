@@ -183,6 +183,14 @@ typedef struct {
        end so earlier fixed offsets used by the trampoline stay stable. */
     void *guest_stack;
     uint64_t guest_stack_pa;
+    /* 9.171: dedicated guest TSS.  OS-as-guest must NOT share the host TSS:
+       Windows context switch (KiSwapThread) writes TSS.RSP0, and with the
+       guest TR pointing at the host TSS that pollutes the host's RSP0 so the
+       host faults on the next interrupt -> whole-machine freeze.  Give each
+       vcpu its own TSS page (copy of host TSS) and point the guest TR there;
+       guest RSP0 writes stay in the guest TSS only. */
+    void *guest_tss;
+    uint64_t guest_tss_pa;
     /* Per-vcpu VMMCALL control key (P0 auth hardening). */
     volatile uint64_t auth_key;
 } svm_vcpu_t;

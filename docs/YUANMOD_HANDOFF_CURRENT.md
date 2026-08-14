@@ -2881,3 +2881,25 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   （可加载/稳定/干净卸载，9.163）。真 OS-as-guest 常驻需换平台。
 - **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：svm_core.c（GS/FS selector 镜像宿主）+ step100 quiet 恢复注释 + 本记录。
+
+### 9.171 2026-08-14 TSS 隔离修复实机负结果（step17 仍冻结）——驱动级假设穷尽
+
+- **假设**：guest 共享宿主 TSS——Windows 上下文切换（KiSwapThread）写 TSS.RSP0，
+  若 guest TR 指向宿主 TSS 则污染 host RSP0 → host 下次中断/异常栈错误 → 全核冻结。
+  KVM 等真实 hypervisor 都为每 vCPU 配独立 TSS。
+- **实现**：`svm_vcpu.h` 加 `guest_tss/guest_tss_pa`；`svm_alloc_vcpu` 分配独立
+  TSS 页（复制宿主 TSS）；`svm_free_vcpu` 释放；main.c 新增
+  `yghv_os_guest_tss_isolate_apply(v)`（复制宿主 TSS + `tr_base` 指向 guest_tss），
+  接入全部 6 个 OS-as-guest 线程（与 tlb_hygiene 并列）。构建 PASS。
+- **step17 实测**：仍 <5s 硬冻结（无转储）→ **TSS 隔离非冻结根因**。
+- **驱动级假设穷尽（本机）**：ASID/TLB 卫生（9.161）、GS selector（9.170，0x139→
+  硬冻结转变但未解决）、TSS 隔离（9.171）——全部无效。GS selector 修复的
+  "0x139→硬冻结"转变说明它在改变 guest 行为，但未能消除更深层的冻结。
+- **诚实结论**：本机 OS-as-guest 阻塞常驻的冻结，经转储分析（0x139
+  MISSING_GSFRAME）+ 穷尽驱动级修复，指向**平台级 CPU 锁死**（guest 内真实
+  Windows 调度器上下文切换路径），非单一驱动字段/指令可修。9.152 独立 CR3 修复
+  仅适用于合成 resident（guest 需完整 Windows 地址空间，OS-as-guest 无法套用）。
+- **剩余可选**：① 接硬件调试器观测冻结点；② 换平台实测（用户已否决）；③ 接受
+  结论，本机维持有界试点 + step20 spin 常驻形态。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：svm_core.c / svm_vcpu.h / main.c（TSS 隔离）+ 本记录。
