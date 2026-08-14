@@ -47,4 +47,32 @@ if (Compare-Object $cValues $java) {
     throw "IOCTL parity FAIL: C vs Java mismatch`nC: $($cValues -join ',')`nJava: $($java -join ',')"
 }
 
+# REV-032: also verify the full CTL_CODE constants (device type / method /
+# access) are identical across the header and all three client implementations,
+# so a drift in the formula itself is caught, not just the function numbers.
+$jniClient = Join-Path (Split-Path -Parent $javaClient) 'native\yghv_ctl_jni.c'
+
+function Get-CConstant {
+    param([string]$Pattern, [string]$Path)
+    $text = Get-Content -LiteralPath $Path -Raw
+    if ($text -match $Pattern) { return [Convert]::ToInt64($Matches[1], 16) }
+    return -1
+}
+
+$cDevType  = Get-CConstant -Path $header    -Pattern '#define\s+YGHV_IOCTL_DEVICE_TYPE\s+(0x[0-9A-Fa-f]+)'
+$cMethod   = Get-CConstant -Path $header    -Pattern '#define\s+YGHV_METHOD_BUFFERED\s+(\d+)'
+$cAccess   = Get-CConstant -Path $header    -Pattern '#define\s+YGHV_FILE_ANY_ACCESS\s+(\d+)'
+$psDevType = Get-CConstant -Path $psClient  -Pattern '\(0x([0-9A-Fa-f]+)u?\s*<<\s*16\)'
+$javaDev   = Get-CConstant -Path $javaClient -Pattern '\(0x([0-9A-Fa-f]+)\s*<<\s*16\)'
+$jniDev    = Get-CConstant -Path $jniClient -Pattern '0x([0-9A-Fa-f]+)\s*<<\s*16'
+
+if ($cDevType -ne 0x5947) { throw "IOCTL parity FAIL: header device type 0x$($cDevType.ToString('X')) != 0x5947" }
+if ($cMethod -ne 0 -or $cAccess -ne 0) {
+    throw "IOCTL parity FAIL: header METHOD=$cMethod ACCESS=$cAccess (expected 0/0)"
+}
+if ($psDevType -ne $cDevType -or $javaDev -ne $cDevType -or $jniDev -ne $cDevType) {
+    throw "IOCTL parity FAIL: device-type drift C=0x$($cDevType.ToString('X')) PS=0x$($psDevType.ToString('X')) Java=0x$($javaDev.ToString('X')) JNI=0x$($jniDev.ToString('X'))"
+}
+
 Write-Host "[PASS] IOCTL parity: C=$($c.Count) PowerShell=$($ps.Count) Java=$($java.Count)"
+Write-Host "[PASS] IOCTL constants: device type=0x5947 METHOD=0 ACCESS=0 across C/PS/Java/JNI"

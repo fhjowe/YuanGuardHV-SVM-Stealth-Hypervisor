@@ -1883,7 +1883,7 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 
 - 澄清：9.124 记录的 `g_hook_patch_active` 补丁互斥其实不存在——9.118
   锁序实验回退时 `patch_begin/patch_end` 一并回退，当前 install/remove
-  仍是旧锁序（持 `g_protect_lock` 内全核心 pause）。`ERROR_BUSY (0x5AA)`
+  仍是旧锁序（持 `g_protect_lock` 内全核心 pause）。`ERROR_NO_SYSTEM_RESOURCES (0x5AA)`
   的真实来源未定位，代码中无 `STATUS_DEVICE_BUSY` 返回点。
 - 诊断加装：`protect.c` 新增 `yghv_hook_diag`，install/remove 各失败
   stage（map/pause/split/perm/addpage/missing/arm/removepage/fail）落盘
@@ -2099,8 +2099,9 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 独立复核修正 2 处子代理误报：exit-test 不可用（漏看 main.c:4075
   `g_persistent_mode=TRUE`，默认构建实际 PASS）；INTR 拦截"惰性"（与 step11
   实测 15 次 INTR 退出矛盾，留 REV-035 待 kd）。
-- 新发现文档/工具间隙：交接文档本文件 line 1886 仍残留 `` `ERROR_BUSY (0x5AA)` ``
-  过时标注，且 `tests/safety_checks.ps1` 检查清单未含本文件（漏检）；
+- 新发现文档/工具间隙：交接文档本文件 9.125 曾把 0x5AA 误标为 ERROR_BUSY
+  （2026-08-14 已改正为 ERROR_NO_SYSTEM_RESOURCES），且
+  `tests/safety_checks.ps1` 检查清单已纳入本文件（见 REV-027）；
   C 盘稳定默认版 `70888311...`（9.112 构建）与 HEAD 源码构建 `F411C929...` 不同源。
 - 下一步：任务清单见审查报告第 4 节（P0 低风险项可本机验证，P3 锁序/hook 路径
   需换平台/kd）；本机继续停止 hook 路径实验。
@@ -2232,3 +2233,40 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 提交：5 驱动文件（vmexit.c / control_device.c / vmmcall.c / svm_core.c /
   loader_stealth.c）+ README + 审查文档 P2 勾选（9 项完成、4 项标注延后）+
   本记录。
+
+### 9.141 2026-08-14 P4 实机硬冻结：调查与回退决策（重要）
+
+- **事件**：P4 清理版（SHA `C014E8BB...`）实机非 hook 回归时，本机硬冻结
+  （10:44:31 意外关机，用户手动重启）。P0/P1/P2 三次同类回归均正常，此为
+  首次冻结。
+- **调查（只读，无新加载）**：
+  - 事件日志：Event 6008 记录 10:44:31 意外关机；**无新 BugCheck（1001）**、
+    **无新 minidump/MEMORY.DMP**（最近转储为 8/12-8/13 历史 0x139/0x101）→
+    判定为**硬挂起非蓝屏**，无转储可分析。
+  - `yghv_progress.log` 尾部：P4 驱动**自测完整通过**（r1 unit / NPT / hook /
+    boundary / cpu0 reset / 多核心跳 / all stopped）→ 冻结不在 DriverEntry
+    自测阶段，而在**常驻持久模式负载下**（4 核 resident guest + 客户端
+    selftest 的 MmCopyVirtualMemory）。
+  - P4 驱动 diff 逐行复查（main.c 死代码移除、svm_core/npt_core 去冗余
+    YGHV_DEBUG_LOG[build.bat 全局传 /DYGHV_DEBUG_LOG，确无行为变化]、
+    loader_stealth 注释、protect.c 解码器拒绝 0x27/2F/9A/EA + hook.log 行数
+    上限）：**无任何触碰常驻/VMEXIT/NPF/VMMCALL/NPT 路径的机制**。
+  - 结论：P4 改动与冻结无合理因果；冻结形态与本机文档记载的"hypervisor
+    负载下平台级硬冻结"（OS-as-guest 停线根因）一致，属**平台级隐患 + 时序**，
+    P4 二进制与冻结仅时间相关。
+- **回退决策（保守修复）**：
+  - 驱动改动（REV-023/024/025/026/048 的代码部分）**整体回退到 P2 已知良好态**
+    （源码 = b7aea63，重建 SHA `FCE2C2C5...`，功能等同 P2 `B337BFC...`，
+    差异仅签名时间戳）。
+  - **保留**无害的脚本/文档改进：REV-027（0x5AA 标注 + safety_checks 纳入）、
+    REV-030（部署基线）、REV-032（ioctl_parity 扩展）、REV-033（stealth_check
+    退出码）、REV-034（build_jni.bat 路径）。
+  - C 盘保持稳定默认版 `70888311...`，服务 STOPPED，机器当前安全。
+- **后续建议**：
+  - 本机 hypervisor 负载（常驻持久模式）存在硬冻结风险，回归测试控制时长；
+    hook/resident 重负载实验优先换平台。
+  - P4 驱动清理待换平台/定位平台冻结根因后再实施（审查文档 P4 已标注回退）。
+  - 冻结前最后操作：sc start C014E8BB → state/list-pages（OK）→ selftest
+    进行中；冻结未留下可分析转储。
+- 提交：脚本/文档 P4 改进（ioctl_parity / safety_checks / stealth_check /
+  build_jni / README / TASKS / 审查文档 / 本记录）+ 驱动回退说明。

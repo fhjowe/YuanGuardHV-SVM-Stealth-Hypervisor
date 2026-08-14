@@ -43,6 +43,7 @@ $checkFiles = @(
     (Join-Path $root '..\docs\YUANMOD_NEXT_WINDOW_PROMPT.md'),
     (Join-Path $root '..\docs\TASKS.md'),
     (Join-Path $root '..\docs\YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md'),
+    (Join-Path $root '..\docs\YUANMOD_HANDOFF_CURRENT.md'),
     (Join-Path $root 'tools\yghv_client\README.md')
 )
 foreach ($file in $checkFiles) {

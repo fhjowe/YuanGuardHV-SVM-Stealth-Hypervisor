@@ -177,7 +177,7 @@
 | YGHV-REV-024 | `main.c:3548-3549` | 重复 `if (g_guest_code_page)`（无害） |
 | YGHV-REV-025 | `svm_core.c:6` | 硬编码 `#define YGHV_DEBUG_LOG`（与 build.bat `/DYGHV_DEBUG_LOG` 重复，已知警告） |
 | YGHV-REV-026 | `debug.h:6` + `loader_stealth.c` + `svm_core.c:571` | `YGHV_TAG 'vhGY'` 注释"change to common pool tag before release"；`ponytail:` 代号残留 |
-| YGHV-REV-027 | `docs/YUANMOD_HANDOFF_CURRENT.md:1886` + `tests/safety_checks.ps1:42-47` | 交接文档残留 `` `ERROR_BUSY (0x5AA)` `` 过时标注；safety_checks 检查清单未含该文档（漏检） |
+| YGHV-REV-027 | `docs/YUANMOD_HANDOFF_CURRENT.md` 9.125 + `tests/safety_checks.ps1` | 交接文档曾把 0x5AA 误标为 ERROR_BUSY（2026-08-14 已改正）；safety_checks 检查清单原未含该文档（已纳入） |
 | YGHV-REV-028 | `control_plane.h:16-21` | 6 个未实现 VMMCALL 命令 fail-closed 到 YGHV_STATUS_ERROR（正确行为，记录） |
 | YGHV-REV-029 | `control_device.c:353-354` | 设备对象无显式安全描述符（依赖驱动内 owner/SeDebug/CR3 检查，鲁棒） |
 | YGHV-REV-030 | C:\yuanguard_hv.sys | C 盘稳定默认版 `70888311...`（9.112 构建）与 HEAD 源码构建 `F411C929...` 不同源；"当前版本"指 HEAD 时需重新部署 |
@@ -239,16 +239,18 @@
 - [ ] **YGHV-REV-035** INTR/NMI 拦截语义 kd 复核
 
 ### P4 —— 清理 / 文档
-- [ ] **YGHV-REV-023** 清理死代码（yghv_prepare_guest_code / yghv_make_guest_code_executable；pool/test/min_drv/stub 归档说明）
-- [ ] **YGHV-REV-024** 去重复 if（main.c）
-- [ ] **YGHV-REV-025** svm_core.c 去掉硬编码 YGHV_DEBUG_LOG
-- [ ] **YGHV-REV-026** 更换 pool tag / 去 ponytail 代号
-- [ ] **YGHV-REV-027** 交接文档 ERROR_BUSY 标注改 0x5AA 正确命名；safety_checks 纳入交接文档
-- [ ] **YGHV-REV-032** *_info 结构体移入共享头；ioctl_parity 扩展完整编码/布局校验
-- [ ] **YGHV-REV-033** stealth_check 加非零退出码
-- [ ] **YGHV-REV-034** build_jni.bat 去掉硬编码路径
-- [ ] **YGHV-REV-048** 解码器非法 opcode 分类、补丁页写窗口、yghv_hook.log 大小上限（NIT 组）
-- [ ] **YGHV-REV-030** 明确"C 盘稳定版 vs HEAD"部署口径（记录即可，非代码问题）
+- [ ] **YGHV-REV-023** 清理死代码（yghv_prepare_guest_code / yghv_make_guest_code_executable；pool/test/min_drv/stub 归档说明）——2026-08-14 曾实施后**回退**（P4 版实机冻结，原因未定位，驱动改动整体回退到 P2 已知良好态；清理可待换平台/明确原因后再做）
+- [ ] **YGHV-REV-024** 去重复 if（main.c）——同 REV-023，回退
+- [ ] **YGHV-REV-025** svm_core.c 去掉硬编码 YGHV_DEBUG_LOG——同 REV-023，回退（build.bat 全局传 /DYGHV_DEBUG_LOG，移除确无害，可后置）
+- [ ] **YGHV-REV-026** 更换 pool tag / 去 ponytail 代号——同 REV-023，回退（纯注释）
+- [x] **YGHV-REV-027** 交接文档 ERROR_BUSY 标注改 0x5AA 正确命名；safety_checks 纳入交接文档——2026-08-14 已修（9.125 改 ERROR_NO_SYSTEM_RESOURCES；safety_checks 纳入并验证通过；纯文档/脚本，保留）
+- [x] **YGHV-REV-032** *_info 结构体移入共享头；ioctl_parity 扩展完整编码/布局校验——2026-08-14 部分：ioctl_parity 已扩展完整编码常量校验（脚本，保留）；*_info 移入共享头待定
+- [x] **YGHV-REV-033** stealth_check 加非零退出码——2026-08-14 已修（脚本，保留）
+- [x] **YGHV-REV-034** build_jni.bat 去掉硬编码路径——2026-08-14 已修（脚本，保留）
+- [ ] **YGHV-REV-048** 解码器非法 opcode 分类、补丁页写窗口、yghv_hook.log 大小上限（NIT 组）——同 REV-023，回退（解码器/日志上限为驱动改动，随 P4 回退；补丁页写窗口本就并入 REV-001）
+- [x] **YGHV-REV-030** 明确"C 盘稳定版 vs HEAD"部署口径（记录即可，非代码问题）——2026-08-14 已记录（TASKS.md 部署基线，保留）
+
+> **2026-08-14 P4 冻结事件**：P4 版（C014E8BB...）实机回归时硬冻结（10:44:31 意外关机，无蓝屏/转储）。进度日志显示驱动自测完整通过，冻结发生在常驻持久模式负载下。逐行复查 P4 驱动 diff（死代码移除/冗余宏/注释/解码器拒绝/日志上限）无任何触碰常驻/VMEXIT/NPF/VMMCALL 路径的机制，判定与平台文档记载的"hypervisor 负载下平台级硬冻结"行为一致，P4 无合理因果。保守决策：驱动改动整体回退到 P2 已知良好态（B337BFC...，3 次干净回归），脚本/文档改进保留。详见 9.141。
 
 ## 5. 文档-代码核对结果
 

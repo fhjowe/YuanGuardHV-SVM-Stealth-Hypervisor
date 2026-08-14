@@ -18,6 +18,12 @@
 > `70888311...`，服务 STOPPED（详见 `YUANMOD_HANDOFF_CURRENT.md`
 > 9.128）。
 
+> 部署基线（REV-030）：`C:\yuanguard_hv.sys` 保持稳定默认版
+> `70888311...`（9.112 构建，已验证可加载）；HEAD 源码构建产物
+> （P0 `57FED86A...` / P1 `FB152265...` / P2 `B337BFC...`）归档于
+> `D:\aaaaaavm\yuanguard_hv_{p0,p1,p2}fix_20260814*.sys`。每次实机回归后
+> C 盘恢复稳定默认版、服务 STOPPED。归档路径见 `YUANMOD_HANDOFF_CURRENT.md` 9.138-9.140。
+
 > 2026-08-13 9.130 Java/JNI 非 hook 产品化 PASS：新增 `unprotect` 与
 > `scan`，实机回归通过；C 盘恢复稳定默认版 `70888311...`，服务
 > STOPPED（详见 `YUANMOD_HANDOFF_CURRENT.md` 9.130）。

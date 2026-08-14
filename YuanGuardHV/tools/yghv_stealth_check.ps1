@@ -69,3 +69,11 @@ if ($h -ne [IntPtr]::Zero -and $h -ne [IntPtr]::new(-1)) {
 }
 
 Write-Host ("Stealth check complete: visible traces = {0}" -f $visible)
+
+# REV-033: expose a non-zero exit code when traces are found so callers can
+# gate on the result (e.g. CI/rollout checks) instead of parsing the text.
+if ($visible -gt 0) {
+    Write-Host "[FAIL] $visible visible trace(s) found"
+    exit 1
+}
+exit 0
