@@ -2833,3 +2833,29 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   初始化与保持正确。**这是 9.84-9.163 全部实验从未触达的层**，且现在有转储实锤。
 - **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.168 2026-08-14 GS 处理链路深挖（D'）：定位 VMCB GS 初始化与 swapgs 语义疑点
+
+- **代码链路（svm_core.c / svm_trampoline.S）**：
+  - `svm_prepare_vcpu`：`state->gs_selector=0`、`state->gs_base = MSR_GS_BASE(0xC0000101)`
+    （宿主当前值）、`state->kernel_gs_base = MSR_KERNEL_GS_BASE(0xC0000102)`（宿主
+    当前值）、`state->tr_* = 宿主 TR`；随后 `yg_svm_vmsave(vcpu->vmcb_pa)` +
+    `yg_svm_vmsave(vcpu->host_vmcb_pa)`（VMSAVE 保存 FS/GS/TR/LDTR/KERNEL_GS_BASE）。
+  - trampoline `os_enter_exit`：VMEXIT 后 `VMSAVE guest`（存回 vcpu->vmcb）+ 
+    `VMLOAD host`（从 host_vmcb 恢复）；`os_enter_resume` VMRUN 前设 hsave_pa。
+- **疑点**：
+  1. **VMRUN 时 guest 的 GS base 完全取自 VMCB state.gs_base**（宿主进入时的快照），
+     guest 内 Windows 执行 **swapgs** 交换 MSR_GS_BASE/KERNEL_GS_BASE 时，若 VMCB
+     初始的 kernel_gs_base 与 Windows 期望不符（内核态应指向 KPCR），swapgs 后
+     GS base 指向错误 KPCR → 上下文切换/异常分发读 exception stack 失败。
+  2. **SVM 无 swapgs 拦截位**（svm_defs.h 无 INTERCEPT_SWAPGS）→ 无法直接拦 swapgs；
+     只能拦截 rdmsr/wrmsr 路径或保证 VMRUN 时 GS 状态正确。
+  3. `state->gs_selector=0` 但 `gs_base=宿主值`——x64 长模式 GS base 由 MSR 提供，
+     selector 0 仅影响 attributes/limit，理论上 base 仍有效；但 KTRAP_FRAME
+     GsBase=0 说明实际异常时 GS base 已丢（swapgs 后或 VMSAVE/VMLOAD 时序）。
+- **D' 结论**：GS base 假说已到"具体指令级"——修复方向 = ①VMRUN 前/VMEXIT 后
+  保证 VMCB state.gs_base/kernel_gs_base 与 Windows 内核 KPCR 语义一致；②拦截
+  guest 对这两个 MSR 的 wrmsr 并模拟（维持 VMCB 状态）；③trampoline 的
+  VMSAVE/VMLOAD 时序复核（VMSAVE guest 是否在正确的 MSR 状态下执行）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。

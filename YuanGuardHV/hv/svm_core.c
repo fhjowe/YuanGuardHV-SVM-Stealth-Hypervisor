@@ -62,6 +62,18 @@ static uint16_t yg_read_es(void) {
     return es;
 }
 
+static uint16_t yg_read_gs(void) {
+    uint16_t gs;
+    __asm__ volatile("mov %%gs, %0" : "=r"(gs));
+    return gs;
+}
+
+static uint16_t yg_read_fs(void) {
+    uint16_t fs;
+    __asm__ volatile("mov %%fs, %0" : "=r"(fs));
+    return fs;
+}
+
 static void yg_read_gdtr(uint64_t *base, uint16_t *limit) {
     struct { uint16_t limit; uint64_t base; } __attribute__((packed)) gdtr;
     __asm__ volatile("sgdt %0" : "=m"(gdtr));
@@ -330,10 +342,16 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
     yg_read_seg_descriptor(state->ss_selector, &state->ss_attrib, &state->ss_limit, &state->ss_base);
     yg_read_seg_descriptor(state->ds_selector, &state->ds_attrib, &state->ds_limit, &state->ds_base);
     yg_read_seg_descriptor(state->es_selector, &state->es_attrib, &state->es_limit, &state->es_base);
-    /* FS/GS base from MSR — leave attributes/limits from GDT if selector is in GDT, or zero */
-    state->gs_selector = 0;
+    /* FS/GS base from MSR — mirror the HOST selectors (not 0!).  A null GS
+       selector makes every gs:[...] access in the guest #GP — Windows x64
+       kernel uses GS (KPCR / exception stack) on every context switch, so a
+       null GS selector is exactly what crashed OS-as-guest resident in
+       KiAbProcessContextSwitch -> KiAbEntryGetLockedHeadEntry -> #GP ->
+       KiExceptionDispatchOnExceptionStack -> 0x139 MISSING_GSFRAME_STACKPTR
+       (v100/v100b dumps both show KTRAP_FRAME.GsBase=0/SegGs=0). */
+    state->gs_selector = yg_read_gs();
     state->gs_base = yg_read_msr(0xC0000101); /* MSR_GS_BASE */
-    state->fs_selector = 0;
+    state->fs_selector = yg_read_fs();
     state->fs_base = yg_read_msr(0xC0000100); /* MSR_FS_BASE */
 
     /* Descriptor tables — mirror host */
