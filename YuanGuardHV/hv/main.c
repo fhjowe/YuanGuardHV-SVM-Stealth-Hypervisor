@@ -3355,7 +3355,10 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         /* step100 isolation: guest continuation performs no file I/O
            (no yghv_trace), leaving only a pure KeDelayExecutionThread
            block, to separate "any guest-mode scheduler switch" from
-           "blocking file write triggers the 0x139". */
+           "blocking file write triggers the 0x139".  (9.170: briefly set
+           FALSE to validate the GS-selector fix against the v100 0x139
+           shape — result was hard freeze, confirming GS selector is not
+           the hard-freeze root cause; restored to TRUE.) */
         g_os_guest_delay_quiet = TRUE;
         mv = svm_core_get_vcpu(1);
         if (mv) {

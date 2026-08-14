@@ -2859,3 +2859,25 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   VMSAVE/VMLOAD 时序复核（VMSAVE guest 是否在正确的 MSR 状态下执行）。
 - **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.170 2026-08-14 GS selector 修复实机负结果（step17/step100 仍冻结）
+
+- **修复**：`svm_core.c` 把 `state->gs_selector = 0` / `fs_selector = 0`（硬编码 null）
+  改为镜像宿主（新增 `yg_read_gs()`/`yg_read_fs()`，`gs_selector = 宿主当前值`，
+  x64 内核态 GS selector 应为 0x2B）。依据：v100/v100b 转储 KTRAP_FRAME GsBase=0/
+  SegGs=0 + Windows 内核处处用 GS 段（KPCR/exception stack），null selector 的
+  gs 段访问会 #GP。
+- **step17（阻塞常驻）实测**：仍 <5s 硬冻结（无 alive/watchdog/转储）→ **GS selector
+  非硬冻结根因**。
+- **step100（v100 可诊断形态，guest 文件写 + 阻塞，`g_os_guest_delay_quiet=FALSE`）实测**：
+  **硬冻结、无 0x139 转储**。对比历史 v100（无 GS 修复）是 0x139 可诊断——**修复后
+  从 0x139 变为硬冻结**，说明 GS selector 修复**移除了早期 GS #GP 症状**，但 guest
+  继续跑 Windows 调度器后仍触达**更深层 CPU 级冻结点**（无异常可拦、无 dump）。
+- **结论（穷尽）**：OS-as-guest 阻塞常驻在本机最终必冻结。已排除/无效：
+  独立 CR3（不可用）、ASID/TLB 卫生（9.161）、GS selector（9.170）、异常拦截/
+  HLT（9.99-9.102）、APIC/IO 系列（9.96-9.98）。冻结发生在 guest 内 Windows
+  调度器上下文切换，为**平台级 CPU 锁死**（本机 Ryzen 5 5500 平台限制）。
+- **本机可达成边界（最终）**：有界试点（12/14/16 全 PASS）+ step20 spin 常驻
+  （可加载/稳定/干净卸载，9.163）。真 OS-as-guest 常驻需换平台。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：svm_core.c（GS/FS selector 镜像宿主）+ step100 quiet 恢复注释 + 本记录。
