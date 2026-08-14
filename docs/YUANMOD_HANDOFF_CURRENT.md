@@ -2373,3 +2373,32 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   P2 + 看门狗 + P4 清理。
 - 提交：6 驱动文件（main.c / svm_core.c / npt_core.c / loader_stealth.c /
   protect.c / common/debug.h）+ 审查文档 P4 勾选 + 本记录。
+
+### 9.147 2026-08-14 逐项解决：B3 根因 + REV-038/007/042 + 看门狗扩展（构建验证）
+
+- **B3 根因定位并修复（svm_core.c）**：`svm_core_stop_all_residents()` 原先
+  无条件把**所有** vcpu（含空闲 STOPPED/OFF）置 STOPPING。空闲核无 resident
+  循环消费 STOPPING→STOPPED，永久卡在 STOPPING → 之后任何 `try_activate`
+  命中 STOPPING 分支而 bail → 单核 persistent（9.143 现象根因）。**修复：仅
+  ACTIVE 的 vcpu 转 STOPPING。** 这使 c1-c11 能真正激活（多核路径正确），
+  "多核心跳/persistent"按设计应真正多核。
+- **REV-038（protect.c）**：`remove_hook_locked` pause 失败时仍恢复原始字节 +
+  清 installed + 释放 stub（不再永久残留函数指向 stub）。
+- **REV-007（vmmcall.c）**：SHUTDOWN 改走 cookie + per-vcpu auth_key(r8)；
+  STOP_INTERNAL 保持 cookie-only（合成测试 guest 含 cpuid guest 覆写 r8 且断言
+  r8==0，无法安全加 key；两者破坏性相同，故为纵深防御，真正门槛是 R1 私有页
+  剔除，默认关）。
+- **REV-042（protect.c）**：`start_locked` 0 页返回 INVALID_PARAMETER 加注释
+  说明（默认路径恒有 ≥1 页；门控 baremetal step9"keepalive"实验需自行加页）。
+- **看门狗扩展（main.c）**：覆盖全部在线核（原仅 c0-c3），格式
+  `wd t=.. e=0x..,.. s=0x..,..`（e=各核 exit 计数、s=各核状态），便于未来平台
+  验证多核 persistent。
+- 构建：`cmd /c build.bat` SUCCESS（静态校验全过），SHA `F401E6D2...`
+  （归档 `D:\aaaaaavm\yuanguard_hv_147_20260814.sys`）。
+- **本机未加载**：B3 修复使持久模式将真正多核（12 核常驻），本机多核曾
+  START_PENDING 挂起（9.145）→ 本机继续用稳定默认版 `70888311`，HEAD 多核
+  验证需换平台。
+- 仍延后（原因明确）：REV-001（锁序重构，大改+hook 路径本机不可测，方案在
+  HOOK_LOCK 文档）、REV-029（设备 SD，DACL 风险）、REV-043/046（R1 族）、
+  REV-035（kd）。
+- 提交：svm_core.c / protect.c / vmmcall.c / main.c + 本记录。

@@ -3550,7 +3550,7 @@ static void yghv_watchdog_log(const char *line) {
     IO_STATUS_BLOCK iosb;
     HANDLE h;
     size_t len = 0;
-    char buf[256];
+    char buf[640];
 
     RtlInitUnicodeString(&name, L"\\SystemRoot\\yghv_watchdog.log");
     InitializeObjectAttributes(&oa, &name,
@@ -3590,8 +3590,9 @@ static void yghv_wd_hex(char *buf, size_t bufsz, size_t *off, uint64_t v) {
 static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
     LARGE_INTEGER delay;
     LARGE_INTEGER tick;
-    char line[256];
+    char line[640];
     size_t off;
+    ULONG n, i;
     (void)ctx;
     delay.QuadPart = -5LL * 10 * 1000 * 1000;   /* 5 s */
     while (!g_watchdog_stop) {
@@ -3599,36 +3600,27 @@ static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
         if (g_watchdog_stop)
             break;
         KeQueryTickCount(&tick);
+        n = g_vcpu_count;
+        if (n > SVM_MAX_CORES) n = SVM_MAX_CORES;
         off = 0;
         line[off++] = 'w'; line[off++] = 'd';
         line[off++] = ' '; line[off++] = 't'; line[off++] = '=';
         yghv_wd_hex(line, sizeof(line), &off, (uint64_t)tick.QuadPart);
-        line[off++] = ' '; line[off++] = 'c'; line[off++] = '0'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[0] ? g_vcpus[0]->resident_exits : 0);
-        line[off++] = ' '; line[off++] = 'c'; line[off++] = '1'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[1] ? g_vcpus[1]->resident_exits : 0);
-        line[off++] = ' '; line[off++] = 'c'; line[off++] = '2'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[2] ? g_vcpus[2]->resident_exits : 0);
-        line[off++] = ' '; line[off++] = 'c'; line[off++] = '3'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[3] ? g_vcpus[3]->resident_exits : 0);
-        /* per-core resident_state to see whether a core is ACTIVE (in VMRUN
-           loop) or STOPPED/STOPPING (thread terminated early). */
-        line[off++] = ' '; line[off++] = 's'; line[off++] = '0'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[0] ? (uint64_t)(LONG)g_vcpus[0]->resident_state : 0xEE);
-        line[off++] = ' '; line[off++] = 's'; line[off++] = '1'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[1] ? (uint64_t)(LONG)g_vcpus[1]->resident_state : 0xEE);
-        line[off++] = ' '; line[off++] = 's'; line[off++] = '2'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[2] ? (uint64_t)(LONG)g_vcpus[2]->resident_state : 0xEE);
-        line[off++] = ' '; line[off++] = 's'; line[off++] = '3'; line[off++] = '=';
-        yghv_wd_hex(line, sizeof(line), &off,
-            g_vcpus[3] ? (uint64_t)(LONG)g_vcpus[3]->resident_state : 0xEE);
+        /* per-core resident exit counts, in core order */
+        line[off++] = ' '; line[off++] = 'e'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? g_vcpus[i]->resident_exits : 0);
+        }
+        /* per-core resident_state (ACTIVE=2 running, STOPPED=4 not running,
+           STOPPING=3 stuck teardown, 0xEE = no vcpu) */
+        line[off++] = ' '; line[off++] = 's'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? (uint64_t)(LONG)g_vcpus[i]->resident_state : 0xEE);
+        }
         line[off] = 0;
         yghv_watchdog_log(line);
     }

@@ -37,8 +37,22 @@ static int yghv_vmmcall_authorized(svm_vcpu_t *vcpu, uint64_t cmd) {
 
     case YGHV_CMD_HOOK_QUERY:
     case YGHV_CMD_STOP_INTERNAL:
-    case YGHV_CMD_SHUTDOWN:
+        /* REV-007: kept cookie-only — the synthetic test guests (including the
+           cpuid guest, which clobbers r8 and is asserted r8==0) issue
+           STOP_INTERNAL without a usable auth-key register; SHUTDOWN below
+           gets the stricter check.  Note STOP_INTERNAL and SHUTDOWN are
+           equally destructive, so this is defense-in-depth only; the real
+           gate is R1 private-page exclusion (gated off by default). */
         return vcpu->regs.rcx == g_vmmcall_auth_cookie;
+
+    case YGHV_CMD_SHUTDOWN:
+        /* REV-007: the most destructive command also requires the per-vcpu
+           key (r8 == auth_key), not just the guest-readable cookie. */
+        if (vcpu->regs.rcx != g_vmmcall_auth_cookie)
+            return 0;
+        if (vcpu->auth_key && vcpu->regs.r8 != vcpu->auth_key)
+            return 0;
+        return 1;
 
     default:
         /* Control commands additionally require the per-vcpu key. */

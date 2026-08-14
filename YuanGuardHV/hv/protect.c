@@ -481,6 +481,10 @@ static NTSTATUS yghv_protect_start_locked(void) {
         if (g_protect.targets[t].cr3)
             total += g_protect.targets[t].page_count;
     }
+    /* REV-042: 0 pages means nothing to arm — reject (the default persistent
+       path always has >= 1 page: workload + hook).  The gated baremetal
+       step-9 "keepalive only" flow expects a success here; that experiment
+       should add a keepalive page or be updated, it is not the default path. */
     if (!total)
         return STATUS_INVALID_PARAMETER;
     for (t = 0; t < g_protect.target_count; t++) {
@@ -1364,7 +1368,21 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
         LOG_ERROR("protect remove hook %u: patch rendezvous failed 0x%x",
             hook_id, st);
         yghv_hook_diag_mark("remove:pause", st);
+        /* REV-038: still restore the original bytes and clear the hook so a
+           transient pause failure cannot strand the function permanently
+           patched to a stub.  pause_residents_for_patch already resumed
+           residents on timeout; restoring under the un-paused guest is
+           best-effort (the REV-001 lock/barrier redesign removes this race). */
+        RtlCopyMemory(wmap + (h->func_va & (HV_PAGE_SIZE - 1)), h->original,
+            h->patch_len);
+        KeInvalidateRangeAllCaches((PVOID)h->func_va, h->patch_len);
         yghv_protect_unmap_writable_page(wmdl, wmap);
+        if (g_hook_stub_pages[hook_id]) {
+            ExFreePoolWithTag(g_hook_stub_pages[hook_id], YGHV_TAG);
+            g_hook_stub_pages[hook_id] = NULL;
+        }
+        h->installed = 0;
+        h->patch_len = 0;
         return st;
     }
     RtlCopyMemory(wmap + (h->func_va & (HV_PAGE_SIZE - 1)), h->original,

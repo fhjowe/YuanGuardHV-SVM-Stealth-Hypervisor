@@ -759,8 +759,15 @@ ULONG_PTR svm_core_ipi_set_npt(ULONG_PTR arg) {
 
 void svm_core_stop_all_residents(void) {
     ULONG i;
+    /* Only ACTIVE residents need a stop signal.  Setting STOPPING on idle vcpus
+       (STOPPED/OFF) leaves them stuck in STOPPING forever — no resident loop
+       runs on them to consume STOPPING -> STOPPED — so every later
+       svm_resident_try_activate on that core hits the STOPPING branch and bails,
+       silently degrading to single-core persistent (observed 9.143, root cause
+       found 9.147). */
     for (i = 0; i < SVM_MAX_CORES; i++) {
-        if (g_vcpus[i]) {
+        if (g_vcpus[i] &&
+            g_vcpus[i]->resident_state == SVM_RESIDENT_ACTIVE) {
             InterlockedExchange((volatile LONG *)&g_vcpus[i]->resident_state,
                                 SVM_RESIDENT_STOPPING);
             if (g_vcpus[i]->pause_requested) {
