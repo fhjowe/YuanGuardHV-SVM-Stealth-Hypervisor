@@ -39,7 +39,7 @@ int npt_init(npt_mgr_t*m,uint64_t mp){
     if(!g_cache)return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(g_cache,sizeof(npt_cached_t));
     m->pml4_va=npt_alloc_table();
-    if(!m->pml4_va){ExFreePool(g_cache);return STATUS_INSUFFICIENT_RESOURCES;}
+    if(!m->pml4_va){ExFreePool(g_cache);g_cache=NULL;return STATUS_INSUFFICIENT_RESOURCES;}
     m->pml4_pa=npt_va_to_pa(m->pml4_va);
     if(mp)return npt_identity_map_range(m,0,mp);
     return STATUS_SUCCESS;
@@ -141,11 +141,15 @@ int npt_set_page_perm(npt_mgr_t*m,uint64_t g,uint64_t f){
 }
 
 int npt_set_page_perm_range(npt_mgr_t*m,uint64_t g,uint64_t s,uint64_t f){
-    uint64_t start=g&~(HV_LARGE_PAGE_SIZE-1);
-    uint64_t end=(g+s+HV_LARGE_PAGE_SIZE-1)&~(HV_LARGE_PAGE_SIZE-1);
+    uint64_t start=g&~(HV_PAGE_SIZE-1);
+    uint64_t end=g+s;
     uint64_t pa;
-    for(pa=start;pa<end;pa+=HV_LARGE_PAGE_SIZE){
-        int st=npt_set_page_perm(m,pa,f);
+    /* Iterate per 4K page so a split (4K) region is fully covered and a large
+       page is not over-applied beyond the requested range. */
+    for(pa=start;pa<end;pa+=HV_PAGE_SIZE){
+        int st=npt_split_2mb_to_4kb(m,pa);
+        if(st)return st;
+        st=npt_set_page_perm(m,pa,f);
         if(st)return st;
     }
     return STATUS_SUCCESS;
@@ -157,10 +161,12 @@ uint64_t npt_translate(npt_mgr_t*m,uint64_t g){
     if(!m||!m->pml4_va)return 0;
     pd=npt_get_pd(m,p4,p2);
     if(!pd)return 0;
+    /* Present must be checked before the large-page branch: a non-present
+       large page must not return a translation. */
+    if(!pd[p1].present)return 0;
     if(pd[p1].large_page){
         return (NPT_PFN_2MB(pd[p1].all)<<21)|(g&(HV_LARGE_PAGE_SIZE-1));
     }
-    if(!pd[p1].present)return 0;
     pt=npt_get_pt(m,p4,p2,p1);
     if(!pt||!pt[p0].present)return 0;
     return ((uint64_t)pt[p0].pfn<<12)|(g&0xFFF);

@@ -34,8 +34,10 @@ static void yghv_hook_diag(const char *stage, NTSTATUS st) {
         FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN_IF,
         FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0)))
         return;
-    while (stage[n] && n < sizeof(buf) - 16)
-        buf[n++] = stage[n];
+    while (stage[n] && n < sizeof(buf) - 16) {
+        buf[n] = stage[n];
+        n++;
+    }
     buf[n++] = ' '; buf[n++] = 's'; buf[n++] = 't'; buf[n++] = '=';
     buf[n++] = '0'; buf[n++] = 'x';
     for (i = 7; i >= 0; i--)
@@ -44,6 +46,28 @@ static void yghv_hook_diag(const char *stage, NTSTATUS st) {
     ZwWriteFile(h, NULL, NULL, NULL, &iosb, buf, (ULONG)n, NULL, NULL);
     ZwFlushBuffersFile(h, &iosb);
     ZwClose(h);
+}
+
+/* REV-036: yghv_hook_diag performs Zw* file I/O, which requires PASSIVE_LEVEL.
+   Every diag call site runs under g_protect_lock (FAST_MUTEX -> APC_LEVEL),
+   an IRQL violation on exactly the error paths the diag serves.  Record the
+   failure in memory (LOG_ERROR is IRQL-safe) and flush the log after the lock
+   is released. */
+static const char *g_hook_diag_stage = NULL;
+static NTSTATUS g_hook_diag_status = 0;
+
+static void yghv_hook_diag_mark(const char *stage, NTSTATUS st) {
+    g_hook_diag_stage = stage;
+    g_hook_diag_status = st;
+    LOG_ERROR("hook diag: %s st=0x%x", stage, (unsigned)st);
+}
+
+static void yghv_hook_diag_flush(void) {
+    if (g_hook_diag_stage) {
+        yghv_hook_diag(g_hook_diag_stage, g_hook_diag_status);
+        g_hook_diag_stage = NULL;
+        g_hook_diag_status = 0;
+    }
 }
 
 yghv_protect_state_t g_protect;
@@ -202,6 +226,7 @@ void yghv_protect_cleanup(void) {
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
     RtlZeroMemory(g_protect_cr3_list, sizeof(g_protect_cr3_list));
     ExReleaseFastMutex(&g_protect_lock);
+    yghv_hook_diag_flush();
 }
 
 NTSTATUS yghv_protect_set_target(uint32_t pid) {
@@ -250,12 +275,23 @@ NTSTATUS yghv_protect_set_target(uint32_t pid) {
     }
     t = &g_protect.targets[idx];
     if (t->page_count) {
+        BOOLEAN was_armed[YGHV_PROTECT_MAX_PAGES];
+        ULONG j;
+        for (j = 0; j < t->page_count; j++)
+            was_armed[j] = t->pages[j].armed ? TRUE : FALSE;
         for (i = 0; i < t->page_count; i++) {
             if (t->pages[i].armed) {
                 int ds = yghv_protect_disarm_page_locked(&t->pages[i]);
                 if (ds) {
                     LOG_ERROR("protect set_target: disarm page %u failed 0x%x",
                         i, ds);
+                    /* REV-044: roll back the pages already disarmed so the
+                       slot keeps its original armed state on this failure
+                       path instead of a mixed armed/disarmed state. */
+                    for (j = 0; j < t->page_count; j++) {
+                        if (was_armed[j] && !t->pages[j].armed)
+                            yghv_protect_arm_page_locked(&t->pages[j]);
+                    }
                     ExReleaseFastMutex(&g_protect_lock);
                     ObDereferenceObject(proc);
                     return STATUS_UNSUCCESSFUL;
@@ -500,6 +536,13 @@ yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa) {
     int st;
 
     ExAcquireFastMutex(&g_protect_lock);
+    if (!g_protect.active) {
+        /* REV-045: protection is off — do not disarm/re-arm pages from an
+           NPF write (a page left armed after a failed stop must not be
+           permanently disarmed by one write). */
+        ExReleaseFastMutex(&g_protect_lock);
+        return YGHV_NPF_NONE;
+    }
     pp = yghv_protect_find_page_locked(gpa);
     if (pp) {
         if (yghv_protect_is_target_cr3_locked(vcpu->vmcb->state.cr3) ||
@@ -671,6 +714,7 @@ NTSTATUS yghv_protect_clear(void) {
     yghv_protect_refresh_cr3_list_locked();
     LOG_ERROR("protect clear: target/pages/hooks cleared");
     ExReleaseFastMutex(&g_protect_lock);
+    yghv_hook_diag_flush();
     return STATUS_SUCCESS;
 }
 
@@ -872,7 +916,7 @@ static int yghv_inst_len(const uint8_t *p, size_t avail, int *rip_rel) {
         b = p[pos];
         if (b >= 0x40 && b <= 0x4F) {
             if (rex) return 0;
-            rex = 1;
+            rex = b;   /* keep the REX byte; bit 3 = W (operand size) */
             pos++;
             continue;
         }
@@ -916,8 +960,13 @@ static int yghv_inst_len(const uint8_t *p, size_t avail, int *rip_rel) {
         return (int)(pos + 1);
     }
     if (op >= 0xB8 && op <= 0xBF) {
-        if (pos + 8 > avail) return 0;
-        return (int)(pos + 8);
+        /* B8+rd: REX.W -> movabs r64, imm64 (8-byte imm); no REX.W -> mov
+           r32, imm32 (4-byte imm).  Every Windows syscall stub begins with
+           the no-REX `mov eax, imm32` form, so sizing it as imm64 was a
+           wrong-boundary bug. */
+        size_t imm = (rex & 0x08) ? 8 : 4;
+        if (pos + imm > avail) return 0;
+        return (int)(pos + imm);
     }
     if (op >= 0xA0 && op <= 0xA3) {
         size_t sz = (op & 1) ? 8 : 4;
@@ -963,12 +1012,17 @@ static int yghv_inst_len(const uint8_t *p, size_t avail, int *rip_rel) {
             return (int)pos;
         }
         if (op2 == 0x38 || op2 == 0x3A) {
-            size_t after = pos;
+            size_t after;
             uint8_t op3;
             if (pos >= avail) return 0;
             op3 = p[pos];
             pos++;
             (void)op3;
+            /* `after` must point at the ModRM byte (after op3); previously it
+               was captured before pos++ and decode_modrm started on the op3
+               opcode itself (off-by-one) and RIP-relative detection probed the
+               wrong byte. */
+            after = pos;
             if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
                 *rip_rel = 1;
             if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
@@ -997,11 +1051,24 @@ static int yghv_inst_len(const uint8_t *p, size_t avail, int *rip_rel) {
     }
 
     if (op == 0x69 || op == 0x6B || op == 0x80 || op == 0x81 || op == 0x83 ||
-        op == 0xC0 || op == 0xC1 || op == 0xC6 || op == 0xC7 || op == 0xF6 ||
-        op == 0xF7) {
+        op == 0xC0 || op == 0xC1 || op == 0xC6 || op == 0xC7) {
         size_t after = pos;
-        size_t imm = (op == 0x69 || op == 0x81 || op == 0xC7 || op == 0xF7)
+        size_t imm = (op == 0x69 || op == 0x81 || op == 0xC7)
                          ? 4 : 1;
+        if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
+            *rip_rel = 1;
+        if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
+        if (after + imm > avail) return 0;
+        return (int)(after + imm);
+    }
+
+    if (op == 0xF6 || op == 0xF7) {
+        size_t after = pos;
+        size_t imm = 0;
+        /* Group-3: only /0 (test) has an immediate; not/neg/mul/imul/div/idiv
+           (F6/F7 /2../7) do not. */
+        if (after < avail && ((p[after] >> 3) & 7) == 0)
+            imm = (op == 0xF7) ? 4 : 1;
         if (rip_rel && after < avail && (p[after] & 0xC7) == 0x05)
             *rip_rel = 1;
         if (yghv_decode_modrm(p, avail, &after) < 0) return 0;
@@ -1051,6 +1118,7 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va) {
     ExAcquireFastMutex(&g_protect_lock);
     st = yghv_protect_install_hook_locked(hook_id, func_va);
     ExReleaseFastMutex(&g_protect_lock);
+    yghv_hook_diag_flush();
     return st;
 }
 
@@ -1064,7 +1132,7 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     yghv_protect_page_t *pp;
     yghv_protect_hook_t *h;
     int patch_len;
-    NTSTATUS st;
+    NTSTATUS st = STATUS_UNSUCCESSFUL;
 
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
     h = &g_protect_hooks[hook_id];
@@ -1150,14 +1218,14 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (!wmap) {
         LOG_ERROR("protect hook %u: writable map of function page 0x%llx failed",
             hook_id, page_pa);
-        yghv_hook_diag("install:map", st);
+        yghv_hook_diag_mark("install:map", st);
         st = STATUS_UNSUCCESSFUL;
         goto fail;
     }
     st = svm_core_pause_residents_for_patch();
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect hook %u: patch rendezvous failed 0x%x", hook_id, st);
-        yghv_hook_diag("install:pause", st);
+        yghv_hook_diag_mark("install:pause", st);
         goto fail;
     }
     RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), patch,
@@ -1170,14 +1238,14 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (st) {
         LOG_ERROR("protect hook %u: split function page failed 0x%x",
             hook_id, st);
-        yghv_hook_diag("install:split", st);
+        yghv_hook_diag_mark("install:split", st);
         goto fail;
     }
     st = npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT);
     if (st) {
         LOG_ERROR("protect hook %u: set function page perm failed 0x%x",
             hook_id, st);
-        yghv_hook_diag("install:perm", st);
+        yghv_hook_diag_mark("install:perm", st);
         goto fail;
     }
 
@@ -1186,14 +1254,14 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect hook %u: add function page failed 0x%x",
             hook_id, st);
-        yghv_hook_diag("install:addpage", st);
+        yghv_hook_diag_mark("install:addpage", st);
         goto fail;
     }
     pp = yghv_protect_find_page_locked(page_pa);
     if (!pp) {
         LOG_ERROR("protect hook %u: function page missing from table",
             hook_id);
-        yghv_hook_diag("install:missing", st);
+        yghv_hook_diag_mark("install:missing", st);
         yghv_protect_remove_page_for_locked(&g_protect.targets[0], h->func_va);
         st = STATUS_UNSUCCESSFUL;
         goto fail;
@@ -1202,7 +1270,7 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     if (st) {
         LOG_ERROR("protect hook %u: arm function page failed 0x%x",
             hook_id, st);
-        yghv_hook_diag("install:arm", st);
+        yghv_hook_diag_mark("install:arm", st);
         yghv_protect_remove_page_for_locked(&g_protect.targets[0], h->func_va);
         goto fail;
     }
@@ -1213,12 +1281,22 @@ static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_
     return STATUS_SUCCESS;
 
 fail:
-    yghv_hook_diag("install:fail", st);
+    yghv_hook_diag_mark("install:fail", st);
     npt_set_page_perm(&g_npt, page_pa, NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    for (i = 0; i < SVM_MAX_CORES; i++) {
+        if (g_vcpus[i])
+            g_vcpus[i]->npt_flush_pending = 1;
+    }
     if (wmap) {
+        /* REV-040/041: the patch may already be applied with residents resumed;
+           re-pause before restoring the original bytes and freeing the stub so
+           the guest cannot execute a torn instruction or a freed stub. */
+        NTSTATUS pst = svm_core_pause_residents_for_patch();
         RtlCopyMemory(wmap + (func_va & (HV_PAGE_SIZE - 1)), h->original,
             h->patch_len);
         KeInvalidateRangeAllCaches((PVOID)func_va, h->patch_len);
+        if (NT_SUCCESS(pst))
+            svm_core_resume_residents();
     }
     yghv_protect_unmap_writable_page(wmdl, wmap);
     if (g_hook_stub_pages[hook_id]) {
@@ -1234,6 +1312,7 @@ NTSTATUS yghv_protect_remove_hook(uint8_t hook_id) {
     ExAcquireFastMutex(&g_protect_lock);
     st = yghv_protect_remove_hook_locked(hook_id);
     ExReleaseFastMutex(&g_protect_lock);
+    yghv_hook_diag_flush();
     return st;
 }
 
@@ -1242,7 +1321,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     uint8_t *wmap = NULL;
     PMDL wmdl = NULL;
     uint64_t page_pa;
-    NTSTATUS st;
+    NTSTATUS st = STATUS_UNSUCCESSFUL;
     if (hook_id >= YGHV_PROTECT_MAX_HOOKS) return STATUS_INVALID_PARAMETER;
     h = &g_protect_hooks[hook_id];
     if (!h->installed) return STATUS_NOT_FOUND;
@@ -1255,7 +1334,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
         LOG_ERROR(
             "protect remove hook %u: writable map of function page 0x%llx failed",
             hook_id, page_pa);
-        yghv_hook_diag("remove:map", st);
+        yghv_hook_diag_mark("remove:map", st);
         return STATUS_UNSUCCESSFUL;
     }
 
@@ -1264,7 +1343,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect remove hook %u: remove_page failed 0x%x",
             hook_id, st);
-        yghv_hook_diag("remove:removepage", st);
+        yghv_hook_diag_mark("remove:removepage", st);
         yghv_protect_unmap_writable_page(wmdl, wmap);
         return st;
     }
@@ -1273,7 +1352,7 @@ static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id) {
     if (!NT_SUCCESS(st)) {
         LOG_ERROR("protect remove hook %u: patch rendezvous failed 0x%x",
             hook_id, st);
-        yghv_hook_diag("remove:pause", st);
+        yghv_hook_diag_mark("remove:pause", st);
         yghv_protect_unmap_writable_page(wmdl, wmap);
         return st;
     }

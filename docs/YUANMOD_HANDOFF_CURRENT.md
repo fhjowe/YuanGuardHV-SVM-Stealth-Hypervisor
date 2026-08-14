@@ -2149,3 +2149,46 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 收尾：C 盘已恢复稳定默认版 `70888311...`，服务 STOPPED。
 - 结论：P0 修复 4 项（REV-003/004/005/006）实机回归全部 PASS，无回归。
   提交（可选）：本轮回归记录。
+
+### 9.139 2026-08-14 P1 语义修复 11 项 + REV-039（用户授权直接修复）
+
+- 用户指示"完成 P1 直接修复，不用给代码"。共改 4 个驱动文件，构建 + 实机非
+  hook 回归全部 PASS。
+- **REV-002** `npt_core.c` `npt_set_page_perm_range` 改 4K 迭代（每页先 split 再
+  set_perm），修正 2MB 步进对拆分区域漏改/大页过度应用。
+- **REV-010** `npt_core.c` `npt_init` pml4 分配失败 `g_cache=NULL`；`main.c`
+  npt_init/map_ram 失败路径补 `npt_cleanup(&g_npt)`（修泄漏/悬垂）。
+- **REV-011** `npt_core.c` `npt_translate` 先查 present 再查 large_page。
+- **REV-013** `vmmcall.c` auth CR3 比较统一 `~0xFFF` 掩码（与 stub 匹配一致）。
+- **REV-015** `vmmcall.c` ADD_PAGE/REMOVE_PAGE 改按调用者 CR3 解析目标槽
+  （`add_page_for`/`remove_page_for`），与 IOCTL 一致。
+- **REV-036** `protect.c` `yghv_hook_diag` IRQL 违规：锁内改 `yghv_hook_diag_mark`
+  （内存+LOG_ERROR），公共包装（install/remove/clear/cleanup）放锁后
+  `yghv_hook_diag_flush` 落盘。
+- **REV-037** `protect.c` 指令解码器 3 类修正：rex 存字节值（W 位）、B8-BF 按
+  REX.W 分 imm32/imm64、0F 38/3A modrm 从 op3 后解码、F6/F7 仅 /0 有立即数；
+  `main.c` `hook_boundary_test` 增补 5 组解码器用例（B8 imm32 / movabs / 0F38 /
+  F6 / F7）。
+- **REV-040** `protect.c` install 失败路径 `npt_set_page_perm` 后补全核
+  `npt_flush_pending`。
+- **REV-041** `protect.c` install 失败路径 re-pause 后再恢复字节 + 释放 stub
+  （消除撕裂指令与 stub UAF 窗口）。
+- **REV-044** `protect.c` `set_target` disarm 失败时 snapshot+rollback 恢复槽原
+  armed 状态。
+- **REV-045** `protect.c` `on_npf_write` 决策前检查 `g_protect.active`（非 active
+  不处理写，避免失败 stop 后一次写永久 disarm）。
+- **REV-039**（P0 清单补）`protect.c` install/remove `st` 声明即初始化
+  `STATUS_UNSUCCESSFUL`，修未初始化传 diag。
+- 构建：首轮因注释 `Zw*/Nt*` 含 `*/` 提前闭合导致编译错误，修正注释后 SUCCESS；
+  另修 `buf[n++]=stage[n]` 未定序警告。最终
+  SHA256 `fb1522651546870ab46740a965cf6abfa6a50a980a90b7ca70f12cb35be1dab4`
+  （含 REV-039；归档 `D:\aaaaaavm\yuanguard_hv_p1fix_20260814.sys` 为前一轮
+  `85b763e...`，本轮最终件见 bin/）。
+- 实机回归（85b763e，REV-039 仅 hook 错误路径变量初始化、不影响非 hook 结果）：
+  部署 → RUNNING；progress log 自测全过（**hook boundary PASS 含新解码器用例**，
+  验证 REV-037）；state/target/list-targets/list-pages/list-hooks/config 全 PASS；
+  selftest PASS；exit-test PASS；`sc stop` 干净 STOPPED；C 盘恢复稳定默认版
+  `70888311...`。（list-pages 首页 armed=0 为常驻 guest 每轮写 workload 页的
+  auto-disarm/rearm 时序快照，非回归；未执行 hook 路径。）
+- 提交：4 驱动文件（npt_core.c / main.c / vmmcall.c / protect.c）+ 审查文档 P0
+  补勾 REV-039 + P1 全部勾选 + 本记录。

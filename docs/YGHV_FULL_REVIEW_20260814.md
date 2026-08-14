@@ -203,20 +203,20 @@
 - [ ] **YGHV-REV-020** PS 客户端 hex 参数兼容 `0x` 前缀（yghv_ctl.ps1）
 - [ ] **YGHV-REV-021** selftest baseline 断言 + 失败清理驱动状态（yghv_ctl.ps1）
 - [ ] **YGHV-REV-022** JNI `GetByteArrayElements` NULL 检查（yghv_ctl_jni.c）
-- [ ] **YGHV-REV-039** `yghv_hook_diag` 未初始化 `st` 修正（protect.c）
+- [x] **YGHV-REV-039** `yghv_hook_diag` 未初始化 `st` 修正（protect.c）——2026-08-14 已修（声明即初始化）
 
 ### P1 —— 语义修复（改后需回归 r1/非 hook 路径）
-- [ ] **YGHV-REV-002** `npt_set_page_perm_range` 改为 4K 迭代（npt_core.c）
-- [ ] **YGHV-REV-010** `npt_init` 失败路径 `g_cache=NULL`；npt_init/map_ram 失败统一清理（npt_core.c + main.c）
-- [ ] **YGHV-REV-011** `npt_translate` 先查 present（npt_core.c）
-- [ ] **YGHV-REV-013** VMMCALL CR3 比较统一掩码（vmmcall.c）
-- [ ] **YGHV-REV-015** VMMCALL ADD/REMOVE_PAGE 按 CR3 解析目标槽（vmmcall.c）
-- [ ] **YGHV-REV-036** `yghv_hook_diag` IRQL 违规：放锁后落盘或在 PASSIVE 线程落盘（protect.c）
-- [ ] **YGHV-REV-037** 指令解码器修正（B8-BF 按 REX.W 分 imm32/imm64、0F 38/3A modrm 差一、F6/F7 按 modrm.reg 判立即数）+ 增补真实目标正向/负向单测（protect.c）
-- [ ] **YGHV-REV-040** install 失败路径恢复后补 NPT TLB flush（protect.c）
-- [ ] **YGHV-REV-041** install 失败路径先释放 stub 再 resume，消除 UAF 窗口（protect.c）
-- [ ] **YGHV-REV-044** `set_target` disarm 失败回滚或保持槽原状（protect.c）
-- [ ] **YGHV-REV-045** `on_npf_write` 决策前检查 `g_protect.active`（protect.c）
+- [x] **YGHV-REV-002** `npt_set_page_perm_range` 改为 4K 迭代（npt_core.c）——2026-08-14 已修
+- [x] **YGHV-REV-010** `npt_init` 失败路径 `g_cache=NULL`；npt_init/map_ram 失败统一清理（npt_core.c + main.c）——2026-08-14 已修
+- [x] **YGHV-REV-011** `npt_translate` 先查 present（npt_core.c）——2026-08-14 已修
+- [x] **YGHV-REV-013** VMMCALL CR3 比较统一掩码（vmmcall.c）——2026-08-14 已修
+- [x] **YGHV-REV-015** VMMCALL ADD/REMOVE_PAGE 按 CR3 解析目标槽（vmmcall.c）——2026-08-14 已修
+- [x] **YGHV-REV-036** `yghv_hook_diag` IRQL 违规：放锁后落盘或在 PASSIVE 线程落盘（protect.c）——2026-08-14 已修（mark+flush）
+- [x] **YGHV-REV-037** 指令解码器修正（B8-BF 按 REX.W 分 imm32/imm64、0F 38/3A modrm 差一、F6/F7 按 modrm.reg 判立即数）+ 增补真实目标正向/负向单测（protect.c）——2026-08-14 已修 + boundary 5 用例
+- [x] **YGHV-REV-040** install 失败路径恢复后补 NPT TLB flush（protect.c）——2026-08-14 已修
+- [x] **YGHV-REV-041** install 失败路径先释放 stub 再 resume，消除 UAF 窗口（protect.c）——2026-08-14 已修（re-pause 后恢复+释放）
+- [x] **YGHV-REV-044** `set_target` disarm 失败回滚或保持槽原状（protect.c）——2026-08-14 已修（snapshot+rollback）
+- [x] **YGHV-REV-045** `on_npf_write` 决策前检查 `g_protect.active`（protect.c）——2026-08-14 已修
 
 ### P2 —— 安全/健壮性加固
 - [ ] **YGHV-REV-007** SHUTDOWN（含 STOP_INTERNAL）走 `r8==auth_key` 分支；cookie 派生加强（vmmcall.c）

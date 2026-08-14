@@ -700,6 +700,7 @@ static NTSTATUS yghv_hook_boundary_test(void) {
     void *buf;
     uint64_t va;
     int ok = 1;
+    int i;
 
     yghv_trace("hook boundary start");
     buf = MmAllocateContiguousMemory(
@@ -741,6 +742,56 @@ static NTSTATUS yghv_hook_boundary_test(void) {
     ((uint8_t *)va)[4] = 0x00; ((uint8_t *)va)[5] = 0x00;
     ((uint8_t *)va)[6] = 0x00;
     if (yghv_protect_validate_hook_target(va) != -1)
+        ok = 0;
+
+    /* REV-037 decoder regression cases (all must decode to boundary 12): */
+
+    /* B8 imm32 (no REX, mov eax,imm32, 5 bytes) + mov [rsp+8],rbx (5) +
+       ret (1) + nop -> boundaries 5,10,11,12 */
+    RtlZeroMemory((void *)va, 32);
+    ((uint8_t *)va)[0] = 0xB8;
+    ((uint8_t *)va)[1] = 0x34; ((uint8_t *)va)[2] = 0x12;
+    ((uint8_t *)va)[3] = 0x00; ((uint8_t *)va)[4] = 0x00;
+    ((uint8_t *)va)[5] = 0x48; ((uint8_t *)va)[6] = 0x89;
+    ((uint8_t *)va)[7] = 0x5C; ((uint8_t *)va)[8] = 0x24;
+    ((uint8_t *)va)[9] = 0x08;
+    ((uint8_t *)va)[10] = 0xC3;
+    ((uint8_t *)va)[11] = 0x90;
+    if (yghv_protect_validate_hook_target(va) != 12)
+        ok = 0;
+
+    /* 48 B8 imm64 (movabs rax,imm64, 10 bytes) + ret + nop -> 12 */
+    RtlZeroMemory((void *)va, 32);
+    ((uint8_t *)va)[0] = 0x48; ((uint8_t *)va)[1] = 0xB8;
+    for (i = 2; i < 10; i++)
+        ((uint8_t *)va)[i] = 0xAA;
+    ((uint8_t *)va)[10] = 0xC3;
+    ((uint8_t *)va)[11] = 0x90;
+    if (yghv_protect_validate_hook_target(va) != 12)
+        ok = 0;
+
+    /* 0F 38 F0 C0 (pshufb xmm0,xmm0, 4 bytes) + 8 NOPs -> 12 */
+    RtlZeroMemory((void *)va, 32);
+    ((uint8_t *)va)[0] = 0x0F; ((uint8_t *)va)[1] = 0x38;
+    ((uint8_t *)va)[2] = 0xF0; ((uint8_t *)va)[3] = 0xC0;
+    RtlFillMemory((void *)(va + 4), 8, 0x90);
+    if (yghv_protect_validate_hook_target(va) != 12)
+        ok = 0;
+
+    /* F6 /0 (test byte [rdi],imm8, 3 bytes) + 9 NOPs -> 12 */
+    RtlZeroMemory((void *)va, 32);
+    ((uint8_t *)va)[0] = 0xF6; ((uint8_t *)va)[1] = 0x07;
+    ((uint8_t *)va)[2] = 0x01;
+    RtlFillMemory((void *)(va + 3), 9, 0x90);
+    if (yghv_protect_validate_hook_target(va) != 12)
+        ok = 0;
+
+    /* F7 /2 (not qword ptr [rdi], no immediate, 3 bytes) + 9 NOPs -> 12 */
+    RtlZeroMemory((void *)va, 32);
+    ((uint8_t *)va)[0] = 0x48; ((uint8_t *)va)[1] = 0xF7;
+    ((uint8_t *)va)[2] = 0x17;
+    RtlFillMemory((void *)(va + 3), 9, 0x90);
+    if (yghv_protect_validate_hook_target(va) != 12)
         ok = 0;
 
     LOG_ERROR("hook boundary test: %s", ok ? "PASS" : "FAIL");
@@ -3639,6 +3690,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         sv = yghv_npt_map_ram(&g_npt);
     if (sv) {
         LOG_ERROR("npt_init/map_ram failed 0x%x", sv);
+        npt_cleanup(&g_npt);
         svm_core_cleanup();
         if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
         g_guest_code_page = NULL;

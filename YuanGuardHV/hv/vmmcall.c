@@ -21,10 +21,12 @@ extern volatile BOOLEAN g_persistent_mode;
 
 static int yghv_vmmcall_authorized(svm_vcpu_t *vcpu, uint64_t cmd) {
     /* Common posture: only ring-0 code running under the control CR3 (when
-       pinned) may use VMMCALL commands at all. */
+       pinned) may use VMMCALL commands at all.  Compare CR3 masked (drop
+       PCID/flags bits) for consistency with the target/hook-stub matching. */
     if (vcpu->vmcb->state.cpl != 0)
         return 0;
-    if (g_control_cr3 && vcpu->vmcb->state.cr3 != g_control_cr3)
+    if (g_control_cr3 &&
+        (vcpu->vmcb->state.cr3 & ~0xFFFULL) != (g_control_cr3 & ~0xFFFULL))
         return 0;
 
     switch (cmd) {
@@ -154,7 +156,10 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
-        vcpu->regs.rax = (uint64_t)yghv_protect_add_page(vcpu->regs.rdx);
+        /* Resolve the target slot by the caller CR3 (matches the IOCTL path)
+           instead of hardcoding targets[0]. */
+        vcpu->regs.rax = (uint64_t)yghv_protect_add_page_for(
+            vcpu->vmcb->state.cr3, vcpu->regs.rdx);
         return 0;
 
     case YGHV_CMD_REMOVE_PAGE:
@@ -166,7 +171,8 @@ int vmmcall_dispatch(svm_vcpu_t *vcpu) {
             vcpu->regs.rax = YGHV_STATUS_DENIED;
             return 0;
         }
-        vcpu->regs.rax = (uint64_t)yghv_protect_remove_page(vcpu->regs.rdx);
+        vcpu->regs.rax = (uint64_t)yghv_protect_remove_page_for(
+            vcpu->vmcb->state.cr3, vcpu->regs.rdx);
         return 0;
 
     case YGHV_CMD_START_PROTECT:
