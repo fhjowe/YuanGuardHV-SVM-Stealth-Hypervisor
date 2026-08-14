@@ -3033,3 +3033,47 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   建立（配置已就绪，BCD 已备份），在冻结前经驱动主动断点捕获 guest 状态。
 - **状态**：BCD 已恢复干净（/debug off），C 盘稳定版 `70888311`，服务 STOPPED。
 - 提交：本记录。
+
+### 9.177 2026-08-14 突破：独立完整镜像 guest CR3 把硬冻结变成可诊断蓝屏
+
+- **新方向**：重新审视 9.152——关键不是"页表内容"，而是 **guest CR3 值 ≠ host CR3**
+  （TLB 以 ASID+CR3 为 tag）。此前 OS-as-guest 各线程从未覆盖 `state->cr3`
+  （一直共享宿主 CR3），而 ASID/TLB 卫生只改 `guest_asid` 不改 CR3 值 → 无效。
+- **实现**：新增 `yghv_clone_host_cr3()`——完整复制宿主整棵页表树（PML4/PDPT/
+  PD/PT，2MB 大页逐项复制，4KB 页复制 PT），返回全新 PML4 PA 作为 guest CR3；
+  `g_os_guest_clone_cr3`（默认 TRUE）+ `yghv_os_guest_clone_cr3_apply(v)` 接入 6 个
+  OS-as-guest 线程。构建 PASS。
+- **step23（阻塞常驻 + 克隆 CR3 + 全部修复，SHA `FB02070B...`）实测**：
+  **0x7E 蓝屏（有转储 `081426-9781-01.dmp`）——不再是硬冻结！**
+- **转储分析**：0x7E / c0000005，崩溃在我自己的 `yghv_clone_host_cr3`（`+0x2d0b`
+  → `MmGetVirtualForPhysical`，访问无效地址，传参 `0xc7d2c000`）。**遍历宿主页表
+  时读到无效物理地址，克隆代码缺防护**。
+- **重大意义**：① 独立 CR3 方向正确——它绕过了共享 CR3 的 CPU 级全核锁死，
+  把"无法诊断的硬冻结"变成"可诊断的代码 bug"；② 首次在 OS-as-guest 阻塞常驻
+  下拿到可分析转储。**修复克隆函数（无效 PA 防护）后重测，可能让 OS-as-guest
+  常驻真正跑起来**——这是 9.157-9.176 全部实验从未达到的状态。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：main.c（克隆 CR3 机制）+ 本记录。
+
+### 9.178 2026-08-14 浅拷贝 PML4 克隆实测负结果——独立 CR3 根不足以消除冻结
+
+- **修复**：把 `yghv_clone_host_cr3` 从"深拷贝整棵页表树"改为"**浅拷贝 PML4 根
+  512 项**"（下层页表与宿主共享，guest CR3 根不同但映射相同）。理由：深拷贝在
+  `MmGetVirtualForPhysical` 遍历时遇无效 PA 崩溃（0x7E，9.177 转储）；浅拷贝更
+  安全且 guest=Windows 本应共享下层页表。构建 PASS。
+- **step23（阻塞常驻 + 浅拷贝 PML4 克隆 + 全部修复，SHA `A31977DE...`）实测**：
+  **仍 <5s 硬冻结（无转储）**。progress 日志确认克隆机制**成功执行**：
+  `os guest cr3 intercept enabled → os guest cloned cr3=0xc7d29000 → os guest cr3
+  cloned to=0xc7d29000 → os resident delay enter=1 → bm os resident block delay
+  running → bm done`，随后冻结。
+- **重要含义**：**独立 CR3 根（浅拷贝）不足以消除冻结**。9.152 的"独立 CR3 稳定"
+  在合成 resident 上有效，但那是**深拷贝独立页表**（guest 不共享下层页表页）；
+  浅拷贝仅改 CR3 根、下层仍共享 → TLB 隔离不彻底 → 仍冻结。
+- **推论**：要真正验证"共享页表页是冻结根因"，需**深拷贝完整独立页表**（修复
+  9.177 的遍历崩溃——无效 PA 防护：遍历时跳过无 PA/无法 MmGetVirtualForPhysical
+  的项），再测。但深拷贝完整页表 + Windows 动态改页表存在失同步问题（guest 改
+  PTE 只改副本，host 看不到），可能引入新故障。
+- **诚实评估**：这是 9.177 方向的第二个负结果。深拷贝修复后再测是本方向的最后
+  一搏；若仍冻结或失同步崩溃，则 9.175 的"平台级 CPU 锁死"结论基本定论。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：main.c（浅拷贝 PML4 克隆）+ 本记录。

@@ -37,6 +37,10 @@ NTKERNELAPI NTSTATUS ZwFlushBuffersFile(HANDLE FileHandle,
                                         PIO_STATUS_BLOCK IoStatusBlock);
 NTSTATUS yghv_loader_stealth(PDRIVER_OBJECT DriverObject,
                              PUNICODE_STRING RegistryPath);
+/* 9.177: clone the host page table into a fresh independent tree (defined later
+   in this TU) and return its PML4 PA for use as a dedicated guest CR3. */
+static uint64_t yghv_clone_host_cr3(void);
+static npt_entry_t *yghv_guest_pt_alloc(void);
 
 npt_mgr_t g_npt;
 uint64_t g_npt_test_pa;
@@ -83,6 +87,35 @@ volatile BOOLEAN g_os_guest_tlb_hygiene = TRUE;
    runs, so guest TLB never coexists with host entries — the last untested
    TLB-level variable for the OS-as-guest resident freeze. */
 volatile BOOLEAN g_os_guest_tlb_flush_all = TRUE;
+/* 9.177: dedicated guest CR3 root for OS-as-guest.  When TRUE, each OS-as-guest
+   vcpu gets a new PML4 (copy of the host PML4's 512 entries) so the guest runs
+   under its own CR3 root value, avoiding the 9.152 shared-CR3 TLB aliasing
+   freeze.  Lower page tables are shared with the host on purpose (the guest IS
+   Windows; guest PTE updates must stay visible to the host). */
+volatile BOOLEAN g_os_guest_clone_cr3 = TRUE;
+static uint64_t yghv_clone_host_cr3(void) {
+    npt_entry_t *src_pml4 = NULL, *dst_pml4 = NULL;
+    uint64_t src_pa, dst_pml4_pa = 0;
+
+    __asm__ volatile("mov %%cr3, %0" : "=r"(src_pa));  /* host CR3 = PA of PML4 */
+
+    src_pml4 = (npt_entry_t *)MmGetVirtualForPhysical(
+        (PHYSICAL_ADDRESS){ .QuadPart = src_pa });
+    if (!src_pml4)
+        return 0;
+    dst_pml4 = yghv_guest_pt_alloc();
+    if (!dst_pml4)
+        return 0;
+    dst_pml4_pa = MmGetPhysicalAddress(dst_pml4).QuadPart;
+
+    /* Copy all 512 PML4 entries verbatim: each entry already holds the PA of
+       the next-level table plus attributes, so sharing the lower tables is
+       correct for OS-as-guest (guest and host are the same Windows).  Only the
+       CR3 root differs, which is what gives the guest its own TLB tag. */
+    RtlCopyMemory(dst_pml4, src_pml4, 512 * sizeof(npt_entry_t));
+    yghv_trace_u64("os guest cloned cr3", dst_pml4_pa);
+    return dst_pml4_pa;
+}
 /* 9.162: clean-unload for OS-as-guest resident (fixes 0xCE).  When
    g_os_guest_stop_requested is set, svm_dispatch_exit returns 1 so the
    trampoline's jnz host_done terminates the guest thread on its next VMEXIT
@@ -959,6 +992,29 @@ static void yghv_os_guest_cr3_intercept_apply(svm_vcpu_t *v) {
     yghv_trace("os guest cr3 intercept enabled");
 }
 
+/* 9.177: give OS-as-guest a dedicated full-mirror CR3 (clone of the host page
+   table, new page-table pages, same VA->PA).  9.152's shared-CR3 freeze was
+   avoided by a different CR3 value; OS-as-guest has never tried a dedicated
+   CR3.  KNOWN LIMITATION: the clone is a static snapshot — Windows-as-guest
+   PTE updates touch the clone, not the host tables, so mapping changes diverge
+   (guest may fault on newly-mapped pages).  This first step is a mechanism
+   test: does a different CR3 value change the freeze into something
+   diagnosable (e.g. triple-fault / NPF) rather than a hard lock?  gated by
+   g_os_guest_clone_cr3. */
+static void yghv_os_guest_clone_cr3_apply(svm_vcpu_t *v) {
+    uint64_t cloned;
+
+    if (!v || !g_os_guest_clone_cr3)
+        return;
+    cloned = yghv_clone_host_cr3();
+    if (!cloned) {
+        LOG_ERROR("os guest clone cr3 failed, keeping host cr3");
+        return;
+    }
+    v->vmcb->state.cr3 = cloned;
+    yghv_trace_u64("os guest cr3 cloned to", cloned);
+}
+
 __declspec(noinline) __declspec(noreturn)
 void yghv_os_guest_host_done(svm_vcpu_t *vcpu) {
     uint32_t core = vcpu ? vcpu->resident_index : 0;
@@ -1010,6 +1066,7 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
+    yghv_os_guest_clone_cr3_apply(v);
     yghv_trace_u64("os guest thread enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Trampoline exits via yghv_os_guest_host_done; this is a fallback. */
@@ -1048,6 +1105,7 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
+    yghv_os_guest_clone_cr3_apply(v);
     yghv_trace_u64("os seamless enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Seamless continuation: this caller now runs in guest mode. */
@@ -1101,6 +1159,7 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
+    yghv_os_guest_clone_cr3_apply(v);
     if (g_v96_apic_tpr_stress && !g_v96_apic_tpr_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
@@ -1301,6 +1360,7 @@ static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
+    yghv_os_guest_clone_cr3_apply(v);
     g_os_resident_mode = TRUE;
     yghv_trace_u64("os resident spin enter", core);
     if (core < SVM_MAX_CORES)
@@ -1348,6 +1408,7 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
+    yghv_os_guest_clone_cr3_apply(v);
     g_os_resident_mode = TRUE;
 
     InterlockedIncrement(&g_v99_allcore_ready);
@@ -1427,6 +1488,7 @@ static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
+    yghv_os_guest_clone_cr3_apply(v);
     if (g_v98_apic_shadow && !g_v98_apic_shadow_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
