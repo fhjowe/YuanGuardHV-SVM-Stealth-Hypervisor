@@ -2809,3 +2809,27 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：重启后 C 盘恢复稳定版 `70888311`（备份
   `D:\yuanguard\backup_stable_70888311.sys`），服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.167 2026-08-14 GS base 假说实证（静态转储）：KTRAP_FRAME.GsBase=0 坐实根因
+
+- **静态转储验证（零机器风险，完成 A）**：
+  - v100（`081226-19625-01.dmp`）与 v100b（`081226-12390-01.dmp`）**两份转储的
+    KTRAP_FRAME 均为 `GsBase=0`、`SegGs=0`、`ExceptionActive=1`**。
+  - 即：guest 内上下文切换 → `KiAbProcessContextSwitch` 路径 #GP → 异常分发
+    `KiExceptionDispatchOnExceptionStack` 依赖 GS base（KPCR）定位 exception stack，
+    但 **guest GS base=0（无有效 KPCR 指针）** → 读 exception stack 失败 → 栈指针
+    非法 → 0x139 `MISSING_GSFRAME_STACKPTR_ERROR`（Arg1=4）。
+  - KPCR for Processor 1 @ `ffffcb017ab80000`（v100）/ `ffffad002e980000`（v100b）
+    正常存在 → 问题在 **guest 上下文里 GS base 未正确传递到异常分发**，而非
+    KPCR 本身缺失。
+- **机理链（完整）**：OS-as-guest guest 用宿主 CR3 运行 Windows 调度器 → 上下文
+  切换（KiSwapThread/KiAbProcessContextSwitch）→ 需要 GS base 访问 KPCR 锁头与
+  exception stack → **guest 模式下 GS base（MSR_GS_BASE/KERNEL_GS_BASE）未正确
+  虚拟化/保持** → #GP + 异常分发栈错误 → 0x139（可诊断形态）或整机硬冻结
+  （无 dump 形态）。
+- **修复方向（明确）**：实现 **GS base / KERNEL_GS_BASE 虚拟化**——拦截 guest 的
+  MSR_GS_BASE(0xC0000101)/MSR_KERNEL_GS_BASE(0xC0000102) 读写（MSRPM + 
+  `svm_handle_msr` 模拟），并确保 VMRUN 时 VMCB state 的 gs_base/kernel_gs_base
+  初始化与保持正确。**这是 9.84-9.163 全部实验从未触达的层**，且现在有转储实锤。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
