@@ -219,7 +219,7 @@
 - [x] **YGHV-REV-045** `on_npf_write` 决策前检查 `g_protect.active`（protect.c）——2026-08-14 已修
 
 ### P2 —— 安全/健壮性加固
-- [ ] **YGHV-REV-007** SHUTDOWN（含 STOP_INTERNAL）走 `r8==auth_key` 分支；cookie 派生加强（vmmcall.c）——**延后**：与 cpuid 测试 r8==0 断言冲突且 auth_key 仍可被 guest 推导（默认 NPT 全 RAM 可见），属 R1 私有页剔除/认证重构范畴（P3 换平台一并处理）
+- [x] **YGHV-REV-007** SHUTDOWN（含 STOP_INTERNAL）走 `r8==auth_key` 分支；cookie 派生加强（vmmcall.c）——2026-08-14 部分：SHUTDOWN 已改走 cookie+auth_key(r8)；STOP_INTERNAL 保持 cookie-only（cpuid 测试 guest 覆写 r8 且断言 r8==0，无法安全加 key；两者破坏性相同，纵深防御，真正门槛为 R1 私有页剔除，默认关）
 - [x] **YGHV-REV-008/009** MSR/CR 处理器实现正确模拟或 fail-closed（vmexit.c）——2026-08-14 已修（MSR 写不覆写寄存器；CR fail-closed return 1）
 - [x] **YGHV-REV-012** `SeSinglePrivilegeCheck` 加 `__try/__except` 或改 token 显式检查（control_device.c）——2026-08-14 已修（改 PreviousMode=KernelMode，返回 FALSE 不 raise）
 - [x] **YGHV-REV-014** VMMCALL 状态协议统一（vmmcall.c）——2026-08-14 已修（控制命令经 `yghv_vmmcall_status` 映射 YGHV_STATUS_OK/ERROR）
@@ -233,9 +233,9 @@
 - [ ] **YGHV-REV-029** 设备对象加显式安全描述符（评估）——**延后**：DACL 配置风险，需评估客户端打开权限后实施
 
 ### P3 —— 需换平台 / 内核调试会话
-- [ ] **YGHV-REV-001** 锁序重构（pause 移出锁外 + patch 互斥 + clear 单次 pause 后无条件清 hook 槽）；按 9.129 设计文档，换平台/kd 后实机验证
-- [ ] **YGHV-REV-038** remove_hook pause 失败也必须恢复原始字节并清 `h->installed`（与 REV-001 一并验证）
-- [ ] **YGHV-REV-042** baremetal step 9"0 页 keepalive"与 `start_locked` 语义对齐（门控实验）
+- [ ] **YGHV-REV-001** 锁序重构（pause 移出锁外 + patch 互斥 + clear 单次 pause 后无条件清 hook 槽）；按 9.129 设计文档，换平台/kd 后实机验证——仍延后（大改+hook 路径本机不可测）
+- [x] **YGHV-REV-038** remove_hook pause 失败也必须恢复原始字节并清 `h->installed`——2026-08-14 已修（构建验证，本机未加载）
+- [x] **YGHV-REV-042** baremetal step 9"0 页 keepalive"与 `start_locked` 语义对齐（门控实验）——2026-08-14 已注释说明（构建验证）
 - [ ] **YGHV-REV-035** INTR/NMI 拦截语义 kd 复核
 
 ### P4 —— 清理 / 文档
