@@ -3077,3 +3077,29 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   一搏；若仍冻结或失同步崩溃，则 9.175 的"平台级 CPU 锁死"结论基本定论。
 - **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：main.c（浅拷贝 PML4 克隆）+ 本记录。
+
+### 9.179 2026-08-14 决定性分析：独立 CR3 架构不可行 + 新方向（APIC/中断完整虚拟化）
+
+- **浅拷贝冻结根因澄清（非 TLB）**：浅拷贝给 guest 设了独立 CR3 根 `0xc7d29000`
+  （成功），但 guest 内 Windows 进程切换写 CR3 被拦截后 `VMCB state.cr3` 更新为
+  **真实进程页表**——guest 是 host 的 Windows，进程页表就是宿主页表 → 首次进程
+  切换后 guest 又回到共享宿主页表 → 独立 CR3 失效 → 冻结。**深拷贝也救不了**：
+  Windows 动态改页表（分配/释放/进程切换）→ 深拷贝失同步 → guest NPF/三重重置，
+  且进程切换仍拉回真实页表。**9.152 的"独立 CR3 稳定"仅适用于合成 resident**
+  （固定页表、不切换 CR3、只访问少数页面）；OS-as-guest 架构上必须共享宿主页表。
+- **新方向（比影子页表更对症、工程量更小）——APIC/中断完整虚拟化**：
+  - 关键证据（9.58）：**step18 自旋 IF=1 无拦截就冻结，step20 自旋+INTR/NMI
+    拦截+host ISR 就 PASS** → 冻结触发点是 **guest 模式内物理中断投递/APIC 交互**
+    （AMD errata 1363 方向），非页表/TLB。
+  - step20 能 PASS 正是因为它拦截了 INTR/NMI、guest 永不收物理中断。阻塞常驻
+    失败，是因为 Windows 调度器必须处理 APIC（TPR/EOI/ICR/时钟中断）→ guest 内
+    APIC 交互 → errata 1363 死锁。
+  - **方案**：在 step20 PASS 基线上，把阻塞常驻的 APIC/中断路径完整虚拟化：
+    ① INTR/NMI 拦截（已有，step20 验证有效）；② 拦截 guest 全部 APIC 访问
+    （MSRPM 拦 APIC MSR + NPT 剔除/重映射 APIC MMIO 页 → NPF → 模拟）；
+    ③ host 模拟 TPR/EOI/ICR/LVTT 并转发真实 APIC；④ 虚拟中断注入（V_INTR/
+    event injection）。工程量远小于影子页表，且直接针对 9.58 证据。
+- **待决策**：A（影子页表，数千行）vs B（APIC/中断完整虚拟化，推荐）vs C（接受
+  边界）。**本会话上下文将满，下窗口请先读本记录 + 9.157-9.178。**
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
