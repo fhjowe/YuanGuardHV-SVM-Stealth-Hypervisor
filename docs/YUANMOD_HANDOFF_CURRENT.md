@@ -2126,3 +2126,26 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   （sc start → state/list-pages/selftest/exit-test → sc stop）。
 - 提交：本轮代码（svm_core.c、protect.c、main.c、yghv_ctl.ps1、YghvCtl.java）
   + 审查文档勾选 + 本记录。
+
+### 9.138 2026-08-14 P0 修复版实机回归（用户授权，全部 PASS）
+
+- 部署：备份 C 盘稳定默认版（`70888311...`）到
+  `D:\aaaaaavm\yuanguard_hv_c_drive_backup_20260814.sys`，覆盖为 P0 修复版
+  `57FED86A...`，`sc start yuanguard` → RUNNING。
+- 驱动自测（`yghv_progress.log`）：NPT/protect 测试、hook test PASS、
+  hook resident allow/deny（deny=0xC0000022）、hook boundary PASS、
+  双核心跳、all stopped，全部正常。
+- 只读查询：`state`（active=1 pid=4 page_count=2）、`target`、
+  `list-targets`（returned=1）、`list-pages`（returned=2 均 armed=1，
+  同时验证 REV-004 修复）、`list-hooks`（id=0 installed patch_len=12）、
+  `config`（auto_disarm=1 deny_status=0xC0000022）全 PASS。
+- 功能回归：`selftest` PASS；`exit-test` PASS（子进程槽自动清理，覆盖
+  REV-006 心跳判活路径）；config 回归 PASS（active 下 `auto-disarm 0`
+  返回 Access Denied 0x5 不冻结、stop 后设置/恢复、deny-status 设置/恢复、
+  `start` 重武装 2 页）。
+- **REV-003 验证**：`sc stop` 干净回 STOPPED（WIN32_EXIT_CODE 0），
+  卸载路径 stop_all_residents→wait_all_stopped 无死锁。
+- 全程无冻结/蓝屏，机器响应正常；未执行 hook 路径（install/remove/clear）。
+- 收尾：C 盘已恢复稳定默认版 `70888311...`，服务 STOPPED。
+- 结论：P0 修复 4 项（REV-003/004/005/006）实机回归全部 PASS，无回归。
+  提交（可选）：本轮回归记录。
