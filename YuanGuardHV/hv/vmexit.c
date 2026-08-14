@@ -341,6 +341,7 @@ static void yghv_v98_apic_scan_forward(void) {
 
 int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     uint64_t exitcode = vcpu->vmcb->control.exitcode;
+    vcpu->last_exitcode = exitcode;   /* 9.152 diag: for freeze/stop localization */
 
     yghv_v100_record(vcpu);
     if (g_r1_diag && g_r1_diag_count++ < 200) {
@@ -407,11 +408,15 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         return 0;
 
     case SVM_EXIT_EXCEPTION_DB:
-        /* REV-047: only consume the #DB for our single-step rearm when TF is
-           set (the ALLOW path sets TF before re-VMRUN).  A guest hardware-
-           breakpoint #DB inside the rearm window has TF clear and must be
-           re-injected instead of being silently consumed. */
-        if (vcpu->rearm_pending && (vcpu->vmcb->state.rflags & 0x100ULL)) {
+        /* 9.152: consume the #DB whenever rearm_pending.  REV-047's TF check
+           is unreliable: the CPU clears TF before the single-step #DB is
+           delivered, so the check fails and the #DB is re-injected into the
+           guest.  Under the shared kernel CR3 that ran the host IDT's handler
+           in guest mode (a freeze/corruption vector); under the dedicated guest
+           CR3 the re-injection triple-faults (IDT unmapped).  The synthetic
+           guests have no hardware breakpoints, so unconditional consumption of
+           the rearm #DB is correct. */
+        if (vcpu->rearm_pending) {
             yghv_protect_rearm(vcpu);
             vcpu->vmcb->state.rflags &= ~0x100ULL;
             return 0;

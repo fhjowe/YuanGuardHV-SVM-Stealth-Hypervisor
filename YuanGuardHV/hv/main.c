@@ -3550,7 +3550,7 @@ static void yghv_watchdog_log(const char *line) {
     IO_STATUS_BLOCK iosb;
     HANDLE h;
     size_t len = 0;
-    char buf[640];
+    char buf[800];
 
     RtlInitUnicodeString(&name, L"\\SystemRoot\\yghv_watchdog.log");
     InitializeObjectAttributes(&oa, &name,
@@ -3581,10 +3581,11 @@ static void yghv_wd_hex(char *buf, size_t bufsz, size_t *off, uint64_t v) {
         buf[(*off)++] = hex[(v >> (i * 4)) & 0xF];
 }
 
-/* 9.152: minimal guest page table — map the guest code page at its kernel VA
-   via a dedicated CR3 so the guest does NOT share the host kernel CR3.  This
-   isolates the "guest uses host kernel address space" variable in the freeze
-   hunt (all other configs still froze: churn / core count / exit rate / C-state). */
+/* 9.152: dedicated guest CR3 — build a page table mapping a list of pages at
+   their kernel VAs (guest VA -> PA; the NPT identity map then PA -> PA).  The
+   guest runs in its OWN address space instead of sharing the host kernel CR3,
+   which is the freeze fix: every shared-CR3 configuration froze within 15-60 s,
+   while the dedicated-CR3 minimal guest ran 5+ min stable. */
 static npt_entry_t *yghv_guest_pt_alloc(void) {
     npt_entry_t *t = (npt_entry_t *)MmAllocateContiguousMemory(
         HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
@@ -3592,34 +3593,54 @@ static npt_entry_t *yghv_guest_pt_alloc(void) {
     return t;
 }
 
-static uint64_t yghv_build_min_guest_cr3(uint64_t code_va) {
-    npt_entry_t *pml4, *pdpt, *pd, *pt;
-    uint64_t code_pa;
-    uint32_t p4, p2, p1, p0;
+static uint64_t yghv_build_guest_cr3(uint64_t *vas, ULONG count) {
+    npt_entry_t *pml4 = NULL, *pdpt = NULL, *pd = NULL, *pt = NULL;
+    uint64_t pml4_pa = 0;
+    ULONG i;
 
-    code_pa = MmGetPhysicalAddress((PVOID)code_va).QuadPart;
-    if (!code_pa) return 0;
-    p4 = (uint32_t)((code_va >> 39) & 0x1FF);
-    p2 = (uint32_t)((code_va >> 30) & 0x1FF);
-    p1 = (uint32_t)((code_va >> 21) & 0x1FF);
-    p0 = (uint32_t)((code_va >> 12) & 0x1FF);
+    for (i = 0; i < count; i++) {
+        uint64_t va = vas[i] & ~(uint64_t)0xFFF;
+        uint64_t pa = MmGetPhysicalAddress((PVOID)va).QuadPart;
+        uint32_t p4, p2, p1, p0;
+        if (!pa)
+            return 0;
+        p4 = (uint32_t)((va >> 39) & 0x1FF);
+        p2 = (uint32_t)((va >> 30) & 0x1FF);
+        p1 = (uint32_t)((va >> 21) & 0x1FF);
+        p0 = (uint32_t)((va >> 12) & 0x1FF);
 
-    pml4 = yghv_guest_pt_alloc();
-    pdpt = yghv_guest_pt_alloc();
-    pd   = yghv_guest_pt_alloc();
-    pt   = yghv_guest_pt_alloc();
-    if (!pml4 || !pdpt || !pd || !pt) {
-        if (pml4) MmFreeContiguousMemory(pml4);
-        if (pdpt) MmFreeContiguousMemory(pdpt);
-        if (pd)   MmFreeContiguousMemory(pd);
-        if (pt)   MmFreeContiguousMemory(pt);
-        return 0;
+        if (!pml4) {
+            pml4 = yghv_guest_pt_alloc();
+            if (!pml4) return 0;
+            pml4_pa = MmGetPhysicalAddress(pml4).QuadPart;
+        }
+        if (!(pml4[p4].all & 1)) {
+            pdpt = yghv_guest_pt_alloc();
+            if (!pdpt) return 0;
+            pml4[p4].all = MmGetPhysicalAddress(pdpt).QuadPart | 0x3;
+        } else {
+            pdpt = (npt_entry_t *)MmGetVirtualForPhysical(
+                (PHYSICAL_ADDRESS){ .QuadPart = pml4[p4].all & ~0xFFFULL });
+        }
+        if (!(pdpt[p2].all & 1)) {
+            pd = yghv_guest_pt_alloc();
+            if (!pd) return 0;
+            pdpt[p2].all = MmGetPhysicalAddress(pd).QuadPart | 0x3;
+        } else {
+            pd = (npt_entry_t *)MmGetVirtualForPhysical(
+                (PHYSICAL_ADDRESS){ .QuadPart = pdpt[p2].all & ~0xFFFULL });
+        }
+        if (!(pd[p1].all & 1)) {
+            pt = yghv_guest_pt_alloc();
+            if (!pt) return 0;
+            pd[p1].all = MmGetPhysicalAddress(pt).QuadPart | 0x3;
+        } else {
+            pt = (npt_entry_t *)MmGetVirtualForPhysical(
+                (PHYSICAL_ADDRESS){ .QuadPart = pd[p1].all & ~0xFFFULL });
+        }
+        pt[p0].all = pa | 0x3;   /* present|writable, no NX (code pages runnable) */
     }
-    pml4[p4].all = MmGetPhysicalAddress(pdpt).QuadPart | 0x3; /* present|writable */
-    pdpt[p2].all = MmGetPhysicalAddress(pd).QuadPart | 0x3;
-    pd[p1].all   = MmGetPhysicalAddress(pt).QuadPart | 0x3;
-    pt[p0].all   = code_pa | 0x3;                             /* present|writable, no NX */
-    return MmGetPhysicalAddress(pml4).QuadPart;
+    return pml4_pa;
 }
 
 /* 9.141 freeze watchdog: a host-side observer that logs the per-core resident
@@ -3631,7 +3652,7 @@ static uint64_t yghv_build_min_guest_cr3(uint64_t code_va) {
 static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
     LARGE_INTEGER delay;
     LARGE_INTEGER tick;
-    char line[640];
+    char line[800];
     size_t off;
     ULONG n, i;
     (void)ctx;
@@ -3661,6 +3682,13 @@ static VOID yghv_freeze_watchdog_thread(PVOID ctx) {
             if (i) line[off++] = ',';
             yghv_wd_hex(line, sizeof(line), &off,
                 g_vcpus[i] ? (uint64_t)(LONG)g_vcpus[i]->resident_state : 0xEE);
+        }
+        /* per-core last VMEXIT code (0x3E8 = SHUTDOWN, 0x1E0 = NPF, etc.) */
+        line[off++] = ' '; line[off++] = 'x'; line[off++] = '=';
+        for (i = 0; i < n; i++) {
+            if (i) line[off++] = ',';
+            yghv_wd_hex(line, sizeof(line), &off,
+                g_vcpus[i] ? g_vcpus[i]->last_exitcode : 0xEE);
         }
         line[off] = 0;
         yghv_watchdog_log(line);
@@ -3711,6 +3739,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     (void)d;(void)r;
     int sv;
     void *npt_test_buf = NULL;
+    uint64_t guest_cr3 = 0;
     ULONG i;
     ULONG online;
 
@@ -4164,35 +4193,51 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
     KeIpiGenericCall(svm_core_ipi_prepare_vcpu, 0);
     svm_core_prepare_vcpu_other(0);
-    /* 9.152: minimal-guest freeze isolation — dedicated CR3 mapping only the
-       guest code page, so the guests no longer share the host kernel CR3. */
-    uint64_t min_cr3 = yghv_build_min_guest_cr3((uint64_t)svm_trampoline_test_guest);
+    /* 9.152: dedicated guest CR3 — map every page the persistent guests touch
+       (workload code, heartbeat code, hook dummy, generated stub, g_protect,
+       workload page) so the guests run in their own address space instead of
+       sharing the host kernel CR3 (the freeze fix: shared-CR3 configs froze
+       15-60 s; dedicated-CR3 minimal guest ran 5+ min stable). */
+    {
+        /* The guest needs its own stack pages mapped too (RSP = host_stack_top;
+           the workload guest's `call rsi` pushes onto it). */
+        uint64_t gv[24];
+        ULONG gvc = 0;
+        ULONG j;
+        gv[gvc++] = (uint64_t)svm_trampoline_test_resident_guest;
+        gv[gvc++] = (uint64_t)svm_trampoline_test_guest;
+        gv[gvc++] = (uint64_t)yghv_hook_test_dummy;
+        gv[gvc++] = yghv_protect_get_hook_stub_va(0);
+        /* g_protect spans ~6.3 KB (targets[4] + config) — map BOTH pages; the
+           stub reads targets[3].cr3 and config.deny_status in the 2nd page,
+           and an unmapped page would NPF -> guest #PF -> triple fault. */
+        gv[gvc++] = (uint64_t)&g_protect;
+        gv[gvc++] = (uint64_t)((uint8_t *)&g_protect + 0x1000);
+        gv[gvc++] = (uint64_t)g_resident_workload_page;
+        for (j = 0; j < online && j < SVM_MAX_CORES; j++) {
+            if (g_vcpus[j] && g_vcpus[j]->host_stack)
+                gv[gvc++] = (uint64_t)g_vcpus[j]->host_stack;
+        }
+        guest_cr3 = yghv_build_guest_cr3(gv, gvc);
+        if (!guest_cr3) {
+            LOG_ERROR("persistent: dedicated guest CR3 build failed, falling back");
+            guest_cr3 = g_protect.targets[0].cr3;
+        }
+    }
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
-#if YGHV_RESIDENT_WORKLOAD_TEST
-        if (i == 0) {
-            g_vcpus[i]->vmcb->state.rip =
-                (uint64_t)svm_trampoline_test_resident_guest;
-            g_vcpus[i]->regs.rdi = (uint64_t)g_resident_workload_page;
-            g_vcpus[i]->regs.rsi = (uint64_t)yghv_hook_test_dummy;
-        } else {
-            g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
-            g_vcpus[i]->regs.rdi = 0;
-            g_vcpus[i]->regs.rsi = 0;
-        }
-        g_vcpus[i]->vmcb->state.cr3 = g_protect.targets[0].cr3;
-#else
-        g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
-#endif
-        /* 9.152: override — pure heartbeat guest (no memory access beyond its
-           own code) under a dedicated CR3; isolates the host-kernel-CR3
-           sharing variable in the freeze hunt. */
+        /* 9.152: all persistent guests run the pure heartbeat under the
+           dedicated guest CR3 — the stable, freeze-free configuration
+           (shared-CR3 configs froze 15-60 s; this ran 5+ min stable).  The
+           full workload guest (NPF/rearm demonstration) triple-faults under
+           the dedicated CR3 (HEARTBEAT zeroes rdi/rsi because the dedicated
+           CR3 is not a target CR3, and the workload write path faults) — a
+           follow-up to restore the runtime NPF demonstration. */
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
         g_vcpus[i]->regs.rdi = 0;
         g_vcpus[i]->regs.rsi = 0;
-        g_vcpus[i]->vmcb->state.cr3 =
-            min_cr3 ? min_cr3 : g_protect.targets[0].cr3;
+        g_vcpus[i]->vmcb->state.cr3 = guest_cr3;   /* dedicated guest CR3 (9.152) */
         sv = svm_core_set_npt(i, g_npt.pml4_pa);
         if (sv) {
             LOG_ERROR("persistent vcpu prepare core %u failed 0x%x", i, sv);

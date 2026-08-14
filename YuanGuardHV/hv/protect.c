@@ -1422,3 +1422,11 @@ uint64_t yghv_protect_find_func_pattern(PCWSTR name_hint, uint8_t *pat, SIZE_T p
     RtlInitUnicodeString(&name, name_hint);
     return (uint64_t)MmGetSystemRoutineAddress(&name);
 }
+
+/* 9.152: expose the generated stub page VA so main.c can map it into the
+   dedicated guest CR3 (the guest calls the hooked dummy -> jumps to the stub). */
+uint64_t yghv_protect_get_hook_stub_va(uint8_t hook_id) {
+    if (hook_id >= YGHV_PROTECT_MAX_HOOKS)
+        return 0;
+    return (uint64_t)g_hook_stub_pages[hook_id];
+}

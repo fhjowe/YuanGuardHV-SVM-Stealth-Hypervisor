@@ -131,6 +131,7 @@ NTSTATUS yghv_protect_install_hook(uint8_t hook_id, uint64_t func_va);
 NTSTATUS yghv_protect_remove_hook(uint8_t hook_id);
 uint64_t yghv_protect_on_hook_query(uint8_t hook_id, uint64_t accessor_cr3);
 uint64_t yghv_protect_find_func_pattern(PCWSTR name_hint, uint8_t *pat, SIZE_T pat_len);
+uint64_t yghv_protect_get_hook_stub_va(uint8_t hook_id);
 yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa);
 void yghv_protect_rearm(svm_vcpu_t *vcpu);
 void yghv_protect_get_state(ULONG *active, ULONG *pid, ULONG *page_count);

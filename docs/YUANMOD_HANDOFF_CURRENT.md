@@ -2466,3 +2466,28 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   hook dummy + stub 页 + g_protect + workload 页），恢复完整功能（NPF/rearm +
   stub 调用）并测试是否仍稳定。若稳定 → 冻结问题彻底解决。
 - 提交：main.c 独立 CR3 构建 + 本记录。
+
+### 9.153 2026-08-14 冻结修复完成：独立 guest CR3 + 纯心跳持久（稳定验证通过）
+
+- **最终配置**（承 9.152）：persistent **全部 12 核**用独立 guest CR3（映射
+  guest 代码/心跳代码/hook dummy/stub/g_protect 两页/workload 页/各核栈页）
+  + **纯心跳 guest**（rdi=rsi=0，不再共享宿主内核 CR3）。构建 SHA
+  `D6F0A6DD...`（归档 `D:\aaaaaavm\yuanguard_hv_freezefix_20260814.sys`）。
+- **验证**：2 次 selftest PASS + 90s 持续负载，12 核全 ACTIVE（x=0x81 VMMCALL、
+  退出计数持续增长），干净卸载，无蓝屏。与此前所有共享 CR3 配置（15-60s 必
+  冻结）形成鲜明对比。
+- **根因总结**：冻结 = guest 共享宿主内核 CR3 导致 guest TLB 活动与宿主 TLB
+  冲突 → 本机 CPU 全核锁死。**修复 = 独立 guest 地址空间。** 附带发现：共享
+  CR3 下重注入的异常（如 workload 写后的 #DB）被宿主 IDT 在 guest 模式
+  "处理"——宿主异常处理程序在 guest 模式运行（GIF=0）是另一条锁死/损坏途径；
+  独立 CR3 下重注入直接三重重置（安全失败）。**REV-047 已回退**（#DB 在
+  rearm_pending 时无条件消费——CPU 在单步 #DB 前清 TF，原 TF 检查导致重注入）。
+- **遗留（后续项）**：full workload guest（NPF/rearm 演示）在独立 CR3 下
+  c0 三重重置（HEARTBEAT 因独立 CR3 非目标 CR3 清零 rdi/rsi + workload 写
+  路径故障），需后续修复 runtime NPF 演示；当前持久模式为纯心跳（保护功能
+  仍有效，只是合成 guest 不再每轮演示写保护）。
+- **新增诊断**：看门狗现含每核 last_exitcode（x= 列表，0x81=VMMCALL、
+  0x7F=SHUTDOWN、0x400=NPF）；缓冲加大到 800。
+- **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED。
+- 提交：svm_vcpu.h / vmexit.c / vmmcall.c / protect.c / protect.h / main.c +
+  本记录。
