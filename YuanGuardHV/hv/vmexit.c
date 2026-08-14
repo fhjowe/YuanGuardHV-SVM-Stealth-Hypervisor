@@ -642,6 +642,37 @@ static int svm_handle_msr(svm_vcpu_t *vcpu) {
         return 0;
     }
 
+    /* 9.174: virtualize MSR_GS_BASE / MSR_KERNEL_GS_BASE.  The guest's GS
+       state lives ONLY in the VMCB (svm_prepare_vcpu sets MSRPM read+write
+       intercept on both).  A guest wrmsr updates the VMCB state; a guest
+       rdmsr returns the VMCB state.  This keeps the guest's GS base isolated
+       from the physical MSR the host uses between VMEXITs — without it the
+       guest's context-switch wrmsr pollutes the host GS base (and VMEXIT
+       VMSAVE/VMLOAD fights over it), which the 9.165-9.170 dumps implicated
+       in the OS-as-guest freeze. */
+    if (msr == 0xC0000101u) {   /* MSR_GS_BASE */
+        if (write) {
+            data = (vcpu->regs.rdx << 32) | vcpu->regs.rax;
+            vcpu->vmcb->state.gs_base = data;
+        } else {
+            data = vcpu->vmcb->state.gs_base;
+            vcpu->regs.rax = (uint32_t)data;
+            vcpu->regs.rdx = (uint32_t)(data >> 32);
+        }
+        return 0;
+    }
+    if (msr == 0xC0000102u) {   /* MSR_KERNEL_GS_BASE */
+        if (write) {
+            data = (vcpu->regs.rdx << 32) | vcpu->regs.rax;
+            vcpu->vmcb->state.kernel_gs_base = data;
+        } else {
+            data = vcpu->vmcb->state.kernel_gs_base;
+            vcpu->regs.rax = (uint32_t)data;
+            vcpu->regs.rdx = (uint32_t)(data >> 32);
+        }
+        return 0;
+    }
+
     if (write)
         return 0; /* REV-008: drop guest writes to un-emulated MSRs without
                      clobbering guest RAX/RDX with a host read value */

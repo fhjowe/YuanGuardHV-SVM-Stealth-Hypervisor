@@ -335,6 +335,26 @@ void svm_prepare_vcpu(svm_vcpu_t *vcpu, uint64_t guest_rip) {
         uint32_t vmcr_bit = (vmcr_delta & 3u) * 2u;
         msrpm[vmcr_byte] |= (uint8_t)(0x3u << vmcr_bit);
     }
+    /* 9.174: intercept guest rdmsr/wrmsr of MSR_GS_BASE (0xC0000101) and
+       MSR_KERNEL_GS_BASE (0xC0000102).  Windows context switch saves/restores
+       per-CPU GS state via these MSRs; without interception the guest's wrmsr
+       writes straight through to the PHYSICAL MSR, polluting the host's GS
+       state (and vice versa on VMEXIT).  By intercepting and updating the VMCB
+       state (svm_handle_msr) the guest's GS/KERNEL_GS base lives entirely in
+       the VMCB, isolated from the host — the standard KVM approach, and the
+       missing half of the 9.168 GS-base virtualization plan (selector mirroring
+       was 9.170).  swapgs cannot be intercepted on SVM, but wrmsr can. */
+    {
+        uint8_t *msrpm = (uint8_t *)vcpu->msrpm;
+        uint32_t i;
+        for (i = 0; i < 2; i++) {
+            uint32_t msr = 0xC0000101u + i;   /* GS_BASE, KERNEL_GS_BASE */
+            uint32_t delta = msr - 0xC0000000u;
+            uint32_t byte = (delta / 4u) + 1u * 2048u;  /* 0xC0000000 bank */
+            uint32_t bit = (delta & 3u) * 2u;
+            msrpm[byte] |= (uint8_t)(0x3u << bit);       /* read+write */
+        }
+    }
 
     /* NPT disabled for minimal test */
     ctrl->np_enable = 0;

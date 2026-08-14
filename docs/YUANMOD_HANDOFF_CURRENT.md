@@ -2950,3 +2950,28 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   需换平台或接硬件调试器观测（errata 无 fix）。
 - **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.174 2026-08-14 GS base MSR 虚拟化 + step23 组合实测负结果——TLB/GS/TSS/中断层穷尽
+
+- **GS base MSR 虚拟化（9.168 方案缺失一半）**：svm_prepare_vcpu 在 MSRPM 拦截
+  MSR_GS_BASE(0xC0000101)/KERNEL_GS_BASE(0xC0000102) 读写；svm_handle_msr 模拟
+  （写→更新 VMCB state，读→返回 VMCB state）。目的：guest 的 GS 状态完全活在
+  VMCB，不污染物理 MSR（KVM 标准做法）。构建 PASS。
+- **step17 + GS MSR 虚拟化实测**：仍 <5s 硬冻结。
+- **step23（阻塞常驻 + INTR/NMI 拦截 + 宿主 ISR + 全部修复：GS selector/TSS
+  隔离/GS MSR 虚拟化/ASID 卫生 FLUSH_ALL）实测**：**仍 <5s 硬冻结**。
+- **决定性含义**：9.58 曾推断"排除 guest 调度器切换，主因是 IF=1 物理中断
+  投递"（所以 step20 加 INTR/NMI 拦截 PASS）。但 **step23（阻塞+拦截+host ISR）
+  仍冻结** → 对**阻塞常驻**（guest 内真实 Windows 调度器上下文切换）而言，
+  **INTR/NMI 拦截 + host ISR 也不能解冻**（9.84 v95 旧代码同结论，现含全部新
+  修复仍同）。
+- **TLB/GS/TSS/中断层修复全部穷尽**：FLUSH_BY_ASID/FLUSH_ALL（9.160/9.172）、
+  GS selector（9.170）、TSS 隔离（9.171）、GS base MSR 虚拟化（9.174）、
+  INTR/NMI 拦截+host ISR（step23）、异常拦截/HLT（9.99-9.102）——全部无效。
+- **剩余唯一未测驱动级方向**：**拦截 guest 的 CR3 写**（cr_write_intercepts 开
+  CR3 位 + svm_handle_cr 模拟：进程切换的 CR3 更新走 VMEXIT，host 控制 CR3/TLB
+  刷新，而非裸直通硬件）。当前 cr_write_intercepts=0（svm_handle_cr 是 REV-009
+  fail-closed 骨架），guest 内 Windows 进程切换写 CR3 完全裸直通——这是最后一
+  个有理论依据的驱动级变量（KVM 也拦截 CR3 写）。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：svm_core.c / vmexit.c（GS base MSR 虚拟化）+ 本记录。
