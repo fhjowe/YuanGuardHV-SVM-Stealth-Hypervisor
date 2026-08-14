@@ -685,10 +685,66 @@ static int svm_handle_msr(svm_vcpu_t *vcpu) {
 }
 
 static int svm_handle_cr(svm_vcpu_t *vcpu) {
+    uint64_t exitcode = vcpu->vmcb->control.exitcode;
     vcpu->resident_cr_exits++;
-    /* REV-009: CR intercepts are not currently enabled; if they ever are, fail
-       closed (stop the resident loop) instead of silently dropping the access,
-       which would leave the guest CR state corrupt. */
-    LOG_ERROR("CR intercept not emulated (exit=0x%llx)", vcpu->vmcb->control.exitcode);
+
+    /* 9.175: emulate guest CR3 writes (mov cr3, r/m64).  OS-as-guest's guest
+       IS Windows, so process switch writes CR3 constantly; without an
+       intercept that CR3 write runs naked in guest mode and its TLB effect can
+       race the host — the last untested candidate for the whole-machine
+       freeze.  Decode the source register from the VMCB Decode-Assist
+       instruction bytes; guest GPRs were saved to vcpu->regs by the trampoline
+       before dispatch.  All other CR intercepts stay fail-closed (REV-009). */
+    if (exitcode == SVM_EXIT_CR3_WRITE) {
+        const uint8_t *ib = vcpu->vmcb->control.instruction_bytes;
+        uint8_t n = vcpu->vmcb->control.byte_fetched;
+        int i = 0;
+        int rex_b = 0;
+        uint8_t modrm, rm, reg;
+        uint64_t *slot;
+
+        if (n >= 3) {
+            /* skip REX prefix (0x40-0x4F); REX.B extends rm to r8-r15 */
+            while (i < n && (ib[i] & 0xF0) == 0x40) {
+                if (ib[i] & 0x02)
+                    rex_b = 1;
+                i++;
+            }
+            if (i + 2 < n && ib[i] == 0x0F && ib[i + 1] == 0x22) {
+                modrm = ib[i + 2];
+                reg = (modrm >> 3) & 7;
+                rm = modrm & 7;
+                if (reg == 3 /* CR3 */ && (modrm & 0xC0) == 0xC0) {
+                    switch (rm | (rex_b << 3)) {
+                        case 0x00: slot = &vcpu->regs.rax; break;
+                        case 0x01: slot = &vcpu->regs.rcx; break;
+                        case 0x02: slot = &vcpu->regs.rdx; break;
+                        case 0x03: slot = &vcpu->regs.rbx; break;
+                        case 0x05: slot = &vcpu->regs.rbp; break;
+                        case 0x06: slot = &vcpu->regs.rsi; break;
+                        case 0x07: slot = &vcpu->regs.rdi; break;
+                        case 0x08: slot = &vcpu->regs.r8;  break;
+                        case 0x09: slot = &vcpu->regs.r9;  break;
+                        case 0x0A: slot = &vcpu->regs.r10; break;
+                        case 0x0B: slot = &vcpu->regs.r11; break;
+                        case 0x0C: slot = &vcpu->regs.r12; break;
+                        case 0x0D: slot = &vcpu->regs.r13; break;
+                        case 0x0E: slot = &vcpu->regs.r14; break;
+                        case 0x0F: slot = &vcpu->regs.r15; break;
+                        default:
+                            LOG_ERROR("CR3 write src rm=%u unsupported", rm);
+                            return 1;
+                    }
+                    vcpu->vmcb->state.cr3 = *slot;
+                    yghv_trace_u64("os guest cr3 write", vcpu->vmcb->state.cr3);
+                    return 0;
+                }
+            }
+        }
+        LOG_ERROR("CR3 write not decoded (exit=0x%llx n=%u)", exitcode, n);
+        return 1;
+    }
+
+    LOG_ERROR("CR intercept not emulated (exit=0x%llx)", exitcode);
     return 1;
 }

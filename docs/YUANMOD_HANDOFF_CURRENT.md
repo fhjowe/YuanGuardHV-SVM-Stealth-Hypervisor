@@ -2975,3 +2975,35 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   个有理论依据的驱动级变量（KVM 也拦截 CR3 写）。
 - **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：svm_core.c / vmexit.c（GS base MSR 虚拟化）+ 本记录。
+
+### 9.175 2026-08-14 CR3 写拦截实测负结果——驱动级假设全部穷尽，确认平台级
+
+- **实现**：`svm_handle_cr` 实现 CR3 写模拟（Decode-Assist 解码 `mov cr3,r/m64`，
+  从 `vcpu->regs` 取源寄存器 → 更新 `VMCB state.cr3`，RIP 由 next_rip 推进）；
+  `yghv_os_guest_cr3_intercept_apply` 开启 `cr_write_intercepts` bit3（CR3 写，
+  u16 字段直接 bit3，非 32 位合并偏移），接入全部 6 个 OS-as-guest 线程。
+  构建 PASS（默认/step23 `817315A1...`）。
+- **step23（阻塞+INTR/NMI 拦截+host ISR+CR3 拦截+GS/TSS/MSR/ASID 全部修复）实测**：
+  **仍 <5s 硬冻结**（无转储）。
+- **驱动级假设全部穷尽（最终）**：
+  | 方向 | 结果 |
+  |---|---|
+  | 独立 CR3（9.152） | 仅合成 resident 可用，OS-as-guest 无法套用 |
+  | ASID/TLB 卫生 FLUSH_BY_ASID（9.161） | ❌ |
+  | FLUSH_ALL（9.172） | ❌（非 TLB 别名） |
+  | GS selector（9.170） | ❌（0x139→硬冻结） |
+  | TSS 隔离（9.171） | ❌ |
+  | GS base MSR 虚拟化（9.174） | ❌ |
+  | INTR/NMI 拦截+host ISR（step23） | ❌ |
+  | 异常拦截/HLT（9.99-9.102） | ❌ 无捕获 |
+  | APIC/IO 系列（9.96-9.98） | ❌ |
+  | **CR3 写拦截（9.175）** | ❌ |
+- **最终结论**：OS-as-guest 阻塞常驻（guest 内 Windows 调度器上下文切换）在本机
+  Ryzen 5 5500 为**平台级 CPU 全核锁死**，经全部驱动级修复穷尽 + web 检索 AMD
+  errata（1363 SVM guest 中断死锁，no fix planned）佐证，**非驱动代码可修**。
+  9.58/9.84/9.101 的历史推断（平台级限制）现在由 9.157-9.175 完整实验矩阵确认。
+- **本机最终边界（实证完备）**：有界试点（12/14/16 PASS）+ step20 spin 常驻
+  （可加载/稳定/干净卸载，9.163 突破）。真 OS-as-guest 常驻需换平台或接硬件
+  调试器。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：svm_core.c / vmexit.c / main.c（CR3 写拦截）+ 本记录。

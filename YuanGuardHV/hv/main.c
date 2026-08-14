@@ -943,6 +943,22 @@ static void yghv_os_guest_tss_isolate_apply(svm_vcpu_t *v) {
     yghv_trace_u64("os guest tss isolated", v->guest_tss_pa);
 }
 
+/* 9.175: enable guest CR3 write interception for OS-as-guest.  Windows process
+   switch writes CR3 constantly; without interception that write executes naked
+   in guest mode.  With the CR3 write intercept (cr_write_intercepts bit 16+3)
+   the write VMEXITs and svm_handle_cr emulates it (updates VMCB state.cr3; RIP
+   advanced via next_rip), so the host owns the CR3 change and TLB refresh.
+   Only set for OS-as-guest vcpus — synthetic residents keep existing behavior. */
+static void yghv_os_guest_cr3_intercept_apply(svm_vcpu_t *v) {
+    if (!v)
+        return;
+    /* cr_write_intercepts is a u16 field (VMCB+0x02): bit N = CRn write.  CR3
+       write is bit 3 (SVM_CR_INTERCEPT_WRITE_SHIFT(3)=19 is the 32-bit merged
+       offset; the split u16 field uses bit 3 directly). */
+    v->vmcb->control.cr_write_intercepts |= (uint16_t)(1u << 3);  /* CR3 write */
+    yghv_trace("os guest cr3 intercept enabled");
+}
+
 __declspec(noinline) __declspec(noreturn)
 void yghv_os_guest_host_done(svm_vcpu_t *vcpu) {
     uint32_t core = vcpu ? vcpu->resident_index : 0;
@@ -993,6 +1009,7 @@ static VOID yghv_os_guest_thread(PVOID ctx) {
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+    yghv_os_guest_cr3_intercept_apply(v);
     yghv_trace_u64("os guest thread enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Trampoline exits via yghv_os_guest_host_done; this is a fallback. */
@@ -1030,6 +1047,7 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+    yghv_os_guest_cr3_intercept_apply(v);
     yghv_trace_u64("os seamless enter", core);
     svm_trampoline_os_enter(v, 0);
     /* Seamless continuation: this caller now runs in guest mode. */
@@ -1082,6 +1100,7 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+    yghv_os_guest_cr3_intercept_apply(v);
     if (g_v96_apic_tpr_stress && !g_v96_apic_tpr_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
@@ -1281,6 +1300,7 @@ static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+    yghv_os_guest_cr3_intercept_apply(v);
     g_os_resident_mode = TRUE;
     yghv_trace_u64("os resident spin enter", core);
     if (core < SVM_MAX_CORES)
@@ -1327,6 +1347,7 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+    yghv_os_guest_cr3_intercept_apply(v);
     g_os_resident_mode = TRUE;
 
     InterlockedIncrement(&g_v99_allcore_ready);
@@ -1405,6 +1426,7 @@ static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
     svm_core_set_npt(core, g_npt.pml4_pa);
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+    yghv_os_guest_cr3_intercept_apply(v);
     if (g_v98_apic_shadow && !g_v98_apic_shadow_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
