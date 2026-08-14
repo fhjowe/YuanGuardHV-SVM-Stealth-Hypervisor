@@ -2445,3 +2445,24 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `D:\aaaaaavm\yuanguard_hv_151_20260814.sys`）。
 - **状态**：C 盘稳定默认版 `70888311`，电源已恢复（C 状态启用），服务 STOPPED。
 - 提交：main.c / svm_trampoline.S 回退 + 本记录。
+
+### 9.152 2026-08-14 突破：独立 guest CR3（不再共享宿主内核 CR3）→ 冻结消除（5+ 分钟稳定）
+
+- **实验**（承 9.149-9.151 结论，最后一个未隔离变量）：给 guest 构建**独立最小
+  页表**（仅映射 guest 代码页），persistent 全核改用**纯心跳 guest**
+  （rdi=rsi=0，无内存访问）+ 独立 CR3——不再共享宿主内核 CR3。
+- **结果（决定性）**：12 核 persistent 稳定运行 **5+ 分钟**（4 次 selftest +
+  持续负载 + 干净卸载 + 无蓝屏）。此前**所有共享宿主 CR3 的配置**（无论 churn/
+  核数/退出率/C 状态）都在 **15-60 秒内**冻结。看门狗全程 12 核 ACTIVE、
+  VMEXIT 持续增长（~1 亿次/核）。
+- **结论**：冻结根因是 **guest 共享宿主内核 CR3**——guest 的 TLB 活动（以 guest
+  ASID 标记的宿主内核地址空间翻译）与宿主 TLB 冲突，触发本机 CPU 锁死。
+  **独立 guest 地址空间是修复方向。** 这不是"平台无法修复"，而是驱动设计缺陷
+  （guest 不应共享宿主内核页表——本就有安全/隔离意义）。
+- **当前状态**：最小 guest 版（`B773F408`）已验证稳定 5 分钟，归档
+  `D:\aaaaaavm\yuanguard_hv_mincr3_20260814.sys`。C 盘恢复 `70888311`，
+  服务 STOPPED。
+- **下一步**：实现"完整版"——独立 CR3 映射 workload 所需全部页（guest 代码 +
+  hook dummy + stub 页 + g_protect + workload 页），恢复完整功能（NPF/rearm +
+  stub 调用）并测试是否仍稳定。若稳定 → 冻结问题彻底解决。
+- 提交：main.c 独立 CR3 构建 + 本记录。

@@ -3581,6 +3581,47 @@ static void yghv_wd_hex(char *buf, size_t bufsz, size_t *off, uint64_t v) {
         buf[(*off)++] = hex[(v >> (i * 4)) & 0xF];
 }
 
+/* 9.152: minimal guest page table — map the guest code page at its kernel VA
+   via a dedicated CR3 so the guest does NOT share the host kernel CR3.  This
+   isolates the "guest uses host kernel address space" variable in the freeze
+   hunt (all other configs still froze: churn / core count / exit rate / C-state). */
+static npt_entry_t *yghv_guest_pt_alloc(void) {
+    npt_entry_t *t = (npt_entry_t *)MmAllocateContiguousMemory(
+        HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (t) RtlZeroMemory(t, HV_PAGE_SIZE);
+    return t;
+}
+
+static uint64_t yghv_build_min_guest_cr3(uint64_t code_va) {
+    npt_entry_t *pml4, *pdpt, *pd, *pt;
+    uint64_t code_pa;
+    uint32_t p4, p2, p1, p0;
+
+    code_pa = MmGetPhysicalAddress((PVOID)code_va).QuadPart;
+    if (!code_pa) return 0;
+    p4 = (uint32_t)((code_va >> 39) & 0x1FF);
+    p2 = (uint32_t)((code_va >> 30) & 0x1FF);
+    p1 = (uint32_t)((code_va >> 21) & 0x1FF);
+    p0 = (uint32_t)((code_va >> 12) & 0x1FF);
+
+    pml4 = yghv_guest_pt_alloc();
+    pdpt = yghv_guest_pt_alloc();
+    pd   = yghv_guest_pt_alloc();
+    pt   = yghv_guest_pt_alloc();
+    if (!pml4 || !pdpt || !pd || !pt) {
+        if (pml4) MmFreeContiguousMemory(pml4);
+        if (pdpt) MmFreeContiguousMemory(pdpt);
+        if (pd)   MmFreeContiguousMemory(pd);
+        if (pt)   MmFreeContiguousMemory(pt);
+        return 0;
+    }
+    pml4[p4].all = MmGetPhysicalAddress(pdpt).QuadPart | 0x3; /* present|writable */
+    pdpt[p2].all = MmGetPhysicalAddress(pd).QuadPart | 0x3;
+    pd[p1].all   = MmGetPhysicalAddress(pt).QuadPart | 0x3;
+    pt[p0].all   = code_pa | 0x3;                             /* present|writable, no NX */
+    return MmGetPhysicalAddress(pml4).QuadPart;
+}
+
 /* 9.141 freeze watchdog: a host-side observer that logs the per-core resident
    VMEXIT counts every 5 s while the driver is loaded.  On a hard freeze the
    last marker tells us whether host code was still running (markers continue
@@ -4123,6 +4164,9 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
     KeIpiGenericCall(svm_core_ipi_prepare_vcpu, 0);
     svm_core_prepare_vcpu_other(0);
+    /* 9.152: minimal-guest freeze isolation — dedicated CR3 mapping only the
+       guest code page, so the guests no longer share the host kernel CR3. */
+    uint64_t min_cr3 = yghv_build_min_guest_cr3((uint64_t)svm_trampoline_test_guest);
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
@@ -4141,6 +4185,14 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
 #else
         g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
 #endif
+        /* 9.152: override — pure heartbeat guest (no memory access beyond its
+           own code) under a dedicated CR3; isolates the host-kernel-CR3
+           sharing variable in the freeze hunt. */
+        g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
+        g_vcpus[i]->regs.rdi = 0;
+        g_vcpus[i]->regs.rsi = 0;
+        g_vcpus[i]->vmcb->state.cr3 =
+            min_cr3 ? min_cr3 : g_protect.targets[0].cr3;
         sv = svm_core_set_npt(i, g_npt.pml4_pa);
         if (sv) {
             LOG_ERROR("persistent vcpu prepare core %u failed 0x%x", i, sv);
