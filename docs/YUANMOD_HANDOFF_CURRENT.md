@@ -2507,3 +2507,21 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   本版含诊断增强）。验证：selftest PASS + c0 ACTIVE + 干净卸载。
 - **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED。
 - 提交：main.c 稳定配置 + 诊断增强（svm_vcpu.h/vmexit.c/main.c）+ 本记录。
+
+### 9.155 2026-08-14 完整修复：hook 调用链根因 = host_stack 只映射 1/4 页（全部解决）
+
+- **根因（最终）**：`svm_alloc_vcpu` 的 `host_stack` 是 **SVM_HOST_STACK_PAGES(4) 页**
+  （16KB），guest RSP = `host_stack + 4*0x1000 - 8`（**第 4 页**）；独立 guest CR3
+  只映射了**第 1 页** → guest 任何函数调用（`call rsi` 压栈到第 4 页）→ NPF →
+  guest #PF → IDT 未映射 → 三重重置。这解释了 hook 调用与普通函数调用都故障，
+  而写/心跳（不用栈）正常。
+- **修复**：guest CR3 映射每 vcpu 的**全部 4 页 host_stack**（gv[] 加大到 64）。
+- **验证（完整修复，SHA `331CB43F...`，归档
+  `D:\aaaaaavm\yuanguard_hv_completefix_20260814.sys`）**：
+  - c0 完整 workload guest（写 + NPF/rearm + **hook 调用**）→ **12 核全 ACTIVE**。
+  - selftest PASS + 60s 持续负载，c0 ~2700 万 VMEXIT，无蓝屏。
+- **最终状态**：**冻结已解决（独立 guest CR3）+ 完整功能已恢复（hook 调用正常）**。
+  HEAD = 独立 guest CR3 + 完整 workload（含 hook 演示），SHA `331CB43F`。
+- **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED。
+- 提交：main.c（完整 4 页栈映射 + 恢复完整 workload guest + plain_fn 测试函数
+  移除待定）+ 本记录。

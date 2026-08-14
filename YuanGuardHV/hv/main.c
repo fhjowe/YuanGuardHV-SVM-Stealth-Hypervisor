@@ -4219,9 +4219,11 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
        sharing the host kernel CR3 (the freeze fix: shared-CR3 configs froze
        15-60 s; dedicated-CR3 minimal guest ran 5+ min stable). */
     {
-        /* The guest needs its own stack pages mapped too (RSP = host_stack_top;
-           the workload guest's `call rsi` pushes onto it). */
-        uint64_t gv[24];
+        /* The guest needs its FULL stack region mapped — host_stack is
+           SVM_HOST_STACK_PAGES (4) pages and guest RSP starts at
+           host_stack + 4*HV_PAGE_SIZE - 8 (the 4th page); mapping only the
+           first page made any guest CALL (stack push) NPF -> triple fault. */
+        uint64_t gv[64];
         ULONG gvc = 0;
         ULONG j;
         gv[gvc++] = (uint64_t)svm_trampoline_test_resident_guest;
@@ -4235,8 +4237,12 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         gv[gvc++] = (uint64_t)((uint8_t *)&g_protect + 0x1000);
         gv[gvc++] = (uint64_t)g_resident_workload_page;
         for (j = 0; j < online && j < SVM_MAX_CORES; j++) {
-            if (g_vcpus[j] && g_vcpus[j]->host_stack)
-                gv[gvc++] = (uint64_t)g_vcpus[j]->host_stack;
+            if (g_vcpus[j] && g_vcpus[j]->host_stack) {
+                uint64_t hs = (uint64_t)g_vcpus[j]->host_stack;
+                ULONG k;
+                for (k = 0; k < SVM_HOST_STACK_PAGES; k++)
+                    gv[gvc++] = hs + k * HV_PAGE_SIZE;
+            }
         }
         guest_cr3 = yghv_build_guest_cr3(gv, gvc);
         if (!guest_cr3) {
@@ -4247,15 +4253,19 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     for (i = 0; i < online; i++) {
         if (!g_vcpus[i]) continue;
         g_vcpus[i]->regs.rcx = g_vmmcall_auth_cookie;
-        /* 9.152/9.153: all persistent guests run the pure heartbeat under the
-           dedicated guest CR3 — the stable, freeze-free configuration.  The
-           full workload hook-call (guest -> hooked dummy -> stub) triple-faults
-           under the dedicated CR3 (unresolved mapping in the hook-call chain;
-           the workload WRITE alone is fine, verified 9.153) — a follow-up to
-           restore the runtime NPF/hook demonstration. */
-        g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
-        g_vcpus[i]->regs.rdi = 0;
-        g_vcpus[i]->regs.rsi = 0;
+        /* 9.154: c0 runs the FULL workload guest (write + hooked-call) under the
+           dedicated CR3 — with the full host_stack (4 pages) now mapped, the
+           guest's call+ret should work.  c1-c11 stay pure heartbeat. */
+        if (i == 0) {
+            g_vcpus[i]->vmcb->state.rip =
+                (uint64_t)svm_trampoline_test_resident_guest;
+            g_vcpus[i]->regs.rdi = (uint64_t)g_resident_workload_page;
+            g_vcpus[i]->regs.rsi = (uint64_t)yghv_hook_test_dummy;
+        } else {
+            g_vcpus[i]->vmcb->state.rip = g_guest_hb_va;
+            g_vcpus[i]->regs.rdi = 0;
+            g_vcpus[i]->regs.rsi = 0;
+        }
         g_vcpus[i]->vmcb->state.cr3 = guest_cr3;   /* dedicated guest CR3 (9.152) */
         sv = svm_core_set_npt(i, g_npt.pml4_pa);
         if (sv) {
