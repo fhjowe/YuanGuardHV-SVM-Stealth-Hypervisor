@@ -2525,3 +2525,25 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED。
 - 提交：main.c（完整 4 页栈映射 + 恢复完整 workload guest + plain_fn 测试函数
   移除待定）+ 本记录。
+
+### 9.156 2026-08-14 会话收尾：最终状态 + OS-as-guest 结论 + 仓库清理（新窗口衔接）
+
+- **最终 HEAD**：`8424a6d`（驱动二进制 SHA `7EBA6044` = 独立 guest CR3 + 完整
+  workload 功能；清理死代码后重建 `2E79F4C4`，归档
+  `D:\aaaaaavm\yuanguard_hv_completefix_final_20260814.sys`）。工作区干净。
+- **已解决**：
+  - 冻结根因 = guest 共享宿主内核 CR3（TLB 冲突→CPU 锁死）→ 独立 guest CR3；
+  - hook 调用三重重置根因 = host_stack 只映射 1/4 页 → 映射全部 4 页；
+  - 看门狗 join 蓝屏 0xA（句柄当对象指针）→ ObReferenceObjectByHandle；
+  - 看门狗空日志（行长/边界越界）→ 缓冲 1600 + `off+18 > bufsz-1`。
+- **OS-as-guest 结论**：本机不建议直接全核 OS-as-guest——它是本机最重的 SVM
+  负载，冻结风险高；OS-as-guest 原本用 guest 自己的 CR3（非我们修的共享 CR3
+  机制），其历史冻结（9.84-9.102：0x139×2、v102 全异常+HLT 阴性）是另一个
+  平台级机制。独立 CR3 + 完整栈映射 + 全核看门狗是重开 OS-as-guest 的良好
+  基础，应**换平台**继续（本机仅维持合成 resident 形态）。
+- **仓库清理**：删除未编译的死代码（`hv/pool/*`、`hv/test_*.c`、
+  `hv/min_drv.c`、`hv/stub.c`）——均不在 build.bat 编译列表、无编译源引用，
+  git 历史可找回。构建验证通过（`2E79F4C4`）。
+- **状态**：C 盘稳定默认版 `70888311`，电源已恢复（IDLEDISABLE=0），服务
+  STOPPED。看门狗日志 `C:\Windows\yghv_watchdog.log` 为诊断产物。
+- 提交：死代码清理 + 本记录。
