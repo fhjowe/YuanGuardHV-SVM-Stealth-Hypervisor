@@ -74,6 +74,15 @@ volatile BOOLEAN g_os_guest_delay_quiet = FALSE;
    aliasing behind the 9.152 shared-CR3 freeze can be avoided for OS-as-guest
    (which cannot use a dedicated minimal guest CR3). */
 volatile BOOLEAN g_os_guest_tlb_hygiene = TRUE;
+/* 9.172: FLUSH_ALL variant of TLB hygiene.  When TRUE (and tlb_hygiene TRUE),
+   every OS-as-guest VMRUN requests a FULL TLB flush (tlb_control=2) instead of
+   FLUSH_BY_ASID (1).  Rationale: the 9.152 shared-CR3 freeze was judged to be
+   guest TLB (guest ASID) coexisting with host TLB (ASID 0) for the same
+   VA->PA; FLUSH_BY_ASID only clears guest entries, leaving host ASID 0 entries
+   behind.  FLUSH_ALL clears the whole TLB (host included) before the guest
+   runs, so guest TLB never coexists with host entries — the last untested
+   TLB-level variable for the OS-as-guest resident freeze. */
+volatile BOOLEAN g_os_guest_tlb_flush_all = TRUE;
 /* 9.162: clean-unload for OS-as-guest resident (fixes 0xCE).  When
    g_os_guest_stop_requested is set, svm_dispatch_exit returns 1 so the
    trampoline's jnz host_done terminates the guest thread on its next VMEXIT
@@ -905,7 +914,9 @@ static void yghv_os_guest_tlb_hygiene_apply(svm_vcpu_t *v, uint32_t core) {
     if (!v || !g_os_guest_tlb_hygiene)
         return;
     v->vmcb->control.guest_asid = core + 1;   /* per-core unique; host keeps 0 */
-    v->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;  /* FLUSH_BY_ASID */
+    v->vmcb->control.tlb_control = g_os_guest_tlb_flush_all
+                                       ? SVM_TLB_CONTROL_FLUSH_ALL  /* 2 */
+                                       : SVM_TLB_CONTROL_FLUSH;     /* 1 */
 }
 
 /* 9.171: give OS-as-guest a DEDICATED TSS so the guest Windows context switch

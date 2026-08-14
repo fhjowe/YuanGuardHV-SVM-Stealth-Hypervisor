@@ -130,8 +130,16 @@ typedef signed int         int32_t;
 #define VMCB_CLEAN_LBR         (1 << 10)
 #define VMCB_CLEAN_AVIC        (1 << 11)
 
-/* VMCB TLB control values */
-#define SVM_TLB_CONTROL_FLUSH  1ULL
+/* VMCB TLB control values (AMD APM Vol.2, TLB_CONTROL field at VMCB+0x5C):
+   0 = do nothing, 1 = flush guest TLB by ASID, 2 = flush ENTIRE TLB
+   (including host ASID 0 entries), 3 = flush non-global entries.
+   9.172: FLUSH_ALL is the last untested TLB variable for the OS-as-guest
+   freeze — if the freeze is "same VA->PA present under both guest ASID and
+   host ASID 0" (the 9.152 shared-CR3 conclusion), flushing the whole TLB on
+   every VMRUN removes the host entries so the guest TLB never coexists with
+   them. */
+#define SVM_TLB_CONTROL_FLUSH     1ULL   /* FLUSH_BY_ASID */
+#define SVM_TLB_CONTROL_FLUSH_ALL 2ULL   /* FLUSH entire TLB */
 
 /* SVM Exit codes */
 #define SVM_EXIT_CR0_READ         0x00

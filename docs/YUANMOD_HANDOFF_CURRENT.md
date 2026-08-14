@@ -2903,3 +2903,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   结论，本机维持有界试点 + step20 spin 常驻形态。
 - **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：svm_core.c / svm_vcpu.h / main.c（TSS 隔离）+ 本记录。
+
+### 9.172 2026-08-14 FLUSH_ALL 变体实机负结果——TLB 级假设穷尽，冻结非 TLB 别名
+
+- **背景**：用户坚持本机运行 OS-as-guest，继续钻研。web 检索 AMD SVM TLB_CONTROL
+  语义（AMD APM 33047）：`0`=不刷、`1`=FLUSH_BY_ASID、`2`=FLUSH_ALL（刷整 TLB 含
+  host ASID 0）、`3`=刷非全局。此前 ASID 卫生用 `tlb_control=1`（FLUSH_BY_ASID），
+  **只刷 guest ASID，host ASID 0 条目保留**。
+- **新假设**：若 9.152 冻结确为"guest TLB（guest ASID）与 host TLB（ASID 0）同
+  VA→PA 并存"，则 **FLUSH_ALL（=2，每次 VMRUN 刷整 TLB）** 应消除并存。
+- **实现**：`svm_defs.h` 加 `SVM_TLB_CONTROL_FLUSH_ALL`；main.c 加
+  `g_os_guest_tlb_flush_all`（默认 TRUE）；`yghv_os_guest_tlb_hygiene_apply`
+  在 flush_all 时用 `tlb_control=2`。构建 PASS（默认/step17 `2C10CC45...`）。
+- **step17 实测**：**仍 <5s 硬冻结**（无转储）→ **FLUSH_ALL 未消除冻结**。
+- **重要推论（推翻 9.152 简单解读）**：若冻结是"guest/host TLB 条目并存"，全刷
+  TLB 应消除——未消除说明**冻结不是 TLB 别名**，而是更深机制（可能 guest 内
+  Windows 调度器上下文切换路径触发的 CPU 级行为，如中断/锁交互死锁、或 NPT
+  页表遍历在 guest 态的真实 Windows 内存活动的未知交互）。
+- **TLB 级假设穷尽**：FLUSH_BY_ASID（9.160-9.161）、FLUSH_ALL（9.172）均无效。
+- **状态**：重启后 C 盘恢复稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：svm_defs.h / main.c（FLUSH_ALL 变体）+ 本记录。
