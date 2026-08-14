@@ -2336,3 +2336,22 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   线程的语义与 persistent 启动前 vcpu 状态需进一步按核诊断（独立问题）。
 - 状态：C 盘稳定默认版 `70888311`，服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.145 2026-08-14 多核 persistent 修复尝试→本机挂起→回退（关键结论）
+
+- **尝试**：为修 9.143 的"单核 persistent"，在 start_persistent_residents 前加
+  `yghv_wait_residents_stopped(online)`（等所有 vcpu 离开 STOPPING，有界 5s/核），
+  使 c1-c3 的 persistent resident 能通过 try_activate 真正进入 VMRUN（多核常驻）。
+- **结果**：加载后 DriverEntry 挂起——服务 **START_PENDING 数分钟**、看门狗线程
+  未创建（卡在 start_persistent/wait_remote_ready 之前）、`sc stop` 返回 1052
+  （START_PENDING 不接受控制）、`C:\yuanguard_hv.sys` 被锁定无法恢复；机器
+  存活但驱动卡死。用户重启清除。
+- **回退**：移除 `yghv_wait_residents_stopped`（助手+调用），恢复单核行为。
+  重建 SHA `D7A8B7E4...`（功能等同 ED7303A5 看门狗态，仅签名时间戳差异）。
+- **关键结论**：**多核常驻（c1-c3 真正进 VMRUN）在本机导致 DriverEntry 挂起；
+  单核（c1-c3 在 try_activate 因 STOPPING bail）是本机稳定配置。** 9.143 的
+  "c1-c3 单核"不是需修 bug，而是本平台（Ryzen 5 5500，hypervisor 负载硬冻结
+  史）稳定性的必要条件。多核 persistent 需换平台验证。
+- **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED，机器安全。HEAD 驱动含
+  看门狗（被动诊断），无多核改动。
+- 提交：main.c 回退 + 本记录。
