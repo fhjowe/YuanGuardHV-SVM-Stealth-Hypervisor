@@ -3255,3 +3255,385 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **本轮提交**：`main.c`（MSV 全局/深拷贝/step200/辅助线程/HLT 拦截）、`vmexit.c`
   （CR3 写 MSV fail-close + dispatch 尊重 CR handler 返回值）、交接文档 9.180-9.183。
 - 提交：本记录。
+
+### 9.184 2026-08-15 选项 B 启动：B-0 = guest 态虚拟中断注入接收测试（step202）
+
+- **决策**：用户否决边界，选择 **选项 B（xAPIC MSR/MMIO 完整虚拟化 + 虚拟中断注入）**，
+  在 step20 稳定基线上推进。每次测试需重启（接受）。
+- **B-0（第一步，已实现 step202）**：在投入完整 APIC 虚拟化前，单独验证**整个 B 最关键的
+  风险假设——guest 能否在 guest 态接收并处理注入的中断**（ISR 必须跑在 guest 态，
+  任何 APIC 虚拟化都绕不过这一点）。
+  - 组合：spin guest（step20 形态，`yghv_os_guest_resident_spin_thread`）+ MSV 深拷贝
+    独立 CR3（`g_msv_test=TRUE`）+ INTR/NMI 拦截 + `g_os_guest_inject_intr=TRUE`
+    （拦截的中断经 VMCB event injection 重新注入 guest，时钟 ISR 在 guest 态跑）
+    + alive/watchdog + 60s 有界等待。
+  - 注：resident 线程在 trampoline 前就 signal 事件，等待实际是"进入即返回"，存活由
+    alive 线程每 5s 日志度量。
+- **判据**：
+  - **存活 ≥60s（`resident alive` 递增、无 0x101）→ guest 态中断接收/处理正常 →
+    继续完整 APIC 虚拟化（B-1）**；
+  - **0x101/硬冻结（<5s）→ guest 态中断处理本身是墙（errata 1363），APIC 虚拟化
+    无法修复（ISR 必须在 guest 态跑）→ 选项 B 在本 CPU 低价值，停止并回到边界**。
+- **构建**：B-0 门控版（`YGHV_BAREMETAL_STEP=202`）SUCCESS，SHA256
+  `DC565069E20CE623F5436B91B389B3371C12ED42DC1285F26A77239CAF44D259`，归档
+  `D:\aaaaaavm\yuanguard_hv_b0_20260815.sys`，字符串（bm b0 spin inject start /
+  bm b0 done / msv deep cr3 cloned）全部 PRESENT；默认版 SUCCESS。step 上限 202。
+- **待实机验证**（需用户确认）：备份 C 盘稳定版 → 覆盖 B-0 → `sc start yuanguard` →
+  观察 `C:\Windows\yghv_progress.log`（`bm step=0xca → bm b0 spin inject start →
+  msv deep cr3 cloned → os resident spin enter=1` → `resident alive` 递增为存活证据）
+  → `sc stop`（9.163 干净卸载机制）→ 恢复 C 盘稳定版。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.185 2026-08-15 B-0 实机结果：硬冻结（无 dump）——但被"未虚拟化 APIC"混淆
+
+- **执行**：用户确认后部署 B-0 门控版（`DC565069`，step202 = spin + 深拷贝独立 CR3 +
+  INTR/NMI 拦截 + 拦截中断经 VMCB 事件注入回 guest）实机加载。
+- **结果**：**整机硬冻结、无响应**（约 <5s，无 `resident alive`、无新 minidump、无
+  0x101）。机器重启后 C 盘已恢复稳定版 `70888311`，服务 STOPPED。
+- **进度日志**（崩溃前）：`bm step=0xca → bm b0 spin inject start → msv deep cr3
+  cloned=0x... → os resident spin enter=1` → 无 alive。
+- **解读（关键，与"选项 B 判死"不同）**：
+  - B-0 **没有虚拟化 APIC**：guest 收到注入的时钟中断后，时钟 ISR 在 guest 态执行，
+    其 **EOI 写直接打到物理 APIC 0xFEE000B0**——这正是 errata 1363（guest 态
+    APIC 交互/访问流→挂起/复位）描述的路径；
+  - 因此 B-0 冻结只能证明"**guest 态中断处理 + 物理 APIC 访问 = 冻结**"，**不能**证明
+    "guest 态中断处理本身 = 冻结"——后者是判死选项 B 的条件；
+  - 选项 B 的核心正是把 APIC 虚拟化（NPT 重映射 0xFEE00000→影子页 + 宿主代理），
+    使 guest 永不碰物理 APIC。B-0 缺这一环，冻结被混淆。
+- **现有 v98 APIC 影子代码缺口**（复核）：`yghv_v98_apic_scan_forward` 只按值比较
+  转发 TPR/ICRL/ICRH/LVTT/TMICT/TDCR；**EOI（0xB0，write-only）无法用值比较检测**，
+  RAM 影子无法捕获写——完整 APIC 虚拟化需对 APIC MMIO 页做**写陷阱（NPF）+ 指令解码
+  模拟 EOI/TPR/ICR/timer**，而非简单 RAM 影子。
+- **B-1 提案（待用户决定）**：
+  - **B-1min（廉价判别）**：B-0 基线上给 APIC 页加 RAM 影子（复用 v98 `npt_map_page`，
+    不转发 EOI）——若机器活过 <5s 窗口（哪怕后续因缺 EOI 变 0x101）→ 物理 APIC 访问
+    确为冻结触发点 → (a) 成立 → 值得投入完整 APIC 虚拟化；若仍 <5s 硬冻结 →
+    guest 态 ISR 执行本身是触发点 → (b) 成立 → 选项 B 本 CPU 判死，回到边界；
+  - **B-1full（完整 APIC 虚拟化）**：APIC MMIO 页 NPT 写陷阱 + 指令解码模拟
+    EOI/TPR/ICR/LVTT/TMICT/TDCR + 转发真实 APIC + 虚拟中断注入——工程量数百行，
+    概率低（1363 无修复）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.186 2026-08-15 B-1min 实现（step202 + APIC RAM 影子，待实机）
+
+- **实现（用户确认 B-1min）**：
+  - `main.c`：把 v98 APIC 影子设置抽成 `yghv_v98_apic_shadow_apply(v)`（分配影子页 +
+    MmMapIoSpace 真实 APIC + 复制初始状态 + `npt_map_page(0xFEE00000→影子)` +
+    tlb_control=FLUSH + trace），delay 线程与 **spin 线程**均调用（spin 用于 B-1min）；
+  - step202（B-1min）= B-0 组合（spin + 深拷贝独立 CR3 + INTR/NMI 拦截 + 事件注入）
+    + `g_v98_apic_shadow=TRUE`（guest ISR 的 EOI/TPR 写改走影子 RAM，**不再碰物理 APIC**）；
+    EOI 有意不转发（判别：是否"物理 APIC 访问"为冻结触发点）。
+  - 注：`yghv_v98_apic_scan_forward` 已在 dispatch 顶部调用（TPR/ICR/timer 值比较转发）。
+- **构建**：B-1min 门控版（`YGHV_BAREMETAL_STEP=202`）SUCCESS，SHA256
+  `9EAF9B7C60A35BC3D2CC63AFC108B5F2A4272C522F70A17DB311102569E71AE1`，归档
+  `D:\aaaaaavm\yuanguard_hv_b1min_20260815.sys`，字符串（bm b0 spin inject start /
+  v98 apic shadow armed / msv deep cr3 cloned）全部 PRESENT；默认版 SUCCESS。
+- **判据**（同 9.185 B-1min）：
+  - 活过 <5s 窗口（哪怕后续因缺 EOI 时钟停走而 0x101）→ 物理 APIC 访问 = 冻结触发点
+    → (a) 成立 → 投入 B-1full（完整 APIC 虚拟化，含 EOI 写陷阱转发）；
+  - 仍 <5s 硬冻结（无 dump）→ guest 态 ISR 执行本身 = 触发点 → (b) 成立 →
+    选项 B 本 CPU 判死，回到边界。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.187 2026-08-15 B-1min 首次实机无效（0xE2 看门狗在深拷贝阶段提前触发）+ 修复
+
+- **首次实机（B-1min，`9EAF9B7C`）**：用户反馈无响应，重启后转储
+  `081526-10953-01.dmp`（已归档 `D:\aaaaaavm\yghv_bsod_b1min_20260815_1031.dmp`）。
+- **转储分析**：**0xE2 MANUALLY_INITIATED_CRASH**，P1=`0x59475644`（=YuanGuardHV Debug
+  标记），P3=3（stall=3）——**是我们的看门狗（`yghv_resident_watchdog_thread`）触发**，
+  不是平台锁死；核心 0（宿主）活着并 bugcheck。
+- **根因（进度日志实锤）**：日志停在 `os guest cr3 intercept enabled`，**`msv deep cr3
+  cloned` 未出现**——深拷贝整棵页表树在 **3s 看门狗窗口内没完成**（分配成百上千个页表页
+  较慢），而 step202 在创建线程前就把 `g_os_resident_mode=TRUE`，导致看门狗把"深拷贝阶段
+  计数为 0"误判为 guest 停顿 → 3s 后 0xE2。**APIC 影子（`v98 apic shadow armed`）尚未
+  装上、guest 未进入，本次 B-1min 判据无效**。
+- **修复**：step202 不再提前置 `g_os_resident_mode`（spin 线程在深拷贝**之后**、进入
+  guest 前才置），看门狗在深拷贝阶段 `if (!g_os_resident_mode) continue` 跳过。
+- **B-1min-fixed 构建**：SHA256
+  `EA8FEEC4A192EE437C8F2EA1F9AF82C8BC6C25DF6F709680966BC383D3480304`，归档
+  `D:\aaaaaavm\yuanguard_hv_b1min2_20260815.sys`。
+- **待实机复测**（需用户确认）：覆盖 B-1min-fixed → `sc start` → 期望
+  `bm b0 spin inject start → msv deep cr3 cloned → v98 apic shadow armed →
+  os resident spin enter=1` → `resident alive` 递增（存活证据）→ `sc stop` → 恢复
+  稳定版。判据见 9.186。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.188 2026-08-15 决策：先做 BIOS/AGESA 更新（用户选 b，B-1min 复测暂缓）
+
+- **背景**：用户转来其他 AI 的 PVE/QEMU 建议（vcpu 分配/CPU Pinning/Host 饥饿/fTPM/
+  BIOS/AGESA）。逐条核验后结论：**该建议针对 QEMU/KVM 托管 VM，与本项目裸机驱动
+  OS-as-guest 场景不符**；其核心假设"全核→Host 饥饿"被本项目证据直接否定——MSV-1/2
+  只把核心 1 放 guest、其余 11 核均为空闲宿主核，核心 1 仍 0x101（guest 态时钟中断
+  不被服务）；9.149 核数 1→12 均冻结。因此"留 2 线程给 Host"对项目无效。
+- **用户选择 b：先做 BIOS/AGESA 更新再回测**（接受其为可执行、无副作用的稳定性项，
+  虽 errata 1363 官方无修复、概率低）。
+- **硬件/软件现状（已实测）**：
+  - 主板 ASUS **PRIME A320M-K**（AM4/A320），当前 BIOS **6042（2022-04-28）**；
+  - CPU Ryzen 5 5500（Cezanne/Zen3 6C12T）；OS Win10 Pro for Workstations 19045；
+  - **BitLocker 未启用**（C:/D: FullyDecrypted，ProtectionStatus Off）→ 升级 fTPM
+    无恢复密钥备份需求；fTPM 已启用（TpmEnabled/Activated）。
+- **web 检索（2026-08-15）**：PRIME A320M-K 较新 BIOS 有 **6251**（2025-08-14，
+  AGESA ComboV2 更新）与 **1168.27.50.919**（2025-12-31，AGESA ComboV2PI 1.2.0.B，
+  部分源标注面向 Ryzen 5000 G-Series）——均晚于当前 6042。用户需在 ASUS 官方支持页
+  确认适用于 Ryzen 5 5500 的最新正式版后下载（EZ Flash 3 USB 升级）。
+- **升级后动作**：BIOS 确认 SVM Mode=Enabled → 稳定基线回归（默认版 `70888311`）
+  → 再测 B-1min-fixed（`EA8FEEC4`）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.189 2026-08-15 BIOS 升级后回归 PASS + B-1min-fixed 复测（0x101，但硬冻结消除）
+
+- **BIOS 升级完成（用户操作）**：升级后 SVM 曾被重置为关（`VirtualizationFirmwareEnabled
+  =False`），用户重新开启 SVM Mode + 重启后恢复（=True）；12 逻辑核。
+- **稳定基线回归（当前 HEAD 默认版 `72A03675`，因 C 盘旧稳定版 `70888311` 不支持多目标
+  客户端命令 GET_TARGETS，改用当前默认版）**：`sc start` RUNNING、自测全过；`state`
+  active=1/2 页、`list-targets` returned=1、**`selftest` PASS**（set-target/add-page/
+  list-pages/start/写读）、**`exit-test` PASS**（child 槽自动清）。BIOS 更新后无回归。
+- **B-1min-fixed 复测（`EA8FEEC4`）**：用户确认后部署实机加载。**蓝屏 0x101
+  CLOCK_WATCHDOG_TIMEOUT**（11:27:53，转储 `081526-7937-01.dmp`，已归档
+  `D:\aaaaaavm\yghv_bsod_b1min2_20260815_1127.dmp`），Arg4=1（核心 1），bucket
+  `CLOCK_WATCHDOG_TIMEOUT_INVALID_CONTEXT`。
+- **进度日志（本次走得更远）**：`bm b0 spin inject start → msv deep cr3 cloned=
+  0x211c9000 → os guest cr3 cloned to=0x211c9000 → **v98 apic shadow armed=0xc7d2d000**
+  → os resident spin enter=1`——**深拷贝完成、APIC 影子装上、guest 真正进入**（上轮 9.187
+  看门狗时序修复生效）。
+- **关键判定（与 B-0 对比）**：
+  | 形态 | 结果 |
+  |---|---|
+  | B-0（spin+注入，**无** APIC 影子） | **整机硬冻结**（无 dump，errata 1363 物理 APIC 访问） |
+  | B-1min-fixed（spin+注入+**APIC 影子**） | **0x101 可诊断**（dump 捕获，核心 1 时钟未服务） |
+  - **APIC 影子消除了硬冻结** → 支持"guest 态物理 APIC 访问 = 硬冻结触发点"（errata 1363）；
+    guest 态 ISR 执行本身未冻结（否则 B-1min 也会硬冻结）。
+  - 剩余 0x101 = **时钟中断没被持续服务**——最可能根因：**EOI 未转发**（B-1min 有意不
+    转发），真实 APIC 的 timer ISR 保持置位 → timer 不再重发 → guest 时钟停走 →
+    Windows 时钟看门狗 0x101。
+- **B-1full 提案（待用户决定）**：在 B-1min 基线上把 APIC 虚拟化补完——APIC MMIO 页
+  **写陷阱（NPT 去 W）+ NPF 指令解码**，模拟并转发 **EOI/TPR/ICR/LVTT/TMICT/TDCR** 到
+  真实 APIC（EOI 转发是关键：让真实 timer 持续重发）。若存活 → 完整 APIC 虚拟化是路径，
+  阻塞 OS-as-guest 有戏；若仍 0x101/冻结 → guest 态中断处理仍是墙。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.190 2026-08-15 B-1full 实现（APIC MMIO 写陷阱 + EOI/TPR/ICR/timer 转发，待实机）
+
+- **实现（用户确认 B-1full）**：
+  - `main.c` `yghv_v98_apic_shadow_apply`：`npt_map_page(0xFEE00000→影子)` flags 改为
+    `(NPT_4K_PAGE_FLAGS & ~NPT_PERM_WRITABLE)|(1<<4)|(1<<63)`——**APIC 页写保护**
+    （present+可读、清 W），guest 写 0xFEE00000+offset → NPF；读仍走影子 RAM。
+  - `vmexit.c` 新增 `yghv_apic_mmio_npf(vcpu)`：从 Decode-Assist 指令字节解码
+    `mov [disp32], r32`（0x89 /r，REX.B 支持 r8-r15）与 `mov [m32], imm32`（0xC7 /0），
+    offset=disp32-0xFEE00000；按寄存器处理并转发真实 APIC：**EOI→写真实 APIC EOI**
+    （关键：让 LAPIC timer 持续重发）、TPR/ICRL/ICRH/LVTT/TMICT/TDCR→更新影子+转发、
+    LDR/DFR/SPIV/ESR→转发、其它→仅存影子；成功返回 0（调用方 svm_finish_exit 推进 RIP），
+    解码失败 LOG+返回未处理。
+  - NPF 分支顶部接入：GPA 页==0xFEE00000 且 `g_v98_apic_shadow` → 走 `yghv_apic_mmio_npf`，
+    处理成功即推进 RIP，**不注入 #PF**。
+  - 新增 `g_v98_apic_mmio_count`（内存计数，VMEXIT 路径零文件写），step202 完成时（宿主
+    上下文）`b0 apic mmio count` 落盘。
+  - `yghv_v98_apic_scan_forward`（值比较转发）保留兜底（写已由 NPF 处理，读无 NPF）。
+- **构建**：B-1full 门控版（`YGHV_BAREMETAL_STEP=202`）SUCCESS，SHA256
+  `0464D52DC4A3BDFF5C2AE2A16A5E854443C6BD31C4FA39AF121B5D1898E560DB`，归档
+  `D:\aaaaaavm\yuanguard_hv_b1full_20260815.sys`，字符串（v98 apic shadow armed /
+  APIC MMIO decode failed / b0 apic mmio count）全部 PRESENT；默认版 SUCCESS。
+- **判据**：存活 ≥30-60s（`resident alive` 递增、无 0x101）→ 完整 APIC 虚拟化是路径，
+  阻塞 OS-as-guest 有戏（下一步把 B-1full 接到阻塞 delay 形态验证调度器）；仍 0x101/
+  冻结 → guest 态中断处理仍是墙，选项 B 本 CPU 判死。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.191 2026-08-15 B-1full 实机：仍 0x101 —— 完整 APIC 虚拟化无法解锁 guest 态时钟服务
+
+- **执行**：用户确认后部署 B-1full（`0464D52D`）实机加载。
+- **结果**：**仍 0x101 CLOCK_WATCHDOG_TIMEOUT**（11:40:11，转储
+  `081526-8765-01.dmp`，已归档 `D:\aaaaaavm\yghv_bsod_b1full_20260815_1140.dmp`），
+  Arg4=1（核心 1），bucket `CLOCK_WATCHDOG_TIMEOUT_INVALID_CONTEXT`。
+- **进度日志**：与 B-1min-fixed 相同（`msv deep cr3 cloned → v98 apic shadow armed →
+  os resident spin enter=1`，之后 0x101）。
+- **转储细节**：核心 1 **非空闲**（CurrentThread=`ffffb20816c150c0` ≠ IdleThread，与 MSV
+  的空闲态不同）——guest 在执行某系统线程时 0x101；mini dump 无法进一步定位 ISR 内部。
+- **VMCB 偏移复核**：exitintinfo=+0x88、event_injection=+0xA8 均正确（vmcb.h static_assert
+  验证），**注入机制结构无误**——不是注入偏移的驱动 bug。
+- **判定（关键）**：
+  - B-1full 已把 APIC 完整虚拟化（MMIO 写陷阱 + EOI/TPR/ICR/timer 转发真实 APIC），
+    **0x101 仍复现** → 时钟不被服务的根因**不是 APIC/timer 机制**（已虚拟化），而是
+    **guest 态对注入中断的处理/ISR 执行本身**——ISR 必须在 guest 态跑，任何 APIC 虚拟化
+    都无法绕过。
+  - B 路线实验结果汇总：B-0（无影子）=硬冻结；B-1min（RAM 影子）=0x101；B-1full
+    （写陷阱+EOI 转发）=0x101。**APIC 影子消除了硬冻结（证实 errata 1363 物理 APIC 访问
+    是硬冻结触发点），但无法让 guest 在 guest 态正常服务时钟中断。**
+- **结论**：**选项 B（APIC 虚拟化）已真正实现并实测，在本 CPU 上无法解锁 OS-as-guest**。
+  剩余阻塞在 guest 态中断/ISR 执行路径（errata 1363 类，官方无修复），非 hypervisor 软件
+  可修。
+- **遗留未决**：注入中断是"没送达 guest"还是"送达但 ISR 未完成"（mini dump 无法区分）——
+  区分需额外诊断构建（计数 INTR 退出/注入/guest RIP，另一次重启），但**不改变战略结论**
+  （无论哪个，guest 态时钟服务在本 CPU 都失败）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.192 2026-08-15 D1：NPF 日志诊断（对"外部 AI 的 NPT 权限假说"的判别测试）
+
+- **背景**：用户转来另一 AI 的参考分析，主张"不是硬件墙、根因在共享 CR3 下 NPT 对
+  ISR 路径页面权限不完整（NPF 卡住中断投递）"，并给出实验 1（NPT 全权限）/2（NPF 日志）/
+  3（关键页预锁定）/4（关 NPT）。
+- **逐条核验后的更正**：
+  - **误读 1**："独立 CR3 稳定 5 分钟 = guest 态 ISR 硬件可行"不成立——9.152 合成常驻是
+    纯心跳 guest 且**中断全在宿主态服务（INTR/NMI 拦截+host ISR），从未在 guest 态执行
+    ISR**；B 系列才是首次真正在 guest 态处理注入中断的实验。
+  - **误读 2**："B 系列是共享 CR3"不成立——B-0/B-1min/B-1full 全用 `g_msv_test=TRUE`
+    → **深拷贝独立 CR3**（`msv deep cr3 cloned` 日志可证）。
+  - **实验 1（NPT 全权限）已天然满足**：NPT 为 `MmGetPhysicalMemoryRanges` 全内存
+    identity 映射、全 RW 无 NX（9.49 起），IDT/ISR/栈/页表页在 NPT 中本就完整 RW；且
+    B 系列在独立 CR3 下实测仍 0x101。
+  - **实验 2（NPF 日志）值得做**——决定性地回答"0x101 前 guest 是否有 NPF"：
+    有大量 NPF（GPA 指向 IDT/ISR/栈/页表区）→ NPT 权限/映射问题 → 可修；零 NPF →
+    guest 未在访存卡住 → NPT 理论证伪，锁定"注入没送达 / ISR 逻辑卡住"。
+  - GIF/clean bits 两点已复核：trampoline 分发期 GIF=0（9.57 设计），VMRUN 前
+    vmcb_clean_bits=0（v94），均已处理。
+- **D1 实现**：`main.c` 新增 `g_npf_count/g_last_npf_gpa/g_last_npf_err/g_last_npf_rip`
+  + `yghv_b0_diag_thread`（1s 宿主线程，核心 0 安全写文件，打印 npf/gpa/err/rip/
+  apic mmio/exits）；`vmexit.c` NPF 分支顶部计数+记录现场（内存，VMEXIT 路径零文件写）；
+  step202 创建/关闭 diag 线程并打印最终 npf 计数。
+- **构建**：D1 门控版（`YGHV_BAREMETAL_STEP=202`）SUCCESS，SHA256
+  `DE6881E9BF4929973E928D4E0354D911AB9B8EB21EECD479928899757869AB83`，归档
+  `D:\aaaaaavm\yuanguard_hv_d1_npfdiag_20260815.sys`，字符串 PRESENT；默认版 SUCCESS。
+- **判据**：`b0 diag npf` 计数若增长且 GPA 指向 ISR/IDT/栈/页表区 → NPT 假说成立、可修；
+  若 M=0 → NPT 假说证伪（guest 未访存卡住），锁定注入/ISR 逻辑。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.193 2026-08-15 D1/D1b/D1c/D2 诊断系列：0x101 <10ms 崩，轮询抓不到；深拷贝竞态 0x50
+
+- **D1（1s diag，`DE6881E9`）**：0x101；首个 diag tick（1s，深拷贝阶段）全零，guest 进入后
+  <1s 崩，下一条 diag 未及写。
+- **D1b（100ms diag，`AF8DC542`）**：0x101；抓到 6+ 个 100ms tick（均深拷贝阶段全零），
+  guest 进入后 <100ms 崩。**确认深拷贝需 600ms+**。
+- **D1c（10ms diag，`303FDEC9`）**：**0x50 PAGE_FAULT，崩在 `yuanguard_hv+0x3074`（深拷贝
+  遍历活页表读无效地址 `ffffdd81042c5000`）**——深拷贝 + 10ms 高频写盘（I/O 分配内存改
+  页表）竞态 → 读到半更新页表项。**深拷贝本身是慢(600ms+)+带竞态的驱动缺陷**。
+- **D2（浅拷贝快 setup，`38AF3937`）**：0x101；浅拷贝后 setup 飞快（日志无 diag 行），
+  guest 进入后 **<10ms 崩**（0x101，16 tick）。**任何轮询都抓不到进入后数据**。
+- **汇总（对 NPT 权限假说的判别）**：
+  - B-1min/B-1full/D1/D2 全用**独立 CR3（深/浅拷贝）+ 全 RW identity NPT**（无权限限制），
+    guest 进入后 **<10ms 0x101**（时钟不被服务）；
+  - **未观测到 NPF**（diag 从未抓到进入后数据，无法证实/证伪 NPF，但 NPT 本就是全 RW，
+    权限假说在独立 CR3+全 RW NPT 下不成立）；
+  - **0x101 太快（<10ms），轮询式诊断（10ms/100ms/1s）均无法捕获**进入后现场。
+- **结论（暂定）**：只要 guest 必须处理注入中断（B/D 系列），就在 <10ms 内 0x101——指向
+  guest 态 ISR 执行路径本身（errata 1363 类）。但"guest 能否处理**单个**受控注入中断"
+  这一最后一问仍未观察（0x101 抢在轮询前）。
+- **D3 提案（待用户决定，可观察的最终判别）**：在 **step20 稳定基线（host ISR，guest 不
+  收中断，机器不崩）** 上，以受控速率（如每 100ms）向 guest **注入单个受控中断**，host
+  ISR 继续服务真实时钟 → **机器存活，轮询可观察**：
+  - guest 能处理受控注入中断（存活、可轮询）→ guest 态 ISR 执行可用 → B 的 0x101 是
+    "时钟全量注入速率/特定向量"问题 → 可修 → 重大突破；
+  - guest 在首个受控注入中断即崩 → guest 态 ISR 执行是墙（errata 1363 类）→ 选项 B 定论。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.194 2026-08-15 D3 实现（host ISR + 受控单中断注入，待实机）
+
+- **实现（用户确认 D3）**：
+  - step202 改为 **D3 配置**：spin guest + INTR/NMI 拦截 + **`g_os_guest_host_isr=TRUE`**
+    （host ISR 服务真实时钟 → 机器存活、可轮询）+ **`g_os_guest_inject_intr=FALSE`**
+    （不洪水注入）；保留浅拷贝快 setup + B-1full APIC 影子 + 10ms diag + alive/watchdog；
+  - 新增 `yghv_b0_injector_thread`（100ms）：每 100ms 把 vcpu1 最近一次拦截中断
+    （exitintinfo，VALID bit31 检查）写入 `event_injection`，下个 VMRUN 注入 guest——
+    受控速率（10 次/秒），host ISR 处理其余；
+  - 修复：先前编辑误删 `yghv_resident_watchdog_thread` 主体，已恢复完整（0xE2 逻辑）；
+    默认版重建验证通过。
+- **构建**：D3 门控版（`YGHV_BAREMETAL_STEP=202`）SUCCESS，SHA256
+  `B7F5A068A97AEFC64FD90F328C093CCCD25A21E00E89C75ACF8DC4A8476E90AB`，归档
+  `D:\aaaaaavm\yuanguard_hv_d3_hostisr_inject_20260815.sys`；默认版 SUCCESS。
+- **判据（决定性，可观察）**：
+  - **guest 能处理受控注入中断**（机器存活、`b0 diag`/`resident alive` 持续、无 0x101）
+    → guest 态 ISR 执行可用 → B 的 0x101 是"全量注入速率/特定向量"问题 → 可修、重大突破；
+  - **guest 在首个受控注入中断即崩**（0x101/冻结，但 host ISR 已让轮询抓到注入前数据）
+    → guest 态 ISR 执行是墙（errata 1363 类）→ 选项 B 定论。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.195 2026-08-15 D3 实机：仍 0x101 <10ms，但被"浅拷贝 CR3 基座不稳定"混淆
+
+- **执行**：用户确认后部署 D3（`B7F5A068`，host ISR + 受控 100ms 单中断注入 + 浅拷贝 +
+  APIC 影子 + 10ms diag）实机加载。
+- **结果**：**仍 0x101**（13:16:32，转储 `081526-9078-01.dmp`，已归档
+  `D:\aaaaaavm\yghv_bsod_d3_20260815_1316.dmp`），Arg4=1（核心 1），同一 bucket。
+  日志：`os resident spin enter=1 → b0 guest entered` 后 <10ms 崩（注入器 100ms 未及
+  触发一次，**注入本身未参与**）。
+- **混淆（关键）**：D3 相对 step20 稳定基线一次改了多变量（浅拷贝 CR3 + APIC 影子 +
+  10ms diag + 注入器）；而**浅拷贝共享宿主下层页表**（9.178 已证浅拷贝对阻塞冻结；D1c
+  0x50 也证明共享页表在负载下有竞态）。因此 **D3 的 0x101 可能是浅拷贝 CR3 基座本身不稳定**
+  （与注入无关），不能据此判定"受控注入导致崩溃"。
+- **结论（对 D3 假设）**：受控注入测试**未干净完成**——需先做**基座控制实验**：
+  - **D3-base（去掉注入器）**：若基座稳定 → 注入器是唯一变量 → 受控注入崩溃即证明
+    guest 态 ISR 执行是墙（干净观察）；若基座也 <10ms 0x101 → 浅拷贝 CR3 是问题 → 需
+    深拷贝 CR3（修 D1c 竞态：深拷贝期间暂停 10ms diag/降 I/O）再做注入测试。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.196 2026-08-15 D3-base 控制实机：基座本身 0x101 <10ms —— 注入不是变量
+
+- **执行**：用户确认后部署 D3-base（`554D6A7A`，shallow CR3 + host ISR + APIC 影子 +
+  10ms diag，**无注入器**）实机加载。
+- **结果**：**仍 0x101 <10ms**（15:03:18，转储 `081526-9437-01.dmp`，已归档
+  `D:\aaaaaavm\yghv_bsod_d3base_20260815_1503.dmp`，Arg4=1，同一 bucket）。
+  日志 `os resident spin enter=1 → b0 guest entered` 后崩。
+- **关键判定**：**控制组（无注入器）也崩** → **基座（shallow CR3 + host ISR + APIC 影子
+  + 10ms diag）本身不稳定**，D3 的 0x101 与注入无关。注入器变量被排除。
+- **B/D 证据重新归位**：
+  - **B-1min/B-1full（深拷贝 CR3，无 diag，全量时钟注入）**：0x101 —— 深拷贝独立页表
+    （不共享宿主表）+ 无 diag 混淆，是"guest 无法处理注入时钟"的最干净证据；
+  - **D3-base（浅拷贝 + host ISR，无注入）**：0x101 —— **浅拷贝共享宿主下层页表 + 宿主
+    I/O 改页表 → guest 走不一致页表 → 核心 1 锁死 → 0x101**（与 9.178 浅拷贝冻结、D1c
+    0x50 同类，属 CR3 页表问题，非注入）；
+  - 因此 D2/D3/D3-base（浅拷贝系）的 0x101 是**浅拷贝 CR3 基座问题**，不能作为
+    "guest 态 ISR 执行"证据；B-1min/B-1full（深拷贝系）才是。
+- **未决（受控注入最后一步）**：需**稳定基座 + 受控注入**才能干净回答"guest 能否处理单个
+  注入中断"。稳定基座 = 深拷贝 CR3 + host ISR（9.152 证 12 核 5 分钟稳定），但深拷贝
+  慢(600ms+)+竞态（D1c 0x50）需先修（深拷贝期间暂停 10ms diag）。工程+多轮重启成本高。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.197 2026-08-15 D4-base 实机：深拷贝+host ISR+APIC 影子基座也 0x101 —— 受控注入测试被阻断
+
+- **执行**：用户选 A（修深拷贝竞态 + 稳定基座 + 受控注入）。实现：`g_b0_cloning` 标志
+  使 10ms diag 在深拷贝期间暂停写盘（修 D1c 0x50 竞态）；step202 恢复 `g_msv_test=TRUE`
+  深拷贝 + host ISR + APIC 影子；注入器仍 `g_b0_inject=FALSE`（D4-base 控制）。
+- **构建**：D4-base SHA256 `BB955FA9E6AF691D601709DF931DB4911F07C677FC0B9B395FAA7616A494B825`，
+  归档 `D:\aaaaaavm\yuanguard_hv_d4base_deep_20260815.sys`。
+- **实机结果**：**仍 0x101 <10ms**（15:16:40，转储 `081526-9750-01.dmp`，已归档
+  `D:\aaaaaavm\yghv_bsod_d4base_20260815_1516.dmp`，Arg4=1）。日志：`msv deep cr3
+  cloned → v98 apic shadow armed → os resident spin enter=1 → b0 guest entered` 后崩。
+  **深拷贝竞态已修复（无 0x50）**，但基座仍 0x101。
+- **关键判定（补全拼图）**：
+  - 9.152 的稳定配置用的是 **yghv_build_guest_cr3（合成 resident 的最小页表）**，而
+    OS-as-guest 路径用的是**克隆整张宿主页表（深/浅）**——两者 CR3 构造不同；
+  - **深拷贝全量页表 + host ISR + APIC 影子（无注入）= 0x101** → "稳定基座"在 OS-as-guest
+    路径**不存在**（只有合成最小页表基座稳定，而它不是真 OS-as-guest）；
+  - 受控注入测试**必须**有完整映射的基座（IDT/ISR/栈需映射才能处理注入中断）→ 该基座
+    本身不稳定 → **受控注入测试在本机无法进行**（无稳定基座可注入）。
+- **最终结论（OS-as-guest 本机定论）**：
+  - 唯一稳定形态 = 合成最小页表心跳 guest（9.152），**从不运行真实 Windows 内核代码**
+    （不跑调度器/ISR）；
+  - 任何让 guest 运行真实 Windows 内核路径（阻塞/MSV、注入/B、APIC 影子/D4、浅拷贝/
+    D2/D3、全量深拷贝/D4）的尝试都在 <10s 内 0x101 或硬冻结；
+  - 判定：**本机（Ryzen 5 5500）无法运行 OS-as-guest（真实 Windows 在 guest 态执行
+    调度器/中断），平台级限制（errata 1363 类），非驱动逻辑可修**——经完整实验矩阵
+    （9.84-9.197，含外部 AI 的 NPT 权限假说判别：全 RW NPT 下仍失败）确认。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.198 2026-08-15 OS-as-guest 完整总结文档 + 收尾状态
+
+- **新增 `docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md`**：OS-as-guest 研究线**完整横向总结**
+  （9.84-9.197 全部路径、问题、判别、结论、归档清单、换平台重启条件）。
+- **工作区状态**：`main.c`、`vmexit.c`（B/D 系列：step200/202 分发、深/浅拷贝、APIC
+  影子/写陷阱、NPF 诊断、受控注入、clone 竞态修复）+ `docs/YUANMOD_HANDOFF_CURRENT.md`
+  （9.180-9.198）+ 新总结文档，均为未提交改动；HEAD `edf42ce`。
+- **机器状态**：C 盘稳定默认版 `70888311`，服务 STOPPED，机器安全。
+- **待定**：是否将 B/D 系列代码与文档提交（step200/202 为门控实验，默认构建不激活）。
+- 提交：本记录。

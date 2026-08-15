@@ -129,6 +129,7 @@ static uint64_t yghv_clone_host_cr3(void) {
 
 /* 9.180 MSV: page-table page allocator for the deep clone.  Uses -1
    HighestAcceptableAddress so the tree may live above 4 GB (per 9.140). */
+extern volatile BOOLEAN g_b0_cloning;   /* D4: defined later; set during deep clone */
 static npt_entry_t *yghv_msv_pt_alloc(void) {
     npt_entry_t *t = (npt_entry_t *)MmAllocateContiguousMemory(
         HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = -1LL });
@@ -154,13 +155,22 @@ static uint64_t yghv_clone_host_cr3_deep(void) {
     uint64_t src_pa, dst_pml4_pa = 0;
     ULONG i;
 
+    /* D4: pause the 10ms diag's file I/O while we walk the LIVE host page
+       table, so its allocations don't churn the tables we are copying (the
+       D1c 0x50 clone-vs-I/O race). */
+    g_b0_cloning = TRUE;
+
     __asm__ volatile("mov %%cr3, %0" : "=r"(src_pa));  /* host CR3 = PML4 PA */
     src_pml4 = yghv_msv_pa_to_va(src_pa);
-    if (!src_pml4)
+    if (!src_pml4) {
+        g_b0_cloning = FALSE;
         return 0;
+    }
     dst_pml4 = yghv_msv_pt_alloc();
-    if (!dst_pml4)
+    if (!dst_pml4) {
+        g_b0_cloning = FALSE;
         return 0;
+    }
     dst_pml4_pa = MmGetPhysicalAddress(dst_pml4).QuadPart;
 
     for (i = 0; i < 512; i++) {
@@ -219,9 +229,11 @@ static uint64_t yghv_clone_host_cr3_deep(void) {
         }
     }
     yghv_trace_u64("msv deep cr3 cloned", dst_pml4_pa);
+    g_b0_cloning = FALSE;
     return dst_pml4_pa;
 
 fail:
+    g_b0_cloning = FALSE;
     yghv_trace("msv deep cr3 clone failed");
     return 0;
 }
@@ -247,6 +259,16 @@ volatile ULONG g_v98_last_icrh = 0;
 volatile ULONG g_v98_last_lvtt = 0;
 volatile ULONG g_v98_last_tmict = 0;
 volatile ULONG g_v98_last_tdcr = 0;
+volatile ULONG64 g_v98_apic_mmio_count = 0;   /* B-1full: APIC MMIO write-trap hits */
+volatile ULONG64 g_npf_count = 0;              /* D1: total NPF exits */
+volatile uint64_t g_last_npf_gpa = 0;          /* D1: last NPF faulting GPA */
+volatile uint64_t g_last_npf_err = 0;          /* D1: last NPF exitinfo1 error code */
+volatile uint64_t g_last_npf_rip = 0;          /* D1: last NPF guest RIP */
+volatile ULONG64 g_intr_exit_count = 0;        /* D1b: INTR/NMI VMEXITs (= injection attempts) */
+volatile BOOLEAN g_b0_inject = FALSE;          /* D3-base control: off = no injector */
+volatile BOOLEAN g_b0_cloning = FALSE;         /* D4: set during deep clone so the 10ms
+                                                  diag pauses its file I/O (fixes the
+                                                  D1c 0x50 clone-vs-I/O page-table race) */
 static volatile LONG g_v99_allcore_ready = 0;
 static volatile LONG g_v99_allcore_go = 0;
 static volatile LONG g_v99_allcore_abort = 0;
@@ -1308,6 +1330,37 @@ static VOID yghv_resident_alive_thread(PVOID ctx) {
     }
 }
 
+/* D1c: 10ms host-side diagnostic for the B experiments.  The 0x101 crashes
+   <100ms after guest entry (16 clock ticks), so even 100ms polling misses it.
+   At 10ms we capture a sample within ~10ms of entry: whether the guest VMEXITs
+   (last exit/RIP), hits NPFs, and how many INTR exits (= injection attempts).
+   Runs on host core 0; file writes safe there (not in the VMEXIT path). */
+static VOID yghv_b0_diag_thread(PVOID ctx) {
+    LARGE_INTEGER delay;
+    svm_vcpu_t *v;
+    (void)ctx;
+
+    KeSetSystemAffinityThread((KAFFINITY)1);
+    delay.QuadPart = -10LL * 10000LL;   /* 10 ms */
+    for (;;) {
+        if (g_os_guest_stop_requested)
+            break;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        if (g_b0_cloning)
+            continue;   /* D4: pause file I/O during the deep clone (0x50 race) */
+        yghv_trace_u64("b0 diag npf", g_npf_count);
+        yghv_trace_u64("b0 diag npf gpa", g_last_npf_gpa);
+        yghv_trace_u64("b0 diag intr", g_intr_exit_count);
+        yghv_trace_u64("b0 diag apic mmio", g_v98_apic_mmio_count);
+        yghv_trace_u64("b0 diag exits", g_os_resident_exits);
+        v = g_vcpu_count > 1 ? svm_core_get_vcpu(1) : NULL;
+        if (v) {
+            yghv_trace_u64("b0 diag last exit", v->last_exitcode);
+            yghv_trace_u64("b0 diag last rip", v->last_rip);
+        }
+    }
+}
+
 static VOID yghv_resident_watchdog_thread(PVOID ctx) {
     LARGE_INTEGER delay;
     ULONG64 last = 0;
@@ -1331,6 +1384,31 @@ static VOID yghv_resident_watchdog_thread(PVOID ctx) {
         } else {
             last = g_os_resident_exits;
             stall = 0;
+        }
+    }
+}
+
+/* D3: controlled interrupt injection.  Every 100ms, re-inject the most recent
+   intercepted interrupt (exitintinfo, when valid) into the guest via VMCB
+   event_injection, while host ISR keeps servicing the real clock.  Tests
+   whether the guest can handle a SINGLE injected interrupt in guest mode
+   without being flooded — with the machine kept alive by host ISR so polling
+   can observe it. */
+static VOID yghv_b0_injector_thread(PVOID ctx) {
+    LARGE_INTEGER delay;
+    svm_vcpu_t *v;
+    (void)ctx;
+
+    KeSetSystemAffinityThread((KAFFINITY)1);
+    delay.QuadPart = -100LL * 10000LL;   /* 100 ms */
+    for (;;) {
+        if (g_os_guest_stop_requested)
+            break;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        v = g_vcpu_count > 1 ? svm_core_get_vcpu(1) : NULL;
+        if (v && g_v98_apic_shadow &&
+            (v->vmcb->control.exitintinfo & (1ULL << 31))) {
+            v->vmcb->control.event_injection = v->vmcb->control.exitintinfo;
         }
     }
 }
@@ -1429,6 +1507,53 @@ static VOID yghv_v100_monitor_thread(PVOID ctx) {
     }
 }
 
+/* 9.185 B-1min: xAPIC MMIO shadow.  NPT-remaps guest 0xFEE00000 to a private
+   shadow RAM page so the guest's APIC register access (incl. the ISR EOI write)
+   never touches the PHYSICAL APIC in guest mode (the errata 1363 path).  The
+   real APIC is mapped host-side; yghv_v98_apic_scan_forward (on VMEXIT)
+   forwards TPR/ICR/timer changes.  EOI is intentionally NOT forwarded here
+   (B-1min tests whether avoiding physical APIC access alone prevents the
+   freeze). */
+static void yghv_v98_apic_shadow_apply(svm_vcpu_t *v) {
+    PHYSICAL_ADDRESS apic_pa;
+
+    if (!g_v98_apic_shadow || !v || g_v98_apic_shadow_va)
+        return;
+    apic_pa.QuadPart = 0xFEE00000ULL;
+    g_v98_apic_shadow_va = MmAllocateContiguousMemory(
+        HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
+    if (!g_v98_apic_shadow_va) {
+        LOG_ERROR("v98: shadow page alloc failed");
+        return;
+    }
+    RtlZeroMemory(g_v98_apic_shadow_va, HV_PAGE_SIZE);
+    g_v98_apic_shadow_pa = MmGetPhysicalAddress(g_v98_apic_shadow_va).QuadPart;
+    g_v98_real_apic_va = MmMapIoSpace(apic_pa, HV_PAGE_SIZE, MmNonCached);
+    if (!g_v98_real_apic_va) {
+        LOG_ERROR("v98: map real APIC failed");
+        return;
+    }
+    RtlCopyMemory(g_v98_apic_shadow_va, g_v98_real_apic_va, HV_PAGE_SIZE);
+    g_v98_last_tpr = READ_REGISTER_ULONG(
+        (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TPR));
+    g_v98_last_icrl = READ_REGISTER_ULONG(
+        (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRL));
+    g_v98_last_icrh = READ_REGISTER_ULONG(
+        (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRH));
+    g_v98_last_lvtt = READ_REGISTER_ULONG(
+        (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_LVTT));
+    g_v98_last_tmict = READ_REGISTER_ULONG(
+        (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TMICT));
+    g_v98_last_tdcr = READ_REGISTER_ULONG(
+        (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TDCR));
+    if (npt_map_page(&g_npt, 0xFEE00000ULL, g_v98_apic_shadow_pa,
+                     (NPT_4K_PAGE_FLAGS & ~NPT_PERM_WRITABLE) |
+                     (1ULL << 4) | (1ULL << 63)) != STATUS_SUCCESS)
+        LOG_ERROR("v98: npt_map_page failed");
+    v->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;
+    yghv_trace_u64("v98 apic shadow armed", g_v98_apic_shadow_pa);
+}
+
 static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     uint32_t core = (uint32_t)(uintptr_t)ctx;
     svm_vcpu_t *v;
@@ -1470,6 +1595,7 @@ static VOID yghv_os_guest_resident_spin_thread(PVOID ctx) {
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
     yghv_os_guest_clone_cr3_apply(v);
+    yghv_v98_apic_shadow_apply(v);
     g_os_resident_mode = TRUE;
     yghv_trace_u64("os resident spin enter", core);
     if (core < SVM_MAX_CORES)
@@ -1598,41 +1724,7 @@ static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
     yghv_os_guest_tss_isolate_apply(v);
     yghv_os_guest_cr3_intercept_apply(v);
     yghv_os_guest_clone_cr3_apply(v);
-    if (g_v98_apic_shadow && !g_v98_apic_shadow_va) {
-        PHYSICAL_ADDRESS apic_pa;
-        apic_pa.QuadPart = 0xFEE00000ULL;
-        g_v98_apic_shadow_va = MmAllocateContiguousMemory(
-            HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = 0xFFFFFFFF });
-        if (!g_v98_apic_shadow_va) {
-            LOG_ERROR("v98: shadow page alloc failed");
-        } else {
-            RtlZeroMemory(g_v98_apic_shadow_va, HV_PAGE_SIZE);
-            g_v98_apic_shadow_pa = MmGetPhysicalAddress(g_v98_apic_shadow_va).QuadPart;
-            g_v98_real_apic_va = MmMapIoSpace(apic_pa, HV_PAGE_SIZE, MmNonCached);
-            if (!g_v98_real_apic_va) {
-                LOG_ERROR("v98: map real APIC failed");
-            } else {
-                RtlCopyMemory(g_v98_apic_shadow_va, g_v98_real_apic_va, HV_PAGE_SIZE);
-                g_v98_last_tpr = READ_REGISTER_ULONG(
-                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TPR));
-                g_v98_last_icrl = READ_REGISTER_ULONG(
-                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRL));
-                g_v98_last_icrh = READ_REGISTER_ULONG(
-                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRH));
-                g_v98_last_lvtt = READ_REGISTER_ULONG(
-                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_LVTT));
-                g_v98_last_tmict = READ_REGISTER_ULONG(
-                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TMICT));
-                g_v98_last_tdcr = READ_REGISTER_ULONG(
-                    (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TDCR));
-                if (npt_map_page(&g_npt, 0xFEE00000ULL, g_v98_apic_shadow_pa,
-                                 NPT_4K_PAGE_FLAGS | (1ULL << 4) | (1ULL << 63)) != STATUS_SUCCESS)
-                    LOG_ERROR("v98: npt_map_page failed");
-                v->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;
-                yghv_trace_u64("v98 apic shadow armed", g_v98_apic_shadow_pa);
-            }
-        }
-    }
+    yghv_v98_apic_shadow_apply(v);
     g_os_resident_mode = TRUE;
     yghv_trace_u64("os resident delay enter", core);
     g_v100_guest_entered = TRUE;
@@ -1894,7 +1986,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 200)
+    if (step > 202)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -2060,6 +2152,138 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         for (h = 0; h < 3; h++)
             if (helpers[h]) ZwClose(helpers[h]);
         return st200;
+    }
+
+    /* 9.184 B-0: Option B first sub-step — guest-mode virtual interrupt
+       reception test.  step21 shape (spin guest + INTR/NMI intercept + re-inject
+       the intercepted event into the guest via VMCB event injection) combined
+       with the MSV deep-copied independent CR3.  This isolates the single
+       riskiest assumption of Option B (full APIC virtualization): can the guest
+       RECEIVE and handle an interrupt (the clock ISR) in guest mode at all?  If
+       it survives 60 s (resident alive keeps advancing, no 0x101) -> guest-mode
+       interrupt reception works -> build the full APIC virtualization.  If it
+       0x101/freezes -> guest-mode interrupt handling is the wall (errata 1363),
+       and no APIC virtualization can fix it (the guest ISR must run in guest
+       mode regardless) -> Option B low-value on this CPU, stop. */
+    if (step == 202) {
+        HANDLE thread = NULL, alive = NULL, watchdog = NULL, diag = NULL;
+        HANDLE injector = NULL;
+        NTSTATUS st202;
+
+        yghv_trace("bm b0 spin inject start");
+        /* D4: use the DEEP clone (g_msv_test=TRUE -> yghv_clone_host_cr3_deep) for
+           the STABLE base — 9.152 proved deep independent CR3 + spin + host ISR is
+           stable (12 cores, 5 min).  The deep clone's slowness/race (D1c 0x50) is
+           mitigated by pausing the 10ms diag's file I/O during the clone
+           (g_b0_cloning).  Controlled injection is gated by g_b0_inject. */
+        g_msv_test = TRUE;
+        g_v98_apic_shadow = TRUE;   /* B-1min: shadow xAPIC MMIO so guest ISR
+                                       EOI/TPR never touch the physical APIC */
+        g_v98_apic_mmio_count = 0;
+        g_npf_count = 0;
+        g_last_npf_gpa = 0;
+        g_last_npf_err = 0;
+        g_last_npf_rip = 0;
+        g_intr_exit_count = 0;
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        /* D3: host ISR services the real clock (machine stays alive, polling
+           works); a controlled injector thread re-injects ONE intercepted
+           interrupt into the guest every 100ms to test guest-mode ISR handling
+           without flooding. */
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_host_isr = TRUE;
+        /* g_os_resident_mode deliberately NOT set here: the spin thread sets it
+           AFTER the deep clone, so the watchdog skips the (multi-second) page
+           table deep-copy setup phase instead of 0xE2-ing on a 3s stall (9.186
+           invalid test lesson). */
+        g_os_resident_log_active = TRUE;
+        st202 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                     NULL, yghv_os_guest_resident_spin_thread,
+                                     (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st202)) {
+            LOG_ERROR("bm b0: thread create failed 0x%x", st202);
+            goto b0_fail;
+        }
+        st202 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                     NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st202)) {
+            LOG_ERROR("bm b0: alive create failed 0x%x", st202);
+            goto b0_fail;
+        }
+        st202 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                     NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st202)) {
+            LOG_ERROR("bm b0: watchdog create failed 0x%x", st202);
+            goto b0_fail;
+        }
+        st202 = PsCreateSystemThread(&diag, THREAD_ALL_ACCESS, NULL, NULL,
+                                     NULL, yghv_b0_diag_thread, NULL);
+        if (!NT_SUCCESS(st202)) {
+            LOG_ERROR("bm b0: diag create failed 0x%x", st202);
+            goto b0_fail;
+        }
+        if (g_b0_inject) {   /* D3-base control: injector off by default */
+            st202 = PsCreateSystemThread(&injector, THREAD_ALL_ACCESS, NULL, NULL,
+                                         NULL, yghv_b0_injector_thread, NULL);
+            if (!NT_SUCCESS(st202)) {
+                LOG_ERROR("bm b0: injector create failed 0x%x", st202);
+                goto b0_fail;
+            }
+        }
+        {
+            LARGE_INTEGER b0_timeout;
+            NTSTATUS wait_st;
+
+            /* Returns on guest entry (the resident thread signals the event
+               before the trampoline); survival is measured by the alive thread
+               logging "resident alive" every 5 s on core 0. */
+            b0_timeout.QuadPart = -60LL * 10000000LL;   /* 60 s cap */
+            wait_st = KeWaitForSingleObject(&g_os_guest_done_events[1],
+                                            Executive, KernelMode, FALSE,
+                                            &b0_timeout);
+            if (wait_st == STATUS_TIMEOUT) {
+                yghv_trace("b0 waited 60s");
+                g_os_guest_stop_requested = TRUE;
+                b0_timeout.QuadPart = -10LL * 10000000LL;
+                KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                                      KernelMode, FALSE, &b0_timeout);
+            } else {
+                yghv_trace("b0 guest entered");
+            }
+        }
+        if (thread) ZwClose(thread);
+        if (alive) ZwClose(alive);
+        if (watchdog) ZwClose(watchdog);
+        if (diag) ZwClose(diag);
+        if (injector) ZwClose(injector);
+        g_msv_test = FALSE;
+        g_v98_apic_shadow = FALSE;
+        g_os_resident_mode = FALSE;
+        g_os_guest_intr_intercept = FALSE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_host_isr = FALSE;
+        g_os_resident_log_active = FALSE;
+        yghv_trace_u64("b0 apic mmio count", g_v98_apic_mmio_count);
+        yghv_trace_u64("b0 npf count", g_npf_count);
+        yghv_trace("bm b0 done");
+        return STATUS_SUCCESS;
+
+    b0_fail:
+        g_msv_test = FALSE;
+        g_v98_apic_shadow = FALSE;
+        g_os_resident_mode = FALSE;
+        g_os_guest_intr_intercept = FALSE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_host_isr = FALSE;
+        g_os_resident_log_active = FALSE;
+        if (thread) ZwClose(thread);
+        if (alive) ZwClose(alive);
+        if (watchdog) ZwClose(watchdog);
+        if (diag) ZwClose(diag);
+        if (injector) ZwClose(injector);
+        return st202;
     }
 
     if (step == 6) {

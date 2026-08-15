@@ -50,6 +50,12 @@ extern volatile ULONG g_v98_last_icrh;
 extern volatile ULONG g_v98_last_lvtt;
 extern volatile ULONG g_v98_last_tmict;
 extern volatile ULONG g_v98_last_tdcr;
+extern volatile ULONG64 g_v98_apic_mmio_count;
+extern volatile ULONG64 g_npf_count;
+extern volatile uint64_t g_last_npf_gpa;
+extern volatile uint64_t g_last_npf_err;
+extern volatile uint64_t g_last_npf_rip;
+extern volatile ULONG64 g_intr_exit_count;
 
 #define YGHV_OS_GUEST_EXIT_LIMIT 10000ULL
 
@@ -344,6 +350,127 @@ static void yghv_v98_apic_scan_forward(void) {
     }
 }
 
+/* 9.190 B-1full: xAPIC MMIO write trap.  The APIC page is write-protected in NPT
+   (present+readable, W cleared) so guest writes to 0xFEE00000+offset cause NPF.
+   Decode the write from Decode-Assist, handle the register (EOI -> forward to the
+   real APIC so the LAPIC timer keeps re-firing; TPR/ICR/timer/LDR/DFR/SPIV/ESR ->
+   update the shadow and forward to the real APIC), then the caller advances RIP.
+   Reads are served from the shadow page directly (no NPF).  Returns 0 on success
+   (handled, caller must svm_finish_exit), 1 on decode failure (unhandled). */
+static int yghv_apic_mmio_npf(svm_vcpu_t *vcpu) {
+    const uint8_t *ib = vcpu->vmcb->control.instruction_bytes;
+    uint8_t n = vcpu->vmcb->control.byte_fetched;
+    int i = 0;
+    int rex_b = 0;
+    uint8_t opcode, modrm, rm, reg;
+    uint32_t offset, value;
+    uint64_t *slot;
+
+    if (!g_v98_apic_shadow || !g_v98_apic_shadow_va || !g_v98_real_apic_va)
+        return 0;
+    if (!(vcpu->vmcb->control.exitinfo1 & NPF_INFO1_WRITE))
+        return 0;   /* reads shouldn't NPF; fall through defensively */
+
+    /* skip REX prefix (0x40-0x4F); REX.B extends reg to r8-r15 */
+    while (i < n && (ib[i] & 0xF0) == 0x40) {
+        if (ib[i] & 0x01)
+            rex_b = 1;
+        i++;
+    }
+    if (i + 1 >= n)
+        return 1;
+    opcode = ib[i];
+    modrm = ib[i + 1];
+    reg = (modrm >> 3) & 7;
+    rm = modrm & 7;
+    if (rm != 5 || (modrm & 0xC0) != 0)   /* only [disp32] addressing */
+        return 1;
+    if (i + 5 >= n)
+        return 1;
+    offset = (uint32_t)(ib[i + 2] | (ib[i + 3] << 8) |
+                        (ib[i + 4] << 16) | (ib[i + 5] << 24));
+    offset -= 0xFEE00000U;
+    if (offset >= HV_PAGE_SIZE)
+        return 1;
+
+    if (opcode == 0xC7) {                 /* mov [m32], imm32: C7 /0 */
+        if (reg != 0)
+            return 1;
+        if (i + 9 >= n)
+            return 1;
+        value = (uint32_t)(ib[i + 6] | (ib[i + 7] << 8) |
+                           (ib[i + 8] << 16) | (ib[i + 9] << 24));
+    } else if (opcode == 0x89) {          /* mov [m32], r32: 89 /r */
+        switch (reg | (rex_b << 3)) {
+            case 0x00: slot = &vcpu->regs.rax; break;
+            case 0x01: slot = &vcpu->regs.rcx; break;
+            case 0x02: slot = &vcpu->regs.rdx; break;
+            case 0x03: slot = &vcpu->regs.rbx; break;
+            case 0x05: slot = &vcpu->regs.rbp; break;
+            case 0x06: slot = &vcpu->regs.rsi; break;
+            case 0x07: slot = &vcpu->regs.rdi; break;
+            case 0x08: slot = &vcpu->regs.r8;  break;
+            case 0x09: slot = &vcpu->regs.r9;  break;
+            case 0x0A: slot = &vcpu->regs.r10; break;
+            case 0x0B: slot = &vcpu->regs.r11; break;
+            case 0x0C: slot = &vcpu->regs.r12; break;
+            case 0x0D: slot = &vcpu->regs.r13; break;
+            case 0x0E: slot = &vcpu->regs.r14; break;
+            case 0x0F: slot = &vcpu->regs.r15; break;
+            default: return 1;
+        }
+        value = (uint32_t)(*slot);
+    } else {
+        return 1;
+    }
+
+    g_v98_apic_mmio_count++;
+
+    switch (offset) {
+    case APIC_OFFSET_EOI:   /* write-only: forward EOI so the LAPIC timer keeps
+                               re-firing; no shadow store (unreadable) */
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_EOI), value);
+        return 0;
+    case APIC_OFFSET_TPR:
+        g_v98_last_tpr = value;
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TPR), value);
+        break;
+    case APIC_OFFSET_ICRH:
+        g_v98_last_icrh = value;
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRH), value);
+        break;
+    case APIC_OFFSET_ICRL:  /* write ICRH (pending) then ICRL (initiate IPI) */
+        g_v98_last_icrl = value;
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRH),
+                             g_v98_last_icrh);
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_ICRL), value);
+        break;
+    case APIC_OFFSET_LVTT:
+        g_v98_last_lvtt = value;
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_LVTT), value);
+        break;
+    case APIC_OFFSET_TMICT:
+        g_v98_last_tmict = value;
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TMICT), value);
+        break;
+    case APIC_OFFSET_TDCR:
+        g_v98_last_tdcr = value;
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TDCR), value);
+        break;
+    case APIC_OFFSET_LDR:
+    case APIC_OFFSET_DFR:
+    case APIC_OFFSET_SPIV:
+    case APIC_OFFSET_ESR:
+        WRITE_REGISTER_ULONG((PULONG)((ULONG_PTR)g_v98_real_apic_va + offset), value);
+        break;
+    default:
+        break;   /* unknown register: shadow store only, no forward */
+    }
+    /* store the written value into the shadow so guest reads see it */
+    *(volatile uint32_t *)((ULONG_PTR)g_v98_apic_shadow_va + offset) = value;
+    return 0;
+}
+
 int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     uint64_t exitcode = vcpu->vmcb->control.exitcode;
     vcpu->last_exitcode = exitcode;   /* 9.152 diag: for freeze/stop localization */
@@ -461,6 +588,27 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         uint64_t pf_ec = 0;
         yghv_npf_result_t npf_result = YGHV_NPF_NONE;
 
+        /* D1: NPF diagnostics — count every NPF, record the last fault site.
+           In-memory only (no file write in the VMEXIT path). */
+        g_npf_count++;
+        g_last_npf_gpa = vcpu->vmcb->control.exitinfo2;
+        g_last_npf_err = vcpu->vmcb->control.exitinfo1;
+        g_last_npf_rip = vcpu->vmcb->state.rip;
+
+        /* 9.190 B-1full: APIC MMIO write trap.  If the faulting GPA is the
+           virtualized xAPIC page, emulate the write (EOI/TPR/ICR/timer forward
+           to the real APIC) and advance RIP — never inject #PF on the APIC
+           page. */
+        if (g_v98_apic_shadow &&
+            (vcpu->vmcb->control.exitinfo2 & ~0xFFFULL) == 0xFEE00000ULL) {
+            if (yghv_apic_mmio_npf(vcpu) == 0) {
+                svm_finish_exit(vcpu);
+                return 0;
+            }
+            LOG_ERROR("APIC MMIO decode failed RIP=0x%llx GPA=0x%llx",
+                vcpu->vmcb->state.rip, vcpu->vmcb->control.exitinfo2);
+        }
+
         if (info1 & NPF_INFO1_WRITE)
             npf_result = yghv_protect_on_npf_write(vcpu,
                 vcpu->vmcb->control.exitinfo2);
@@ -527,6 +675,7 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     case SVM_EXIT_INTR:
     case SVM_EXIT_NMI:
         vcpu->resident_interrupt_exits++;
+        g_intr_exit_count++;   /* D1b: INTR/NMI VMEXITs (= injection attempts) */
         return 0;
 
     /* Instruction-boundary exits — advance RIP */
