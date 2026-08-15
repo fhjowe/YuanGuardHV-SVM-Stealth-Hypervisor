@@ -3637,3 +3637,489 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **机器状态**：C 盘稳定默认版 `70888311`，服务 STOPPED，机器安全。
 - **待定**：是否将 B/D 系列代码与文档提交（step200/202 为门控实验，默认构建不激活）。
 - 提交：本记录。
+
+### 9.199 2026-08-15 提交 + 新窗口提示词更新
+
+- **提交**：B/D 系列代码 + 文档（main.c / vmexit.c / HANDOFF 9.180-9.198 / 新总结文档）
+  已提交为 `7f19683`（+964 行）；工作区干净；bin 已重建当前 HEAD 默认版
+  `8B59430C...`（构建 SUCCESS）。
+- **新增 `docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md`**：OS-as-Guest 完整横向总结。
+- **更新 `docs/YUANMOD_NEXT_WINDOW_PROMPT.md`**：完整重写为 9.198 状态（协作铁律、当前
+  状态、关键结论、本机雷区、归档、下一步、常用命令、文档索引）。
+- **状态**：C 盘稳定默认版 `70888311`，服务 STOPPED，机器安全；工作区干净，HEAD
+  `7f19683`（NEXT_WINDOW_PROMPT 更新未提交，待下次一并提交）。
+- 提交：本记录。
+
+### 9.200 2026-08-15 用户决策：VM + KD 重新开启全核常驻路线（第一步）
+
+- **背景**：用户希望用 VM + kd 调试继续研究全核常驻（OS-as-guest）路线，理由：
+  VMware 是软件 L0，guest 态执行由 VMware 模拟调度，可能绕开本机裸机 errata 1363
+  类平台限制；且 VM 里冻结最多是 VM 冻结，宿主安全，配合 kd 可反复实验。
+- **环境核实**（只读）：
+  - SVM/NPT 开启（`VirtualizationFirmwareEnabled=True`），HypervisorPresent=False，裸机。
+  - yuanguard 服务 STOPPED；C 盘稳定版 `70888311`（9.112 旧版，无多目标命令）。
+  - VMware Workstation 17.6.4 已装；kd.exe 在 Windows Kits Debuggers。
+  - 调试 VM `C:\Users\Administrator\Documents\Virtual Machines\Windows 10 x64\
+    Windows 10 x64.vmx` 完整可用：官方 Win10 Pro 19045.2965，`vhv.enable=TRUE`，
+    numvcpus=4、memsize=8192，serial0 命名管道 `\\.\pipe\yuanhv_debug`（server,
+    startConnected=TRUE），共享目录 `D:\aaaaaavm` 挂载为 `aaaaaavm`。
+- **历史纠错（重要）**：此前提示词把 "VMware 17.6.4 启动任何 VM 硬卡死" 标为
+  9.85-9.88——**编号有误**。9.85-9.88 实际是云服务器 KDNET 调试（Realtek RTL8168
+  硬件级不支持 KDNET）记录。真实 VMware 冻结是 8.1-8.5 节（2026-08-09/10，精简镜像
+  "不忘初心" + 调试管道组合），9.4 官方镜像重装 VM 后该 VM 一直稳定，9.11-9.22 在
+  VM 里把 VMRUN/VMMCALL/NPT/保护/hook 全链路验证通过。
+- **VM 冻结前科（9.43，2026-08-11）**：v56/v57 在 VM 里跑多核心跳回归时 "VM 仍整机
+  冻结"；但该结论在 v58 诊断刷盘副作用（ZwFlushBuffersFile 进常驻热路径 → I/O 风暴
+  死锁）未清除时得出；v60 清除后实机稳定，**VM 未用干净版复测**。
+- **OS-as-guest 从未在 VM 里试过**：9.44 之后全转实机，9.197 本机定论是裸机平台限制。
+- **用户确认的第一步**（本会话问答确认）：
+  1. 构建门控版 `YGHV_BAREMETAL_STEP=11`（有界 2 核心跳 + INTR/NMI/SHUTDOWN 拦截，
+     与 9.43 冻结形态对齐；wait_all_stopped 自动退出，不常驻，风险低）。
+  2. 复制到共享目录 `D:\aaaaaavm\`（VM 内 `aaaaaavm`）。
+  3. 用户 GUI 启动 VM；我连 kd（run_kd.bat / kd_ctl.ps1）。
+  4. VM 内加载 step11 跑有界心跳回归；通过 = VM 基座可用，冻结 = 分析冻结点。
+- **已确认**：构建覆盖 `bin\yuanguard_hv.sys`（当前 HEAD 默认版 8B59430C），C 盘稳定版
+  `70888311` 不受影响；本机不承载持续 VMRUN 常驻负载，VM 内实验。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.201 2026-08-15 VM 路线第一步+第二步实机结果：VM 基座可用 + OS-as-guest 有界试点成功（突破）
+
+- **执行链**（用户 GUI 启动 VM → kd 管道先连再 reset VM 才能激活串口 → VM 内 sc 加载门控版）：
+  1. **KD 串口关键教训**：serial0 是 pipe **server** 端，必须先让 kd 客户端连上
+     `\\.\pipe\yuanhv_debug` **再启动/重启 VM**，串口后端才就绪、guest 才枚举 COM1；
+     否则 guest 无 COM1、kdcom 不激活、kd 一直 Waiting to reconnect。本次复现并解决。
+  2. **step11（有界 2 核心跳 + INTR/NMI/SHUTDOWN 拦截）**：VM 内加载成功，服务
+     RUNNING，`WIN32_EXIT_CODE 0`。kd 日志：`r1 unit: PASS`、`NPT enabled for 2
+     cores: pml4=0xbf7a2000`、`heartbeat limit reached, stopping resident loop`
+     （10000 次心跳跑满正常停止）。CPUID 8000000A：`NPT=1 FLUSHBYASID=1`（VMware
+     嵌套下 NPT/FLUSHBYASID 均暴露）。**9.43 的 VM 多核心跳冻结前科未复现** → VM
+     基座可用（v60 后干净版首次 VM 复测通过）。
+  3. **step12（单核 core1 有界 OS guest：guest 内 5000 次 CPUID/RDTSC + 60s 超时）**：
+     VM 内加载成功，服务 RUNNING，`WIN32_EXIT_CODE 0`（STATUS_SUCCESS，非超时）。
+     guest `C:\Windows\yghv_progress.log` 完整链：`bm os guest start → tss
+     isolated=0xbf7a6000 → cr3 intercept enabled → cloned cr3=0xbf794000 → thread
+     enter=1 → host done=1 → **os guest counter=0x1388(=5000)** → bm os guest done
+     → bm done`。**真实 Windows 内核代码在 guest 态完整执行 5000 次 CPUID/RDTSC**。
+- **重大结论**：裸机 OS-as-guest step12 实机 0x7E/硬冻结（9.44-9.45），**VM 里成功**。
+  → 证实用户核心假设：**VMware 软件 L0 绕开了本机裸机 errata 1363 类平台限制**，
+  VM 是 OS-as-guest/全核常驻研究的可用平台（宿主安全，冻结最多是 VM 冻结）。
+- **环境说明**：kd 当前保持连接（PID 6024，kd_auto.log 记录 YGHV DbgPrint）。step12
+  驱动已加载于 VM（服务 RUNNING）。共享目录根 `D:\aaaaaavm\yuanguard_hv.sys` 被 VM
+  共享句柄占用无法覆盖，改用带日期命名 `yuanguard_hv_step1X_20260815.sys`。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 内 step12 服务 RUNNING
+  （待卸载/继续）。
+- 提交：本记录。
+
+### 9.202 2026-08-15 step20 常驻在 VM 里复测 PASS（自旋常驻 + INTR 拦截 + host ISR）
+
+- **执行**：卸载 step12 → 构建 `YGHV_BAREMETAL_STEP=20`（SHA256
+  `2cb62bc49310511186f00d5d2c9fcd8a72867459bad81ac2842f20bd72e20d5c`，归档
+  `D:\aaaaaavm\yuanguard_hv_step20_20260815.sys`）→ VM 内创建服务加载。
+- **结果（完整 PASS）**：
+  - `sc start` → `STATE 4 RUNNING, WIN32_EXIT_CODE 0`；
+  - guest 进度日志：`bm os resident spin host-isr start → tss isolated=0xbf7a8000
+    → cr3 intercept enabled → cloned cr3=0xbf796000 → os resident spin enter=1
+    → bm os resident spin host-isr running → bm done`；
+  - **常驻稳定**：`resident alive` 从 `0x5` 每 5 秒递增到 `0x28`（40 秒持续运行，
+    无冻结）；
+  - **干净卸载**：`sc stop` → `STATE 1 STOPPED, WIN32_EXIT_CODE 0`（无 0xCE/冻结），
+    `sc query` 复核 STOPPED/0。
+- **结论**：自旋常驻 + INTR 拦截 + host ISR（裸机唯一 PASS 形态）在 VM 里复测
+  PASS——VM 常驻基线建立，且验证无宿主风险。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 内 step20 已卸载。
+- 提交：本记录。
+
+### 9.203 2026-08-15 step14 全核有界 OS guest 在 VM 里 PASS（多核并发进入 guest 态）
+
+- **执行**：构建 `YGHV_BAREMETAL_STEP=14`（SHA256
+  `c128ce2cbe17a4cef9d9bcdadccf3550fd066721eae954933c48487f5ac01f7d`，归档
+  `D:\aaaaaavm\yuanguard_hv_step14_20260815.sys`）→ VM 内加载（先 `sc delete` 清理
+  step20 残留服务再 create）。
+- **结果（完整 PASS）**：`sc start` → RUNNING/WIN32_EXIT_CODE 0；guest 进度日志：
+  `bm os guest all start → 两核均 tss isolated/cr3 intercept/cloned cr3/thread
+  enter → 两核 host done=1/0 → 两核 os guest exits=0x2710(=10000) → os guest
+  counter=0x2710 → bm os guest all done → bm done`。kd：`NPT enabled for 2 cores`
+  （VM 内驱动检测 active processors=2）。
+- **结论**：多核（全核）同时进入 guest 态执行 CPUID/RDTSC 有界跑完，VM 里稳定；
+  比 step12 单核更进一步。渐进路线继续。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 内 step14 已加载
+  （服务 RUNNING，待卸载）。
+- 提交：本记录。
+
+### 9.204 2026-08-15 step16 全核 seamless OS guest 在 VM 里 PASS（无缝上下文延续）
+
+- **执行**：构建 `YGHV_BAREMETAL_STEP=16`（SHA256
+  `b96af48f9551d58975b12b4fbccac361657c36133a9792c4eaf131ca10fab2cd`，归档
+  `D:\aaaaaavm\yuanguard_hv_step16_20260815.sys`）→ VM 内加载（step14 服务已卸载）。
+- **结果（完整 PASS）**：`sc start` → RUNNING/WIN32_EXIT_CODE 0；guest 进度日志：
+  `bm os seamless all start → 两核均 tss isolated/cr3 intercept/cloned cr3/
+  os seamless enter=1/0 → 两核 host done=1/0 → 两核 os seamless exits=0x2710
+  (=10000) → os guest counter=0x2710 → bm os seamless all done → bm done`。
+  guest 用 `svm_os_seamless_cont`（无缝延续上下文）执行。
+- **结论**：seamless 形态（上下文延续）在 VM 里全核稳定，渐进路线 step12/14/16
+  全部 PASS。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 内 step16 已加载
+  （服务 RUNNING，待卸载）。
+- 提交：本记录。
+
+### 9.205 2026-08-15 step17 阻塞常驻在 VM 里硬冻结：NPF 捕获 guest 态物理 APIC 访问（决定性证据）
+
+- **执行**：构建 `YGHV_BAREMETAL_STEP=17`（阻塞常驻，guest 用 `svm_os_seamless_cont`
+  延续执行真实 Windows 上下文，SHA256 `92373a70aee3aeb71a24eaa7d87aa96e80dc6e6128
+  2f24e3266aaaf3d2027480`，归档 `D:\aaaaaavm\yuanguard_hv_step17_20260815.sys`）。
+- **结果**：VM 内 `sc start` 执行时 **VM 整机卡死**（guest 无响应，宿主正常；
+  用户报告"虚拟机卡住了"，已用 vmrun reset 重启 VM）。
+- **决定性诊断（kd 冻结前捕获 NPF early）**：
+  - `NPF early: exits=2 GPA=0xfee000b0 info1=0x100000006`（fetch+write）
+  - `NPF early: exits=13 GPA=0xfee00300 info1=0x100000004`（write）
+  - `NPF early: exits=18 GPA=0xfee00300 info1=0x100000004`（write）
+  - `NPF early: exits=20 GPA=0xfee00300 info1=0x100000004`（write）
+  - **GPA=0xfee000b0 / 0xfee00300 均为 xAPIC 地址空间（FEE00000-FEEFFFFF）**，
+    write 访问。→ **guest 态物理 APIC 访问触发 NPF → 硬冻结**，与裸机 9.189 结论
+    一致（errata 1363：guest 态物理 APIC 访问 = 硬冻结触发点）。
+- **意义**：VM 里 step17 冻结根因与裸机**同一堵 APIC 墙**——VMware 软件 L0 绕开了
+  "真实 Windows 代码在 guest 态执行"本身，但 **guest 态物理 APIC 访问仍是冻结点**。
+  裸机 B-1min（v98 APIC 影子）把硬冻结变成可诊断 0x101（9.189）→ **VM 里应复测
+  step98（APIC 影子）**，看能否同样消除硬冻结。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 vmrun reset 重启
+  进桌面；kd 进程存活（PID 6024），VM 重启后需重新握手。
+- 提交：本记录。
+
+### 9.206 2026-08-15 step98（APIC 影子 + 阻塞常驻）在 VM 里硬冻结：npt_map_page 对 APIC 失败
+
+- **执行**：构建 `YGHV_BAREMETAL_STEP=98`（`g_v98_apic_shadow=TRUE` + step23 阻塞常驻
+  基座，SHA256 `ef430ee13de4c0a78d2478cd218516f3a855647d86f8fbe0be9c33b28ed90d00`，
+  归档 `D:\aaaaaavm\yuanguard_hv_step98_20260815.sys`）→ VM 内加载（kd 已先持管道
+  再 reset VM 成功重握手，Connected count=2，新内核基址 0xfffff801`6e200000）。
+- **结果**：VM 内 `sc start` 执行时**再次整机卡死**（用户报告"执行加载卡住"，已
+  vmrun reset 重启）。
+- **根因（kd 冻结前捕获）**：最后一条 `[YGHV][E] v98: npt_map_page failed`。
+  - `yghv_v98_apic_shadow_apply` 调 `npt_map_page(&g_npt, 0xFEE00000ULL, shadow_pa,
+    ...)` 返回非 STATUS_SUCCESS；
+  - 裸机 B-1min（9.189）该调用成功（`v98 apic shadow armed=0xc7d2d000`），VM 里失败
+    → **VMware 嵌套下 NPT 无法重映射 0xFEE00000 xAPIC 页**（与"VMware 嵌套不能剔除
+    NPT 私有页"限制一致）；
+  - APIC 影子未装上 → guest 态物理 APIC 访问依旧硬冻结（同 step17，无 NPF 新日志
+    即卡在 APIC 访问路径）。
+- **VM 路线阶段性负面结论**：VMware 软件 L0 能绕开"真实 Windows 代码在 guest 态
+  执行"（step12/14/16 PASS），但 **guest 态物理 APIC 访问仍是硬冻结点**，且
+  **VMware 嵌套下 APIC 影子（裸机 B-1min 解法）无法部署** → VM 里阻塞常驻同样卡在
+  errata 1363 类 APIC 墙。VM 与裸机结论收敛：**APIC 虚拟化/影子是唯一出路**，需在
+  支持 APIC MMIO 重映射的平台（KVM/真实硬件）验证。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启进桌面，kd 已
+  重握手（PID 11148）。
+- 提交：本记录。
+
+### 9.207 2026-08-15 v98fix 生效 + 诊断：Decode-Assist 正常，卡点=解码器只支持 [disp32] 寻址
+
+- **v98fix（main.c）**：`yghv_v98_apic_shadow_apply` 在 `npt_map_page` 前补
+  `npt_identity_map_range(&g_npt, 0xFEE00000, 0xFEE00000+HV_PAGE_SIZE)`。备份
+  `D:\aaaaaavm\main.c.bak-20260815-v98fix`。**修复生效**：VM 里不再报
+  `v98: npt_map_page failed`，APIC 影子装上，guest APIC 访问被 NPT 捕获
+  （GPA=0xfee00300/0xfee00310）。
+- **新卡点 + 诊断（vmexit.c 解码失败日志加 nf/ib 打印，SHA256
+  `42fd489e08d1d6c3956f79c7824980b4b9d3d891450f1f934bc5e591a82dc3e3`，归档
+  `D:\aaaaaavm\yuanguard_hv_step98diag_20260815.sys`）**：
+  - `APIC MMIO decode failed RIP=... GPA=0xfee00300 nf=15
+    ib=89 90 00 03 00 00 c3 ...` → 89 90 00 03 00 00 = `mov [rax+0x300], ecx`
+  - `GPA=0xfee00310 nf=15 ib=89 88 10 03 00 00 48 8b 05 ...` → `mov [rax+0x310], ecx`
+  - **`nf=15`（byte_fetched）→ Decode-Assist 填充完全正常（非 VMware 限制）**；
+  - **解码器 bug**：`yghv_apic_mmio_npf` line 386 强制 `rm!=5 || mod!=0`
+    （只支持 `[disp32]` 裸寻址），而 Windows APIC 写用 **`[rax+disp32]` 基址寻址**
+    （mod=2, rm=0）→ 被拒 → 解码失败 → 无法推进 RIP → VM 卡住。
+- **修复方向（明确）**：放宽寻址检查（GPA 已由 exitinfo2 提供，无需从指令解码
+  地址），`89 /r` value 从 reg 字段对应寄存器取，`next_rip` 推进 RIP。这是纯解码器
+  增强，不涉平台限制。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 vmrun reset 重启
+  进桌面，kd 需重握手。
+- 提交：本记录。
+
+### 9.208 2026-08-15 解码器修复生效 + step98 阻塞常驻仍硬冻结：kd 无法打断（VM 与裸机收敛）
+
+- **解码器修复（vmexit.c `yghv_apic_mmio_npf`）**：放宽寻址检查——不再要求
+  `rm!=5||mod!=0`（[disp32] 裸寻址），GPA offset 直接取 `exitinfo2 & 0xFFF`，
+  `89 /r` value 从 reg 字段对应寄存器取，`C7 /0` imm32 用 `next_rip-rip` 定位
+  （Decode-Assist 已证填充正常，nf=15）。备份 `D:\aaaaaavm\main.c.bak-20260815-v98fix`。
+  构建 step98 含修复 SHA256 `71b6186859bea64ff57451b2b4ad100ff936199afa66bb6aac7d1e573d7783ca`
+  （归档 `D:\aaaaaavm\yuanguard_hv_step98decodefix_20260815.sys`）。
+- **断点教训（run_kd.bat）**：原 `-c ".reload;bu yuanguard!DriverEntry;g"` 在 kd
+  真正连接时，驱动加载到 DriverEntry 即命中断点→guest 冻结等待 kd 输入（SCM 显示
+  RUNNING 但 guest 卡住）。已改为 `.reload;g`（无断点）。**kd 连接时不能设
+  DriverEntry 断点，除非用交互续行。**
+- **step98decodefix 实机（VM）**：progress log 走到**前所未有的深度**：
+  `bm step=0x62 → v98 apic shadow armed=0xbf78e000 → os resident delay enter=1 →
+  bm os resident block delay running → bm done`（APIC 影子+解码器两项修复生效）。
+  但**之后无 `resident alive` 递增 → 阻塞常驻卡死**。
+- **kd 交互（kd_ctl.ps1 -b 模式）打断失败（决定性）**：VM 卡住后发 Ctrl+C，
+  **kd 无法打断**（kd_ctl.log 停在 prepare vcpu CPUID 8000000A，无 `kd>` 提示符，
+  进程存活 CPU 2.08）。→ **与裸机 9.166/9.197 的"硬冻结形态无观测能力"完全一致**：
+  guest 态进入后整机卡死，kd 连 Ctrl+C 都无法打断，无 dump、无现场。
+- **VM 与裸机最终收敛**：
+  - 有界/自旋形态（step11/12/14/16/20）：VM 全部 PASS（远超裸机）；
+  - **阻塞常驻（step17/step98，guest 态跑真实 Windows 调度器/ISR）：VM 硬冻结，
+    kd 无观测能力**，与裸机 9.197 定论一致；
+  - APIC 影子+解码器修复让 progress 走得更深，但**未消除阻塞常驻冻结**——冻结点
+    是"guest 态执行真实 Windows 调度器"本身，APIC 访问已不是主要墙。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 reset 重启进桌面。
+- 提交：本记录。
+
+### 9.209 2026-08-15 step202（自旋+深拷贝+APIC 影子）VM 冻结 <10ms：变量锁定=APIC 影子/深拷贝
+
+- **执行**：构建 `YGHV_BAREMETAL_STEP=202`（B 路线：自旋 guest + 深拷贝 CR3
+  g_msv_test=TRUE + APIC 影子 g_v98_apic_shadow=TRUE + host ISR + 10ms b0 diag
+  观测，SHA256 `f941638087d5678a73a8782d6f498e4e44a331b621fd2d7b674f19fb45c1c392`，
+  归档 `D:\aaaaaavm\yuanguard_hv_step202_20260815.sys`）。
+- **结果**：VM 内加载后 **整机冻结 <10ms**（`b0 guest entered` 后**零笔 b0 diag
+  样本**——10ms 采样线程都没来得及写，比裸机 <10s 更快，全核瞬间停转，core0 diag
+  线程也死）。
+- **关键变量锁定（对比 step20）**：
+  | 形态 | CR3 | APIC 影子 | VM 结果 |
+  |---|---|---|---|
+  | step20 | 浅拷贝 | 无 | ✅ PASS（alive 0x28） |
+  | step202 | **深拷贝** | **有** | ❌ 冻结 <10ms |
+  - 裸机 9.152 证深拷贝 CR3 稳定（12 核 5min）；裸机 B-1min 证 APIC 影子有效
+    （硬冻结→0x101 可诊断）→ 两者在 VM 里行为**反常**，需对照实验区分。
+- **未决**：step202 冻结是 APIC 影子导致，还是深拷贝 CR3 导致，还是组合？
+  对照实验设计：A) step202 关 APIC 影子（g_v98_apic_shadow=FALSE 保留深拷贝）；
+  B) step202 关深拷贝（g_msv_test=FALSE 用浅拷贝保留 APIC 影子）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 reset 重启进桌面。
+- 提交：本记录。
+
+### 9.210 2026-08-15 对照实验 A 结果：关 APIC 影子仍冻结 → 冻结源=深拷贝 CR3
+
+- **变体 A 构建**：`YGHV_BAREMETAL_STEP=202` + `YGHV_NO_APIC_SHADOW=1`（main.c step202
+  加 `#ifndef YGHV_NO_APIC_SHADOW` 门控，build.bat 加传递；备份
+  `D:\aaaaaavm\main.c.bak-20260815-step202-ctlA`、`build.bat.bak-20260815-ctlA`）。
+  SHA256 `e8780f05e67088417f242cf62f56a54519a6a9611ff25d7bbdf935ef162ac7a1`，归档
+  `D:\aaaaaavm\yuanguard_hv_step202_noapicshadow_20260815.sys`。
+- **变体 A 实机（VM）**：仍整机冻结。progress log：`bm step=0xca → b0 spin inject
+  start → tss isolated → cr3 intercept → msv deep cr3 cloned=0x2399ce000 → os
+  resident spin enter=1 → b0 guest entered → b0 apic mmio count=0`（比标准 step202
+  多写一笔 diag，但仍在 guest 进入后极快冻结，VM 完全卡死，需 reset）。
+- **关键定位（对照表）**：
+  | 形态 | CR3 | APIC 影子 | VM 结果 |
+  |---|---|---|---|
+  | step20 | 浅拷贝 | 无 | ✅ PASS |
+  | 变体 A | 深拷贝 | 无 | ❌ 冻结 |
+  | 标准 step202 | 深拷贝 | 有 | ❌ 冻结 |
+  - step20 与变体 A 同为"无 APIC 影子 + 自旋 + host ISR"，唯一差异=深/浅拷贝 CR3；
+    step20 浅拷贝 PASS、变体 A 深拷贝冻结 → **深拷贝 CR3 在 VM 里是冻结源**。
+  - 裸机 9.152 证深拷贝稳定（12核5min），**VM 里深拷贝整棵宿主页表反而冻结**
+    （VMware 嵌套下页表遍历/克隆 600ms+ 慢 + D1c 0x50 竞态类问题）。
+- **未决**：变体 B（浅拷贝 + APIC 影子）待测——确认"浅拷贝 + APIC 影子 + 自旋"
+  能否在 VM 存活。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 reset 重启进桌面。
+- 提交：本记录。
+
+### 9.211 2026-08-15 对照实验 B 结果：浅拷贝+APIC 影子仍冻结 → 深拷贝与 APIC 影子均为独立冻结源
+
+- **变体 B 构建**：`YGHV_BAREMETAL_STEP=202` + `YGHV_NO_MSV_DEEP=1`（main.c step202
+  加 `#ifndef YGHV_NO_MSV_DEEP` 门控使 g_msv_test=FALSE 用浅拷贝，保留 APIC 影子；
+  build.bat 加传递）。SHA256
+  `24c7532db1fd23732edd49707a402575dc36696c7b36143839e297a37fb51ec5`，归档
+  `D:\aaaaaavm\yuanguard_hv_step202_shallow_20260815.sys`。
+- **变体 B 实机（VM）**：仍整机冻结。progress log：`bm step=0xca → b0 spin inject
+  start → tss isolated → cr3 intercept → os guest cloned cr3=0xbf78d000（浅拷贝
+  bf 段）→ v98 apic shadow armed=0xbf78c000 → os resident spin enter=1 → b0 guest
+  entered`（冻结，VM 完全卡死，reset 恢复）。
+- **对照实验完整矩阵（VM）**：
+  | 变体 | CR3 | APIC 影子 | 结果 |
+  |---|---|---|---|
+  | step20 | 浅拷贝 | 无 | ✅ PASS（alive 0x28） |
+  | 变体 A | 深拷贝 | 无 | ❌ 冻结 |
+  | 变体 B | 浅拷贝 | 有 | ❌ 冻结 |
+  | 标准 step202 | 深拷贝 | 有 | ❌ 冻结 |
+  - **结论：深拷贝 CR3 与 APIC 影子在 VM 里均为独立冻结源**（各自单独加入即冻结）。
+    只有 step20（浅拷贝 + 无 APIC 影子 + 自旋 + host ISR）在 VM 存活。
+- **意义**：VMware 嵌套下 APIC 影子（NPT 重映射 0xFEE00000）即便浅拷贝也导致冻结
+  ——裸机 B-1min 有效（硬冻结→0x101），VM 里不可用；深拷贝整棵宿主页表在 VM 里
+  也冻结（VMware 嵌套页表遍历问题）。VM 路线进一步收敛：阻塞常驻所需的两项关键
+  技术（APIC 影子/深拷贝）在 VMware 嵌套下都不可用。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 reset 重启进桌面。
+- 提交：本记录。
+
+### 9.212 2026-08-15 变体 C' 决定性结论：VM 里拦截 APIC 写本身即冻结（完整矩阵）
+
+- **变体 C'（正确构建）**：`YGHV_BAREMETAL_STEP=202` + `YGHV_NO_MSV_DEEP=1`（浅拷贝）
+  + `YGHV_APIC_IDENTITY=1`（APIC 影子不重定向 shadow，`npt_map_page` 目标=
+  0xFEE00000 自身 identity，仅清 W 位拦截写；main.c 加 `#ifndef YGHV_APIC_IDENTITY`
+  门控，备份 `D:\aaaaaavm\main.c.bak-20260815-step202-ctlC`）。SHA256
+  `5077f8f53fe2d6e53d16b76ed17f45af963b26def3444c2a563d3ac121dff290`，归档
+  `D:\aaaaaavm\yuanguard_hv_step202_apicidentity_shallow_20260815.sys`。
+  （注：先误构建了深拷贝+identity 的 C，progress 显示 deep cr3 cloned，已废弃；
+   重建成正确 C'。）
+- **变体 C' 实机（VM）**：仍整机冻结。progress log：`bm step=0xca → b0 spin inject
+  start → tss isolated → cr3 intercept → os guest cloned cr3=0xbf791000（浅拷贝）→
+  v98 apic shadow armed=0xbf790000 → os resident spin enter=1 → b0 guest entered`
+  （冻结，无 diag，VM 完全卡死，reset 恢复）。
+- **完整对照矩阵（VM）**：
+  | 变体 | CR3 | APIC 处理 | VM 结果 |
+  |---|---|---|---|
+  | step20 | 浅拷贝 | 无拦截，直通 VMware 虚拟 APIC | ✅ PASS |
+  | 变体 A | 深拷贝 | 无拦截 | ❌ 冻结 |
+  | 变体 B | 浅拷贝 | 重定向 shadow + 拦截 | ❌ 冻结 |
+  | 变体 C' | 浅拷贝 | **identity + 清 W（只拦截写）** | ❌ 冻结 |
+  | 标准 step202 | 深拷贝 | 重定向 shadow + 拦截 | ❌ 冻结 |
+- **决定性结论**：step20 与 C' 唯一差异=是否拦截 guest APIC 写（清 W 触发 NPF+转发）；
+  C' 不重定向、仅清 W 拦截写仍冻结 → **VM 里拦截 guest 对 APIC 页的任何访问（哪怕
+  只清 W 位）即整机冻结**。VMware L0 自虚拟化 APIC，不允许 L1 经 NPT 权限位干预
+  APIC 页（与"VMware 嵌套不能剔除 NPT 私有页"限制同源）。→ **VM 里无 APIC 虚拟化
+  空间**，阻塞常驻所需的所有关键技术在 VMware 嵌套下均不可用。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 reset 重启进桌面。
+- 提交：本记录。
+
+### 9.213 2026-08-15 变体 D（APIC 直通+阻塞常驻）突破：硬冻结→可诊断 0x139，guest 存活 10 分钟
+
+- **变体 D 构建**：`YGHV_BAREMETAL_STEP=17` + `YGHV_APIC_PASSTHROUGH=1`（main.c
+  step17 阻塞线程 `yghv_os_guest_resident_thread` 在 `svm_core_set_npt` 后补
+  `npt_identity_map_range(&g_npt, 0xFEE00000, +HV_PAGE_SIZE)`——APIC 页全权限
+  identity 直通，不清 W 不拦截；build.bat 加传递；备份
+  `D:\aaaaaavm\main.c.bak-20260815-step17-ctlD`）。SHA256
+  `4eca79d1d5717cdc0a6efff53d9dc297b6db45e4042ff846abf3a9a8eb28c6a3`，归档
+  `D:\aaaaaavm\yuanguard_hv_step17_apicpassthrough_20260815.sys`。
+- **变体 D 实机（VM）：重大突破——硬冻结变成可诊断蓝屏**：
+  - **guest 存活 10 分钟**（dump `System Uptime: 0:10:24`），期间真实运行含
+    NtWriteFile 文件写入（写 progress log），远超此前 step17 系 <10ms 冻结；
+  - **蓝屏 0x139 KERNEL_SECURITY_CHECK_FAILURE，Arg1=0x4 = FAST_FAIL_INCORRECT_
+    STACK**（线程栈指针超出合法栈范围），dump `081526-5937-01.dmp`（428KB，归档
+    `D:\aaaaaavm\yghv_bsod_variantD.dmp`）；
+  - **完整调用栈**：`nt!NtWriteFile → IopWriteFile → FLTMGR!FltpFastIoWrite →
+    FltpPassThroughFastIo → nt!IoGetStackLimits → RtlpGetStackLimits →
+    KiRaiseSecurityCheckFailure → KiFastFailDispatch → KiBugCheckDispatch →
+    KeBugCheckEx`，且 `yuanguard_hv_step17d+0x132d` 出现在
+    `KiSystemServiceCopyEnd+0x28` 之后（syscall 返回路径）——**guest 执行真实
+    syscall 返回时栈指针非法**；
+  - 根因指向代码：`yghv_os_guest_resident_thread` 里
+    `v->vmcb->state.rip = svm_os_seamless_cont; v->vmcb->state.rsp = 0;`
+    ——**RSP 被清 0**，guest 从无缝延续入口进入时无合法栈 → syscall 返回时 0x139
+    （与裸机 9.11 FAST_FAIL_INCORRECT_STACK 一致，但裸机之后转硬冻结，VM 稳定可诊断）。
+- **突破意义**：APIC 页 identity 直通（不拦截）解决了"APIC 页未映射→NPF→硬冻结"
+  （此前 step17 冻结根因 = APIC 页未映射，非平台墙）；剩余问题 = **guest 栈 RSP=0**
+  是可修复的代码问题。→ **阻塞常驻在 VM 里可行**，需修 guest 栈。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启进桌面。
+- 提交：本记录。
+
+### 9.214 2026-08-15 变体 E（最小干预根治）重大进展：guest 态真实 Windows 持续运行
+
+- **变体 E 构建**：`YGHV_BAREMETAL_STEP=17` + `YGHV_APIC_PASSTHROUGH=1` +
+  `YGHV_NO_CR3_INTERCEPT=1`（main.c step17 线程加 `#ifndef YGHV_NO_CR3_INTERCEPT`
+  门控：跳过 `yghv_os_guest_cr3_intercept_apply` + `yghv_os_guest_clone_cr3_apply`，
+  guest 直接用宿主 CR3；保留 APIC 直通 + TLB 卫生 + TSS 隔离；build.bat 加传递；
+  备份 `D:\aaaaaavm\main.c.bak-20260815-step17-ctlE`）。SHA256
+  `b3d50a618fc8f68522850141ff5e269f23bcf1e205cbd837811e50306e94c071`，归档
+  `D:\aaaaaavm\yuanguard_hv_step17_minimal_20260815.sys`。
+- **变体 E 实机（VM）：重大进展——guest 态真实 Windows 持续运行（非冻结）**：
+  - VM 加载后**有画面（Windows 渲染持续）但鼠标键盘无响应**；
+  - **vmware-vmx CPU 持续增长**（5739→5851→6024s，Responding=True）= vCPU 一直
+    guest 态执行；
+  - **VMware Tools heartbeat 停在 9721**（vmtoolsd 用户态交互线程被抢占/受影响）；
+  - **soft stop 超时**（guest 无法优雅关机），**hard stop 立即成功**（VMware L0
+    层完全健康——对比 step17 旧版硬冻结时连 reset 都难）；
+  - 无 0x139、无冻结、无蓝屏——**变体 E 消除了 step17 的硬冻结和变体 D 的 0x139**。
+- **意义**：最小干预（APIC 直通 + 宿主 CR3 直通，不拦截不克隆）让 guest 态真实
+  Windows **持续运行**——核心矛盾（CR3 拦截+克隆静态快照 vs 多进程栈一致性）被
+  绕过。剩余问题 = "无法交互"（vCPU 全在 guest 态，输入中断被抢占/未服务）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 hard stop 关闭
+  （待重启）。
+- 提交：本记录。
+
+### 9.215 2026-08-15 变体 F（+host ISR）复测：同样有画面无响应——host ISR 不解决交互
+
+- **变体 F 构建**：`YGHV_BAREMETAL_STEP=17` + `YGHV_APIC_PASSTHROUGH=1` +
+  `YGHV_NO_CR3_INTERCEPT=1` + `YGHV_HOST_ISR=1`（main.c step17 编排加
+  `#ifdef YGHV_HOST_ISR`：`g_os_guest_intr_intercept=TRUE` + `g_os_guest_host_isr
+  =TRUE` + `g_os_guest_inject_intr=FALSE`——host 侧服务时钟，step20 的 PASS 组合；
+  build.bat 加传递）。SHA256
+  `4fdeaf85e30ec3779161c53b3d147bc5b4027048e663f8ba5e880be36e983e6b`，归档
+  `D:\aaaaaavm\yuanguard_hv_step17_hostisr_20260815.sys`。
+- **变体 F 实机（VM）**：同样"有画面无响应"（用户确认）。vmx CPU 持续增长
+  （227s→...），heartbeat 有值（577 新会话）但 Tools 交互停。已 hard stop+重启恢复。
+- **对比结论**：变体 E（无 host ISR）与 F（有 host ISR）**均为有画面无响应**——
+  host ISR 不改变交互状态。两变体都证明 **guest 态真实 Windows 持续运行**（无
+  冻结/0x139/蓝屏，vmx CPU 持续增长，有画面），这是本轮核心突破；剩余"无响应"
+  = guest 态占满 vCPU 后交互线程饿死，不影响"Windows 在 guest 态运行"核心目标。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已 hard stop+重启
+  进桌面。
+- 提交：本记录。
+
+### 9.216 2026-08-15 决定性归因：VM 阻塞常驻的墙 = 单核不对称跨核 IPI 死锁
+
+- **验证**：变体 E 加载后卡死（有画面无响应），hard stop 重启后读 progress log：
+  `bm step=0x11 → os resident start → ctlD apic passthrough mapped → os guest tss
+  isolated → ctlE: host cr3 passthrough → os resident enter=1 → bm os resident
+  running → bm done`，**无任何 `resident alive` 行**（alive 线程 pin core0 每 5s
+  写一帧，一帧都没写）→ **core0 也死了**。
+- **精确根因（跨核 IPI 死锁）**：Windows 2 核（core0+core1）；core1 进 guest 态跑
+  真实 Windows 调度器 → guest 态调度器向 core0 发 IPI/访问共享调度器锁 → core0
+  宿主态不知道 core1 在 guest 态 → 双向跨核交互在"一核 guest + 一核 host"不对称
+  配置下死锁 → core0 卡死 → alive/交互线程饿死 → "有画面无响应"。
+- **解释 step20 为何 PASS**：自旋 guest 不跑真实 Windows 调度器 → 不跨核协作 →
+  不死锁。
+- **意义**：VM 里阻塞常驻的墙比 APIC/CR3/栈更深——是**多核拓扑下的跨核协作
+  死锁**。候选修复方向：A) 全核进 guest（core0+core1 对称）；B) 隐藏 CPU 拓扑让
+  guest 只看到 1 核（不做跨核调度）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启进桌面。
+- 提交：本记录。
+
+### 9.217 2026-08-15 变体 G（全核对称）仍死锁：跨核协作在 L1 双层虚拟化下本质有问题
+
+- **变体 G 构建**：`YGHV_BAREMETAL_STEP=99`（全核阻塞常驻 `yghv_os_guest_allcore_
+  thread`）+ `YGHV_APIC_PASSTHROUGH=1` + `YGHV_NO_CR3_INTERCEPT=1` +
+  `YGHV_HOST_ISR=1`（给 allcore_thread 加与变体 E/F 相同的"最小干预"门控；
+  build.bat 已支持；备份 `D:\aaaaaavm\main.c.bak-20260815-step99-ctlG`）。SHA256
+  `d1c06b9d8f272d35fda7258d34ce582904dac38b1929b478e762529fe0ad50ec`，归档
+  `D:\aaaaaavm\yuanguard_hv_step99_allcore_20260815.sys`。
+- **变体 G 实机（VM）**：仍整机卡死。progress log：`bm step=0x63 → bm os allcore
+  resident start → core1 和 core0 均 ctlG apic passthrough/tss isolated/host cr3
+  passthrough/allcore enter=1/0 → bm os allcore resident running → bm done`，
+  **两核都进 guest 仍无 `resident alive`**（core0 alive 线程也死）。
+- **结论**：**全核对称不消除跨核死锁**——推翻"不对称是死锁根因"假设。跨核 IPI/锁
+  协作在 VMware 嵌套的 L1 双层虚拟化下（两个独立 VMRUN 循环）本质无法正确协作。
+- **下一步候选**：B) **单核 VM**——把 VMX `numvcpus` 改为 1，Windows 启动即单核，
+  调度器不做跨核调度 → 跨核死锁根本不会发生（配置层改动，非代码）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启进桌面。
+- 提交：本记录。
+
+### 9.218 2026-08-15 单核方案（变体 H）结果：加载后 VM 立即重启（triple fault 类）
+
+- **单核配置**：VMX `numvcpus=4 → 1`（备份 `D:\aaaaaavm\Windows 10 x64.vmx.bak-
+  20260815-singlecore`）。代码 step17 加 `YGHV_SINGLECORE` 门控：guest core 1→0、
+  event index 1→0（`g_os_guest_done_events[0]`）。构建
+  `YGHV_BAREMETAL_STEP=17`+APIC_PASSTHROUGH+NO_CR3_INTERCEPT+HOST_ISR+SINGLECORE
+  （SHA256 `ad7ca2e6ec95029584988a558c1117ed9005425a0969a7da43b00c1d38170679`，
+  归档 `D:\aaaaaavm\yuanguard_hv_step17_singlecore_20260815.sys`）。
+- **单核实机（VM）**：`sc start` 后 **VM 立即软重启**（vmware.log `TOOLS soft reset
+  detected`），无新 minidump、无 bugcheck 事件 1001（最新仍 18:50 的 0x139）。
+  progress log 走完 `bm done`（DriverEntry 返回），`os resident enter=0`（core0 进
+  guest）后 VM 层面崩溃。
+- **结论**：单核没有消除问题——guest 态执行真实 Windows 调度器在单核下无第二核
+  分担，某些异常/中断处理直接触发 VM 层面重启（triple fault 类）。**跨核死锁假设
+  被单核结果排除**（单核无跨核仍崩）。
+- **VM 路线全景**：硬冻结→0x139→多核死锁→全核死锁→单核 VM 重启。核心突破是
+  变体 E/F 的"guest 态真实 Windows 持续运行（有画面）"，但阻塞常驻的可用性
+  （交互/稳定）在所有形态下均未达成——VMware 嵌套的 L1 双层虚拟化对真实 Windows
+  调度的支持存在根本限制。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启进桌面（单核
+  配置）。
+- 提交：本记录。
+
+### 9.219 2026-08-15 VM 路线收尾：总结文档第 8 章 + 工作区状态
+
+- **收尾动作**：`docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md` 新增**第 8 章**（VMware
+  嵌套 VM 路线完整实验与结论 9.198-9.218）——含前置纠错/KD 串口/kd 断点教训、有界/
+  自旋形态全 PASS、阻塞常驻逐层归因矩阵（step17→变体 A/B/C'/D/E/F/G/H）、三项代码
+  修复（v98fix/解码器/run_kd）、0x139 精确定位、VM 路线最终结论、归档清单。
+- **工作区状态（本轮全部改动，未提交）**：
+  - `YuanGuardHV/hv/main.c`（+90）：v98fix APIC 映射、step202 门控（NO_APIC_SHADOW/
+    NO_MSV_DEEP/APIC_IDENTITY）、step17 门控（APIC_PASSTHROUGH/NO_CR3_INTERCEPT/
+    HOST_ISR/SINGLECORE）；
+  - `YuanGuardHV/hv/vmexit.c`（+46）：APIC MMIO 解码器修复（[rax+disp32]）+ nf/ib 诊断；
+  - `YuanGuardHV/build.bat`（+7）：7 个新门控传递；
+  - `YuanGuardHV/run_kd.bat`：去掉 DriverEntry 断点；
+  - 文档：HANDOFF 9.200-9.218、SUMMARY 第 8 章、NEXT_WINDOW_PROMPT。
+- **VM 遗留**：VMX `numvcpus=1`（单核方案遗留，备份 `Windows 10 x64.vmx.bak-
+  20260815-singlecore`）；如需多核改回 4。
+- **下一步待定**：是否提交本轮改动（7 文件）；是否恢复 VM numvcpus=4。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 运行中（单核）。
+- 提交：本记录。

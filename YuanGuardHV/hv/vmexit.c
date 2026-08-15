@@ -383,23 +383,29 @@ static int yghv_apic_mmio_npf(svm_vcpu_t *vcpu) {
     modrm = ib[i + 1];
     reg = (modrm >> 3) & 7;
     rm = modrm & 7;
-    if (rm != 5 || (modrm & 0xC0) != 0)   /* only [disp32] addressing */
-        return 1;
-    if (i + 5 >= n)
-        return 1;
-    offset = (uint32_t)(ib[i + 2] | (ib[i + 3] << 8) |
-                        (ib[i + 4] << 16) | (ib[i + 5] << 24));
-    offset -= 0xFEE00000U;
+    /* 9.207: relax addressing — the faulting GPA (exitinfo2) already identifies
+       the xAPIC target, so we do NOT need to decode the effective address.
+       Windows APIC writes are typically `mov [rax+disp32], r32` (mod=2, rm=0),
+       which the old `rm!=5 || mod!=0` check rejected, causing decode failure and
+       a VM stall.  Take the page offset from the GPA instead. */
+    (void)rm;
+    offset = (uint32_t)(vcpu->vmcb->control.exitinfo2 & 0xFFFULL);
     if (offset >= HV_PAGE_SIZE)
         return 1;
 
     if (opcode == 0xC7) {                 /* mov [m32], imm32: C7 /0 */
+        uint32_t ilen;
         if (reg != 0)
             return 1;
-        if (i + 9 >= n)
+        /* imm32 is the trailing 4 bytes of the instruction; next_rip-rip is the
+           instruction length (Decode-Assist), valid on NPF. */
+        if (vcpu->vmcb->control.next_rip <= vcpu->vmcb->state.rip)
             return 1;
-        value = (uint32_t)(ib[i + 6] | (ib[i + 7] << 8) |
-                           (ib[i + 8] << 16) | (ib[i + 9] << 24));
+        ilen = (uint32_t)(vcpu->vmcb->control.next_rip - vcpu->vmcb->state.rip);
+        if (ilen < 4 || ilen > 15 || (int)ilen > n)
+            return 1;
+        value = (uint32_t)(ib[ilen - 4] | (ib[ilen - 3] << 8) |
+                           (ib[ilen - 2] << 16) | (ib[ilen - 1] << 24));
     } else if (opcode == 0x89) {          /* mov [m32], r32: 89 /r */
         switch (reg | (rex_b << 3)) {
             case 0x00: slot = &vcpu->regs.rax; break;
@@ -605,8 +611,24 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
                 svm_finish_exit(vcpu);
                 return 0;
             }
-            LOG_ERROR("APIC MMIO decode failed RIP=0x%llx GPA=0x%llx",
-                vcpu->vmcb->state.rip, vcpu->vmcb->control.exitinfo2);
+            LOG_ERROR("APIC MMIO decode failed RIP=0x%llx GPA=0x%llx nf=%u ib=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
+                vcpu->vmcb->state.rip, vcpu->vmcb->control.exitinfo2,
+                vcpu->vmcb->control.byte_fetched,
+                vcpu->vmcb->control.instruction_bytes[0],
+                vcpu->vmcb->control.instruction_bytes[1],
+                vcpu->vmcb->control.instruction_bytes[2],
+                vcpu->vmcb->control.instruction_bytes[3],
+                vcpu->vmcb->control.instruction_bytes[4],
+                vcpu->vmcb->control.instruction_bytes[5],
+                vcpu->vmcb->control.instruction_bytes[6],
+                vcpu->vmcb->control.instruction_bytes[7],
+                vcpu->vmcb->control.instruction_bytes[8],
+                vcpu->vmcb->control.instruction_bytes[9],
+                vcpu->vmcb->control.instruction_bytes[10],
+                vcpu->vmcb->control.instruction_bytes[11],
+                vcpu->vmcb->control.instruction_bytes[12],
+                vcpu->vmcb->control.instruction_bytes[13],
+                vcpu->vmcb->control.instruction_bytes[14]);
         }
 
         if (info1 & NPF_INFO1_WRITE)

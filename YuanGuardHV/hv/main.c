@@ -1287,10 +1287,28 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    /* 9.213 变体 D: YGHV_APIC_PASSTHROUGH=1 时把 xAPIC 页 0xFEE00000 identity
+       映射进 NPT（全权限，不清 W，不拦截）——guest 直接访问 VMware 虚拟 APIC
+       （step20 的 PASS 方式），同时跑真实 Windows 调度器（阻塞常驻）。区分
+       "APIC 页未映射"（step17 冻结的 NPF 根因）vs "拦截 APIC"（变体 B/C' 冻结）。 */
+#ifdef YGHV_APIC_PASSTHROUGH
+    if (npt_identity_map_range(&g_npt, 0xFEE00000ULL,
+                               0xFEE00000ULL + HV_PAGE_SIZE) != STATUS_SUCCESS)
+        LOG_ERROR("ctlD: identity-map APIC 2MB failed");
+    yghv_trace("ctlD apic passthrough mapped");
+#endif
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+    /* 9.214 变体 E (根治): YGHV_NO_CR3_INTERCEPT=1 时跳过 CR3 拦截 + 克隆 CR3，
+       guest 直接用宿主 CR3——VM 里 VMware L0 处理 CR3 写/TLB，core0/core1 共享
+       同一套宿主页表，跨核线程分派时栈/页表一致（0x139 FAST_FAIL_INCORRECT_STACK
+       根因 = 克隆静态快照 + 两核页表不一致）。 */
+#ifndef YGHV_NO_CR3_INTERCEPT
     yghv_os_guest_cr3_intercept_apply(v);
     yghv_os_guest_clone_cr3_apply(v);
+#else
+    yghv_trace("ctlE: host cr3 passthrough (no intercept/clone)");
+#endif
     if (g_v96_apic_tpr_stress && !g_v96_apic_tpr_va) {
         PHYSICAL_ADDRESS apic_pa;
         apic_pa.QuadPart = 0xFEE00000ULL;
@@ -1546,10 +1564,30 @@ static void yghv_v98_apic_shadow_apply(svm_vcpu_t *v) {
         (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TMICT));
     g_v98_last_tdcr = READ_REGISTER_ULONG(
         (PULONG)((ULONG_PTR)g_v98_real_apic_va + APIC_OFFSET_TDCR));
+    /* 9.206 v98fix: the xAPIC page (0xFEE00000) is MMIO, not RAM, so
+       yghv_npt_map_ram (MmGetPhysicalMemoryRanges) leaves its 2MB PD entry
+       unmapped on VMs whose RAM layout does not cover it (bare metal 16GB
+       happened to).  Map the 2MB page identity first so npt_map_page's
+       npt_split_2mb_to_4kb finds a present PD entry; then remap the single
+       4K APIC page to the shadow. */
+    if (npt_identity_map_range(&g_npt, 0xFEE00000ULL,
+                               0xFEE00000ULL + HV_PAGE_SIZE) != STATUS_SUCCESS)
+        LOG_ERROR("v98: identity-map APIC 2MB failed");
+    /* 9.212 变体 C (对照): YGHV_APIC_IDENTITY=1 构建时 APIC 影子不重定向到 shadow
+       RAM 页，而是把 0xFEE00000 映射到自身（identity）并清 W 位——guest 写 APIC
+       仍触发 NPF 由 handler 转发，但 NPT 目标不变。区分"重定向到 shadow"vs
+       "拦截 APIC 写"哪个是 VM 里的冻结点。 */
+#ifndef YGHV_APIC_IDENTITY
     if (npt_map_page(&g_npt, 0xFEE00000ULL, g_v98_apic_shadow_pa,
                      (NPT_4K_PAGE_FLAGS & ~NPT_PERM_WRITABLE) |
                      (1ULL << 4) | (1ULL << 63)) != STATUS_SUCCESS)
         LOG_ERROR("v98: npt_map_page failed");
+#else
+    if (npt_map_page(&g_npt, 0xFEE00000ULL, 0xFEE00000ULL,
+                     (NPT_4K_PAGE_FLAGS & ~NPT_PERM_WRITABLE) |
+                     (1ULL << 4) | (1ULL << 63)) != STATUS_SUCCESS)
+        LOG_ERROR("v98 ctlC: npt_map_page(identity) failed");
+#endif
     v->vmcb->control.tlb_control = SVM_TLB_CONTROL_FLUSH;
     yghv_trace_u64("v98 apic shadow armed", g_v98_apic_shadow_pa);
 }
@@ -1631,8 +1669,11 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     v->vmcb->control.general1_intercepts =
         INTERCEPT_CPUID | INTERCEPT_RDTSC |
         INTR_GEN1(SVM_INTERCEPT_SHUTDOWN) |
-        INTR_GEN1(SVM_INTERCEPT_MSR_PROT) |
+        INTR_GEN1(SVM_INTERCEPT_MSR_PROT);
+#ifdef YGHV_HOST_ISR
+    v->vmcb->control.general1_intercepts |=
         INTR_GEN1(SVM_INTERCEPT_INTR) | INTR_GEN1(SVM_INTERCEPT_NMI);
+#endif
     v->vmcb->control.general2_intercepts =
         INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
     v->vmcb->control.exception_intercepts = 0;
@@ -1640,10 +1681,24 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
     svm_core_set_npt(core, g_npt.pml4_pa);
+    /* 9.216/9.217 变体 G: step99 全核形态复用变体 E/F 的"最小干预"门控——
+       APIC 直通（不清 W 不拦截）+ 宿主 CR3 直通（不拦截不克隆）。全核（core0+
+       core1）都进 guest 态后，跨核 IPI 在两个 guest 态 vCPU 之间走 VMware 模拟
+       路径，消除"一核 guest + 一核 host"的跨核死锁（9.216 实锤）。 */
+#ifdef YGHV_APIC_PASSTHROUGH
+    if (npt_identity_map_range(&g_npt, 0xFEE00000ULL,
+                               0xFEE00000ULL + HV_PAGE_SIZE) != STATUS_SUCCESS)
+        LOG_ERROR("ctlG: identity-map APIC 2MB failed");
+    yghv_trace("ctlG apic passthrough mapped");
+#endif
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
+#ifndef YGHV_NO_CR3_INTERCEPT
     yghv_os_guest_cr3_intercept_apply(v);
     yghv_os_guest_clone_cr3_apply(v);
+#else
+    yghv_trace("ctlG: host cr3 passthrough (no intercept/clone)");
+#endif
     g_os_resident_mode = TRUE;
 
     InterlockedIncrement(&g_v99_allcore_ready);
@@ -2171,14 +2226,22 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         NTSTATUS st202;
 
         yghv_trace("bm b0 spin inject start");
+        /* 9.210 变体 B (对照): YGHV_NO_MSV_DEEP=1 构建时用浅拷贝 CR3（g_msv_test=FALSE，
+           保留 APIC 影子）——变体 A 已证深拷贝是 VM 冻结源，本变体确认"浅拷贝+APIC
+           影子"是否可存活。 */
+#ifndef YGHV_NO_MSV_DEEP
         /* D4: use the DEEP clone (g_msv_test=TRUE -> yghv_clone_host_cr3_deep) for
            the STABLE base — 9.152 proved deep independent CR3 + spin + host ISR is
            stable (12 cores, 5 min).  The deep clone's slowness/race (D1c 0x50) is
            mitigated by pausing the 10ms diag's file I/O during the clone
            (g_b0_cloning).  Controlled injection is gated by g_b0_inject. */
         g_msv_test = TRUE;
+#endif
+        /* 9.209 ctl A: YGHV_NO_APIC_SHADOW disables APIC shadow for VM freeze isolation. */
+#ifndef YGHV_NO_APIC_SHADOW
         g_v98_apic_shadow = TRUE;   /* B-1min: shadow xAPIC MMIO so guest ISR
                                        EOI/TPR never touch the physical APIC */
+#endif
         g_v98_apic_mmio_count = 0;
         g_npf_count = 0;
         g_last_npf_gpa = 0;
@@ -2680,13 +2743,33 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         NTSTATUS st17;
 
         yghv_trace("bm os resident start");
+        /* 9.217 单核方案: YGHV_SINGLECORE=1 时 step17 用 core0（VMX numvcpus=1 时
+           g_vcpu_count=1 只有 core0）。单核 Windows 调度器不做跨核调度 → 消除
+           跨核 IPI 死锁（9.216/9.217）。单核下 alive/watchdog 线程 pin core0 与
+           guest 竞争同一 vCPU，无法运行——观测靠 guest 态交互/heartbeat。 */
+#ifdef YGHV_SINGLECORE
+        KeInitializeEvent(&g_os_guest_done_events[0], NotificationEvent, FALSE);
+#else
         KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+#endif
         KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
         g_os_resident_mode = TRUE;
         g_os_resident_log_active = TRUE;
+#ifdef YGHV_HOST_ISR
+        /* 9.215 变体 F: host ISR 服务时钟（step20 的 PASS 组合）——拦截 INTR/NMI，
+           host 侧服务中断，guest 态不需要自己处理时钟中断（变体 E"有画面无响应"
+           的可能根源 = guest 态时钟/中断服务断）。 */
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+#endif
         st17 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
                                     NULL, yghv_os_guest_resident_thread,
+#ifdef YGHV_SINGLECORE
+                                    (PVOID)(uintptr_t)0);
+#else
                                     (PVOID)(uintptr_t)1);
+#endif
         if (!NT_SUCCESS(st17)) {
             LOG_ERROR("bm step 17: thread create failed 0x%x", st17);
             g_os_resident_mode = FALSE;
@@ -2712,8 +2795,13 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             g_os_resident_log_active = FALSE;
             return st17;
         }
+#ifdef YGHV_SINGLECORE
+        KeWaitForSingleObject(&g_os_guest_done_events[0], Executive,
+                              KernelMode, FALSE, NULL);
+#else
         KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
                               KernelMode, FALSE, NULL);
+#endif
         ZwClose(thread);
         ZwClose(alive);
         ZwClose(watchdog);

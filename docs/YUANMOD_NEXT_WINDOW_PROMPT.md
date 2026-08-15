@@ -1,128 +1,95 @@
-# YuanGuardHV 新窗口提示词（2026-08-13 9.135 更新版）
+# YuanGuardHV 新窗口提示词（2026-08-15 更新版，对应 9.198）
 
 你接手 YuanGuardHV（AMD-V SVM/NPT 隐形 Hypervisor）项目，仓库根
-D:\yuanguard，分支 main，HEAD 2c0acbf（文档已收尾到 9.134，9.135 为本
-文件对应的收尾记录）。
+D:\yuanguard，分支 main，HEAD `7f19683`（工作区干净；文档收尾到 9.198）。
 
 【协作铁律（最高优先级）】
-1. 任何代码/资源/文档改动前，先向用户说明想法并取得明确确认；未确认
-   不得改。
+1. 任何代码/资源/文档改动前，先向用户说明想法并取得明确确认；未确认不得改。
 2. 只修用户反馈的问题，不擅自扩大范围。
 3. 每次修改与决策必须记录到 docs/YUANMOD_HANDOFF_CURRENT.md。
 4. 禁止回滚用户/历史改动；工作区如有未提交改动，先查 git status 再动手。
 
 【当前状态】
-- 机器：Windows 10 19045，Ryzen 5 5500，>16GB。服务 yuanguard 已
-  STOPPED；C:\yuanguard_hv.sys = 稳定默认版
-  （SHA256 70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B，
-  归档 D:\aaaaaavm\yuanguard_hv_default_cpcr_20260813.sys）。
-- 工作区干净（HEAD d4079bc）；YuanGuardHV/bin 为 9.134 构建验证产物
-  （忽略文件，未清理）；Java/JNI 产物未生成；logs_archive/、kd 运行
-  文件、.superpowers/ 均已清理；.gitignore 已覆盖。
-- 9.132 文档清理：已删除 `PLAN.md`、`YuanGuardHV/HANDOFF.md`、
-  `YuanGuardHV/TECHNICAL_REVIEW.md`、旧 `docs/NEXT_WINDOW_PROMPT.md`、
-  `docs/SESSION_20260811.md`、`docs/reference/*` 旧文档与 OS-as-guest
-  计划；有效文档以 HANDOFF_CURRENT/TASKS/YUANMOD_NEXT_WINDOW_PROMPT/
-  hook 设计文档为准。
-- 9.135 新增 `docs/YGHV_STEALTH_AUDIT_20260813.md` 与
-  `tools/yghv_stealth_check.ps1`：全链路隐藏审计 + 痕迹自查。
-- 最近提交：d4079bc test: 静态校验脚本 + docs 9.133；f4978ff docs
-  9.132；a5f354e feat: Java client unprotect/scan + docs 9.130；
-  1587a4d docs 9.129；0268a81 docs 9.128；02131a1 docs 9.127；
-  f833ab1 docs 9.126；772de94 docs 9.125；691e2c5 2B-3-b 多目标；
-  6af1d8b 2B-3-a；1cecd2f 2C-3；1591a55 2C；d5631ef 2B-2；be87130
-  2B-1；8dac7e9 MDL+真实 hook；b9504ef 9.113 收尾。
+- 机器：Windows 10 Pro for Workstations 19045，Ryzen 5 5500（6C12T），>16GB。
+  **BIOS 已升级（AGESA 更新），SVM 已重新开启**（VirtualizationFirmwareEnabled=True）。
+- 服务 yuanguard：STOPPED；`C:\yuanguard_hv.sys` = 稳定默认版
+  `70888311B38EF8D386252271CAF8EC8ADE8D96FAA472C7260E30692B95F92E3B`
+  （归档 `D:\aaaaaavm\yuanguard_hv_default_cpcr_20260813.sys`，本会话另备份
+  `D:\aaaaaavm\yuanguard_hv_c_drive_backup_20260815.sys`）。
+- 仓库 HEAD `7f19683`（B 路线 APIC 虚拟化实验 + OS-as-guest 总结），工作区干净。
+- 注意：C 盘 `70888311` 是 9.112 旧稳定版，**不支持多目标客户端命令（GET_TARGETS/
+  list-targets）**；当前 `tools/yghv_ctl.ps1`/Java 客户端需配 **HEAD 默认版**（bin 已重建
+  `8B59430C...`）。实机回归用 HEAD 默认版（9.128 清单：state/list-targets/selftest/
+  exit-test）。
 
-【关键结论（务必先读 9.84-9.134）】
-1. OS-as-guest 常驻线已停线：guest 内 Windows 调度器上下文切换触发
-   平台级整机停机；唯一 PASS 是 step20 自旋+INTR/NMI 拦截+宿主 ISR。
-   非驻留保护路线是产品主线。
-2. R1 私有页剔除门控关闭（YGHV_R1_EXCLUDE_PRIVATE=0）；R1 deny 机器级
-   停机保持门控。
-3. P0 已完成：VMMCALL 认证分层（per-vcpu auth_key）、控制面 SeDebug 提权
-   校验、VMMCALL SET_TARGET 自设目标、ADD/REMOVE_PAGE 目标进程绑定。
-4. 真实 hook：MDL 可写映射修掉 0x50；可变长度 12-16 字节补丁；原生 CR3
-   跳板（真实进程不能用 VMMCALL 决策）；控制面 INSTALL/REMOVE_HOOK 可用。
-5. 多目标已完成（2B-3）：targets[4] 槽、NPF/决策跨槽、hook stub unrolled
-   遍历 4 槽 CR3、GET_TARGETS 0x80E、list-targets。
-6. 2C 已完成：loader_stealth 接线（YGHV_LOADER_STEALTH 门控默认 0）、
-   服务持久化/防卸载（set/unset-auto-start、harden/unharden-service 用
-   sc sdset）、内核侧防卸载（YGHV_UNLOAD_GUARD 门控默认 0）。
-7. 9.128 非 hook 路径回归 PASS（查询/配置/selftest/exit-test/服务脚本；
-   构建哈希 7B19EF02...）。
-8. 9.129 静态分析：0x5AA 实为 ERROR_NO_SYSTEM_RESOURCES，是
-   STATUS_INSUFFICIENT_RESOURCES 的 Win32 映射，不是 ERROR_BUSY；
-   锁序死锁与 0x5AA 修复方案见
+【关键结论（务必先读 9.84-9.198；横向总结见
+docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md）】
+1. **OS-as-Guest 本机定论（9.198）**：本机无法运行 OS-as-Guest——guest 态执行真实
+   Windows 内核代码（调度器/ISR）在 <10s 内 0x101 或硬冻结，无论独立 CR3/APIC 虚拟化/
+   NPT 全权限/ASID-TLB/HLT/host ISR 组合。**平台级限制（AMD errata 1363 类，无修复）**。
+   本机可运行形态 = 有界试点（step12/14/16）+ **step20 自旋常驻**（可干净卸载）。
+2. MSV（9.180-9.183）与 B 路线（9.184-9.197）均为门控实验
+   （`YGHV_BAREMETAL_STEP=200/202`），**默认构建不激活**；换平台时可复用。
+3. **非驻留保护路线（产品主线）稳定**：内存页写保护 / 终止保护 / 句柄保护 / 真实目标
+   接入 / Java 客户端均 PASS。
+4. 已完成里程碑：多目标（2B-3，targets[4]）、loader_stealth 接线（2C，门控默认 0）、
+   服务持久化/防卸载（sc sdset + UNLOAD_GUARD 门控）、P0/P1/P2 修复（REV-003/004/005/
+   006/002/010/011/013/015/036/037/039/040/041/044/045/008/009/012/014/016/017/018/
+   019/047）、静态校验（build.bat 编译前）、隐藏审计、真实 hook（MDL 可写映射）。
+5. 9.129 静态分析：0x5AA 实为 ERROR_NO_SYSTEM_RESOURCES（STATUS_INSUFFICIENT_
+   RESOURCES），候选根因目标表满/池分配失败；锁序与 0x5AA 方案见
    docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md。
-9. 9.130 Java/JNI 非 hook 产品化：`unprotect`/`scan` 已加入并实机
-   PASS。
-10. 9.131 收尾：构建与 Java/JNI 产物已清理，提示词与 TASKS 已同步。
-11. 9.132 文档清理：删除旧快照/停线计划，TASKS 勾选当前进度。
-12. 9.133 tests/ 静态校验脚本 PASS（接口/命令/安全红线）。
-13. 9.134 build.bat 已接入静态校验，编译前失败即中止。
-14. 9.135 全链路隐藏审计与痕迹自查：目标抗人工取证优先，ACE 尽力不
-    保证；当前本机可见 5 项痕迹。
 
 【本机雷区（重要）】
-- install/remove/clear 类 hook 路径实机验证会触发整机硬冻结：remove/
-  clear 持 g_protect_lock 内全核心 pause，与 NPF handler 存在死锁
-  （9.118/9.125 多次无 dump 硬冻结）。本机已停止该族实验，留待换平台
-  或硬件调试器。
-- ERROR_NO_SYSTEM_RESOURCES (0x5AA) 偶发：实为 STATUS_INSUFFICIENT_
-  RESOURCES 的 Win32 映射；候选根因是目标表满/池分配失败，详见 9.129
-  设计文档。yghv_hook_diag 落盘 C:\Windows\yghv_hook.log。
-- clear 后 hook_count 可能残留 1；hooks 为全局表，目标退出不自动移除。
-- 常驻/OS-as-guest 相关构建、R1 门控版、YGHV_UNLOAD_GUARD 门控版加载后
-  可能硬冻结或无响应；YGHV_UNLOAD_GUARD 版只能重启解除。
-- VMware 嵌套：MSRPM/IOPM 拦截不生效、不能剔除 NPT 私有页、不能写 CR0；
-  INTR/NMI 拦截冻结 L1。
-- 控制面要求调用者启用 SeDebugPrivilege（管理员客户端）。
-- loader_stealth 的 kd !driver 复核需要内核调试会话，本机暂无。
+- **本机 hypervisor 负载有平台级冻结/0x101 史**：OS-as-guest 相关构建、R1 门控版、
+  YGHV_UNLOAD_GUARD 门控版加载可能硬冻结/无响应；本机不承载持续 VMRUN 常驻负载，
+  OS-as-guest 实验**换平台**。YGHV_UNLOAD_GUARD 版只能重启解除。
+- install/remove/clear 类 hook 路径实机验证可能整机硬冻结（持 g_protect_lock 内全核心
+  pause 死锁，9.118/9.125）——本机已停该族实验。
+- 控制面要求调用者启用 SeDebugPrivilege（管理员客户端，脚本已自动启用）。
+- VMware 嵌套：MSRPM/IOPM 拦截不生效、不能剔除 NPT 私有页、不能写 CR0；且 VMware
+  17.6.4 在这台 AMD 主机上启动任何 VM 会整机硬卡死（9.85-9.88）——VM 调试不可用。
+- 深拷贝整棵页表树（yghv_clone_host_cr3_deep）慢（600ms+）且带竞态（D1c 0x50；D4 已用
+  克隆期暂停 diag 缓解）——仅门控实验使用。
 
 【归档（D:\aaaaaavm）】
-- yuanguard_hv_default_cpcr_20260813.sys = 70888311...（当前 C 盘稳定版）
-- yuanguard_hv_default_auth2_20260813.sys = 1BD333E2...
-- yuanguard_hv_realhook_gated_20260813.sys（多次覆盖，以 dump 为准）
-- yghv_bsod_0x50_realhook_20260813_1728.dmp（0x50 dump）
-- yuanguard_hv_realhook_mdl_native_20260813.sys = 88D7D986...
-- yuanguard_hv_default_cfg_20260813.sys = 3F9B85B4...
-- yuanguard_hv_default_hookctl_20260813.sys = FB410209...
-- yuanguard_hv_loader_stealth_20260813.sys = 7B9CEECB...
-- yuanguard_hv_unload_guard_20260813.sys = 8B147F29...
-- yghv_service_sddl_backup.txt（harden-service SDDL 备份）
-- yuanguard_hv_targets_refactor_20260813.sys = C9638324...
-- yuanguard_hv_multi_target_20260813.sys = 14253486...
-- yuanguard_hv_hook_diag_20260813.sys = 48824837...（多目标+诊断最新默认）
-- yuanguard_hv_default_full_20260813.sys = 8A9734CA...
+- 稳定版：`yuanguard_hv_default_cpcr_20260813.sys`（70888311...）
+- 2026-08-15 B/D 系列：`yuanguard_hv_{msv,msv2,b0,b1min,b1min2,b1full,d1_npfdiag,
+  d1b_fastdiag,d1c_10ms,d2_shallow,d3_hostisr_inject,d3base_noinject,d4base_deep}_
+  20260815.sys`（哈希见总结文档 6.1）
+- 转储：`D:\aaaaaavm\yghv_bsod_*.dmp`（0x101 ×9、0xE2、0x50；清单见总结文档 6.2）
+- 总结文档：`docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md`
 
 【下一步建议】
-1. 本机非 hook 路径回归已在 9.128 完成；新窗口如需重复按 9.126/9.128
-   清单执行。
-2. hook 路径（install/remove/clear、真实 hook 多目标语义、锁序优化、
-   ERROR_NO_SYSTEM_RESOURCES 根因）按 9.129 设计文档换平台或接硬件
-   调试器后再继续。
-3. loader_stealth 并入默认前先做 kd !driver 复核。
+1. **非驻留保护路线继续（产品主线）**：真实 hook 多目标语义与锁序（REV-001，换平台/
+   kd）、目标生命周期细节、控制面完善、Java 客户端补 config/unprotect/scan 之外命令、
+   loader_stealth 并入默认前 kd `!driver` 复核、R1 私有页剔除换平台验证。
+2. **OS-as-Guest 换平台重启条件**：见总结文档第 7 节（顺序：有界试点 → ASID/TLB 卫生
+   负结果记录 → 独立 CR3 + APIC 虚拟化 → 阻塞常驻）。
+3. 本机仅作构建/静态验证；真实 hypervisor 运行/回归测试换平台。
 
 【常用命令】
-- 构建默认版：cd D:\yuanguard\YuanGuardHV; cmd /c build.bat
-- 构建门控版：$env:YGHV_XXX='1'; cmd /c build.bat
-  （XXX ∈ BAREMETAL_STEP / R1_EXCLUDE_PRIVATE / REAL_HOOK_TEST /
-  LOADER_STEALTH / UNLOAD_GUARD）
-- 复制：Copy-Item bin\yuanguard_hv.sys C:\yuanguard_hv.sys -Force
-- 加载/停止：sc.exe start yuanguard / sc.exe stop yuanguard
-- 客户端：powershell -ExecutionPolicy Bypass -File
-  D:\yuanguard\YuanGuardHV\tools\yghv_ctl.ps1 <命令>
-  （state/target/list-targets/list-pages/list-hooks/config/selftest/
-  exit-test/set-auto-start/unset-auto-start/harden-service/
-  unharden-service/install-hook/remove-hook/clear）
-- Java：cd D:\yuanguard\YuanGuardHV\tools\yghv_client; cmd /c run.bat <cmd>
-- 日志：Get-Content C:\Windows\yghv_progress.log -Tail N；
-  C:\Windows\yghv_ioctl.log（IOCTL 入口/出口）；
-  C:\Windows\yghv_hook.log（hook 失败 stage）
-- 蓝屏转储：C:\Windows\Minidump\；cdb -z <dmp> -c '!analyze -v; q'
+- 构建默认版：`cd D:\yuanguard\YuanGuardHV; cmd /c build.bat`
+  （静态校验 + 编译 + 签名，输出 bin\yuanguard_hv.sys）
+- 构建门控版：`$env:YGHV_XXX='1'; cmd /c build.bat`
+  （XXX ∈ BAREMETAL_STEP / R1_EXCLUDE_PRIVATE / REAL_HOOK_TEST / LOADER_STEALTH /
+  UNLOAD_GUARD）
+- 复制：`Copy-Item bin\yuanguard_hv.sys C:\yuanguard_hv.sys -Force`
+- 加载/停止：`sc.exe start yuanguard` / `sc.exe stop yuanguard`
+- 客户端：`powershell -ExecutionPolicy Bypass -File D:\yuanguard\YuanGuardHV\tools\
+  yghv_ctl.ps1 <命令>`
+  （state/target/list-targets/list-pages/list-hooks/config/selftest/exit-test/
+  set-auto-start/unset-auto-start/harden-service/unharden-service/install-hook/
+  remove-hook/clear）
+- Java：`cd D:\yuanguard\YuanGuardHV\tools\yghv_client; cmd /c run.bat <cmd>`
+- 日志：`C:\Windows\yghv_progress.log`（进度）、`yghv_ioctl.log`（IOCTL）、
+  `yghv_hook.log`（hook 失败 stage）、`yghv_watchdog.log`（常驻诊断）
+- 蓝屏转储：`C:\Windows\Minidump\`；`cdb -z <dmp> -c '!analyze -v; q'`
+- 常用：`cd D:\yuanguard; git status / git log --oneline -5`
 
 【文档核实说明】
-docs/YUANMOD_HANDOFF_CURRENT.md 中 9.110-9.118 存在驱动记录与 Codex
-桌面恢复记录的编号重复（历史遗留，内容均有效）；当前主线记录为
-9.115-9.134，尾部 9.134 为最新；9.135 为本文件对应的收尾记录。新窗口
-以本文件为准。
+- `docs/YUANMOD_HANDOFF_CURRENT.md` 中 9.110-9.118 存在驱动记录与 Codex 桌面恢复记录
+  的编号重复（历史遗留，内容均有效）。
+- 主线记录最新为 9.198；OS-as-guest 横向总结见 `docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md`；
+  有效文档：HANDOFF_CURRENT / TASKS / YGHV_FULL_REVIEW_20260814 / HOOK_LOCK 设计 /
+  STEALTH_AUDIT / OS_AS_GUEST_RESEARCH_20260814 / 本文件。

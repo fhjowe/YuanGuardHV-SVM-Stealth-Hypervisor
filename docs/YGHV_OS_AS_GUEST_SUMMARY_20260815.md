@@ -169,3 +169,91 @@ OS-as-guest 常驻在本机冻结。
 - 后续开发走**非驻留保护路线**（产品主线）；OS-as-guest 作为换平台项记录；
 - 提交本轮 B/D 代码与文档时，保留 step200/202 门控实验（默认构建不激活），并在
   `docs/YUANMOD_HANDOFF_CURRENT.md` 9.197 之后补本轮收尾记录。
+
+## 8. 补充章节（2026-08-15 下半场）：VMware 嵌套 VM 路线完整实验与结论（9.198-9.218）
+
+> 本节补充 2026-08-15 下半场在 **VMware Workstation 17.6.4 嵌套 VM**（Windows 10 x64，
+> 官方镜像 19045.2965，`vhv.enable=TRUE`，KD 命名管道）上重新开启 OS-as-guest 的完整
+> 实验。**结论方向：VM 能跑有界/自旋形态（裸机做不到），但阻塞常驻同样到顶——VMware
+> 嵌套的 L1 双层虚拟化存在平台级限制。**
+
+### 8.1 前置（关键纠错与基建）
+
+- **历史纠错**：原提示词把 "VMware 启动任何 VM 硬卡死" 标为 9.85-9.88，编号有误——
+  9.85-9.88 实为云服务器 KDNET 调试（Realtek RTL8168 硬件级不支持）。真实 VMware 冻结
+  是 8.1-8.5 节（2026-08-09/10，精简镜像+调试管道组合）；9.4 官方镜像重装后 VM 稳定。
+- **KD 串口关键教训**：serial0 是 pipe server 端，**必须先让 kd 客户端连上
+  `\\.\pipe\yuanhv_debug` 再启动/重启 VM**，串口后端才就绪、guest 才枚举 COM1；否则
+  kd 一直 Waiting to reconnect。
+- **kd 断点教训**：`run_kd.bat` 原 `-c ".reload;bu yuanguard!DriverEntry;g"` 在 kd 真连
+  接时，驱动加载到 DriverEntry 即命中断点→guest 冻结等待 kd 输入（SCM 显示 RUNNING 但
+  guest 卡住）。已改为 `.reload;g`（无断点）。
+
+### 8.2 有界/自旋形态：VM 全 PASS（远超裸机）
+
+| step | 形态 | VM 结果 |
+|---|---|---|
+| step11 | 有界 2 核心跳（INTR/NMI/SHUTDOWN 拦截） | ✅ PASS（NPT/FLUSHBYASID 均暴露） |
+| step12 | 单核有界 OS guest（5000 CPUID/RDTSC） | ✅ **PASS（裸机 0x7E/硬冻结→VM 成功）** |
+| step14 | 全核有界 OS guest | ✅ PASS |
+| step16 | 全核 seamless | ✅ PASS |
+| step20 | **自旋常驻** + INTR/host ISR | ✅ **PASS（可干净卸载，alive 0x28）** |
+
+**核心突破**：VMware 软件 L0 绕开了裸机 errata 1363 类限制，guest 态执行真实 Windows
+代码（有界/自旋）在 VM 里全部可行——裸机做不到。
+
+### 8.3 阻塞常驻：逐层归因（严格对照实验）
+
+| 变体 | CR3 | APIC | 结果 | 归因 |
+|---|---|---|---|---|
+| step17 原始 | 浅拷贝+拦截+克隆 | 未映射 | 硬冻结 | **APIC 页未映射→NPF→硬冻结** |
+| 变体 A | 深拷贝 | 无拦截 | 冻结 | **深拷贝 CR3=冻结源** |
+| 变体 B | 浅拷贝 | 重定向 shadow+拦截 | 冻结 | **APIC 拦截=冻结源** |
+| 变体 C' | 浅拷贝 | identity+清 W 拦截写 | 冻结 | **拦截 APIC 写本身即冻结** |
+| 变体 D | 浅拷贝+APIC 直通 | identity 直通 | **0x139 蓝屏（活 10min）** | **CR3 拦截+克隆静态快照→栈崩溃** |
+| 变体 E/F | APIC 直通+宿主 CR3 直通(+host ISR) | 直通 | **guest 态真实 Windows 持续运行（有画面）** | **突破：最小干预** |
+| 变体 G | 全核（core0+1 都进 guest） | 直通 | 仍死锁（无 alive） | **跨核协作在 L1 双层虚拟化下有问题** |
+| 变体 H | 单核（VMX numvcpus=1） | 直通 | VM 立即软重启（triple fault 类） | **单核无第二核分担，仍崩** |
+
+**三项关键代码修复（均生效）**：
+1. **v98fix**：APIC 影子 NPT 映射前补 `npt_identity_map_range(&g_npt, 0xFEE00000, +0x1000)`
+   （APIC 页是 MMIO 非 RAM，`yghv_npt_map_ram` 未映射 → `npt_map_page failed`）；
+2. **解码器修复**：`yghv_apic_mmio_npf` 放宽寻址检查（支持 `[rax+disp32]` 基址寻址，
+   GPA 直接从 exitinfo2 取，C7 imm32 用 next_rip 定位）——Decode-Assist 填充正常
+   （nf=15），原代码只支持 `[disp32]` 导致 Windows APIC 写解码失败；
+3. **run_kd.bat**：去掉 DriverEntry 断点。
+
+**0x139 精确定位**（dump `yghv_bsod_variantD.dmp`）：`FAST_FAIL_INCORRECT_STACK`，
+崩溃线程 vmtoolsd.exe（普通进程）在 `NtWriteFile → KiSystemServiceCopyEnd` 返回路径栈
+指针出界（RSP 0x619470c0 远低于线程栈 Limit 0x62109000）——根因是 CR3 拦截+克隆静态
+快照（`yghv_os_guest_clone_cr3_apply` 注释明说"静态快照，PTE 更新分歧"）导致跨进程栈
+翻译错误。
+
+### 8.4 VM 路线最终结论
+
+- **VM 能跑有界/自旋（远超裸机）**；**阻塞常驻所需的所有关键技术（APIC 影子/深拷贝/
+  CR3 拦截+克隆）在 VMware 嵌套下均不可用**；
+- 最小干预（APIC 直通 + 宿主 CR3 直通）让 guest 态真实 Windows 持续运行（有画面），
+  但多核跨核 IPI 死锁、全核同样死锁、单核 VM 重启——**阻塞常驻的可用性（交互/稳定）
+  在所有形态下未达成**；
+- **根本限制**：VMware 嵌套的 L1 双层虚拟化（两个独立 VMRUN 循环）对真实 Windows 调度
+  的跨核协作/异常处理存在平台级限制，非驱动逻辑可修；
+- 换平台候选：**KVM/Proxmox（AMD 原生嵌套）或真实硬件**。
+
+### 8.5 归档（2026-08-15 下半场 VM 实验）
+
+- 驱动：`D:\aaaaaavm\yuanguard_hv_step1X_20260815.sys`、`_step17_apicpassthrough_
+  20260815.sys`、`_step17_minimal_20260815.sys`、`_step17_hostisr_20260815.sys`、
+  `_step99_allcore_20260815.sys`、`_step17_singlecore_20260815.sys`；
+- 蓝屏 dump：`D:\aaaaaavm\yghv_bsod_variantD.dmp`（0x139 FAST_FAIL_INCORRECT_STACK）；
+- 代码备份：`D:\aaaaaavm\main.c.bak-20260815-v98fix/-step202-ctlA/-step17-ctlD/
+  -step202-ctlC/-step17-ctlE/-step99-ctlG`、`build.bat.bak-20260815-ctlA`、
+  `Windows 10 x64.vmx.bak-20260815-singlecore`；
+- VM 当前配置：`numvcpus=1`（单核方案遗留，如需多核改回 4）。
+
+### 8.6 交接建议（VM 路线）
+
+- VM 路线（OS-as-guest 阻塞常驻）同样**收尾**——证据完备，VMware 嵌套平台限制实锤；
+- 有界/自旋形态（step11-20）可在 VM 继续用于回归/机制研究；
+- 换平台（KVM/真实硬件）时，复用本轮三项修复（v98fix/解码器/run_kd）+ 最小干预配置
+  （APIC 直通 + 宿主 CR3 直通）；
