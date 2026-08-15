@@ -3103,3 +3103,155 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   边界）。**本会话上下文将满，下窗口请先读本记录 + 9.157-9.178。**
 - **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.180 2026-08-15 MSV：最小影子验证方案（用户确认，开始实施）
+
+- **背景**：9.179 把影子页表列为理论正确但成本最高（A），推荐 B。用户目标=本机运行
+  真 OS-as-guest，追问"影子表入手"。分析确认：完整影子页表是唯一能把"独立地址空间"
+  给到活 Windows 的方案（同时解决深拷贝失同步 + 进程切换拉回真实 CR3 两条理由），
+  且 9.152 是唯一解冻变量（独立 CR3，合成常驻 5 分钟稳定）。影子假设从未在 OS-as-guest
+  上被真正测过（此前失败：浅拷贝只换根/下层共享、或 CR3 拦截只模拟回真实表）。
+  **MSV = 在投入数千行完整实现前，用一个最小实验区分两条假设**：
+  - **H1**：共享 CR3（地址空间隔离）是冻结根因 → 独立 CR3 + 影子可解，投入完整影子；
+  - **H2**：errata 类中断/上下文切换死锁（与地址空间无关，AMD 1363 无修复）→ 影子无效，
+    本机停线止损。
+- **MSV 设计（用户 2026-08-15 确认 "ok"）**：
+  1. **深拷贝整棵宿主页表树**为完全独立 guest CR3（修复 9.177 的 0x7E：无效 PA 防护，
+     无法 `MmGetVirtualForPhysical` 的项跳过；分配上限 -1 不限 4GB；PML4→PDPT→PD→PT
+     逐级独立，1GB/2MB 大页项逐字复制，4KB 项复制整张 PT）；
+  2. OS-as-guest **阻塞 delay 线程**（step23 形态，core1）guest CR3 = 深拷贝；
+  3. **CR3 写拦截 fail-close**：首次 CR3 写（意外进程切换）→ 日志 + 置
+     `g_os_guest_stop_requested` 干净退出（避免映射混乱/冻结）；
+  4. **同进程调度切换**：guest 核创建 2-3 个 **System 进程辅助线程**（同 CR3）做
+     1ms delay 循环，使调度器在 guest 内只做**同进程切换**（KiSwapThread，无 CR3 写）
+     ——历史所有实验从未测过的组合：独立 CR3 + 真实上下文切换；
+  5. **判据**（alive + watchdog，历史冻结窗口 <5s）：
+     - 存活 ≥30-60s 同进程切换 → H1 成立 → 投入完整影子页表；
+     - 硬冻结（无 dump）→ H2 成立 → 本机停线；
+     - 可诊断故障（BSOD/三重故障/NPF）→ 独立 CR3 把硬冻结变可诊断（参考 9.177）
+       → 部分支持 H1，完整影子可修。
+- **实现接入**（本轮目标，改动范围明确）：
+  - `main.c`：新增 `yghv_clone_host_cr3_deep()`（深拷贝）、`g_msv_test/
+    g_msv_helper_stop` 全局、`yghv_msv_helper_thread()`、step 200 分发（复用 step23
+    编排 + 辅助线程）；`yghv_baremetal_step_test` 上限 102→200；
+  - `vmexit.c`：`svm_handle_cr` 的 CR3 写分支加 MSV fail-close（extern `g_msv_test`）；
+  - `svm_core.c` / `svm_trampoline.S` / NPT / 控制面 / hook 路径**不动**；
+  - 门控用 `YGHV_BAREMETAL_STEP=200`（build.bat 已有传参）。
+- **风险**：加载有冻结风险（需重启预案 + 恢复 C 盘 `70888311`，已有备份
+  `D:\yuanguard\backup_stable_70888311.sys`）；深拷贝内存几 MB 可接受。
+- **实现（2026-08-15，已构建验证）**：
+  - `main.c`：新增 `yghv_msv_pt_alloc/yghv_msv_pa_to_va/yghv_clone_host_cr3_deep`
+    （深拷贝整棵页表树，无效 PA 防护，分配上限 -1）、`g_msv_test/g_msv_helper_stop/
+    g_msv_cr3_seen/g_msv_cr3_writes`、`yghv_msv_helper_thread`（同进程 1ms delay 切换）、
+    step 200 分发（step23 编排 + 3 辅助线程 + `g_os_guest_delay_quiet=TRUE` 防 0x139）；
+    `yghv_os_guest_clone_cr3_apply` 在 `g_msv_test` 下走深拷贝；step 上限 102→200。
+  - `vmexit.c`：`svm_handle_cr` CR3 写分支加 MSV fail-close（首次 CR3 写 → 置
+    `g_os_guest_stop_requested` + return 1，**VMEXIT 路径内零文件写**——v100b 0x139
+    教训）；dispatch CR case 改为尊重 `svm_handle_cr` 返回值（fail-closed 语义，REV-009）。
+  - `svm_core.c`/`svm_trampoline.S`/NPT/控制面/hook 路径未动。
+- **构建**：MSV 门控版（`YGHV_BAREMETAL_STEP=200`）SUCCESS，SHA256
+  `27A9C34A512CD67A44F5589DC558E8E2BC48463D6ABCDC5C6F44DB5266029FD5`，归档
+  `D:\aaaaaavm\yuanguard_hv_msv_20260815.sys`，MSV 字符串（bm msv start / msv deep
+  cr3 cloned / msv survived 60s timeout / bm msv done）全部 PRESENT（防 9.94 常量折叠）；
+  默认版（门控关）SUCCESS，SHA256 `511B595DD211CBF332AD8C2B1E8639EBFE8BB0ED308061EE01B435B84A170294`。
+  **有界等待修正**：step200 的 `KeWaitForSingleObject` 改为 60s 有界等待 + 超时后置
+  `g_os_guest_stop_requested` 干净停止（否则 H1 成立时 guest 永不停止 → DriverEntry
+  卡 START_PENDING，同 9.145 挂起形态）。
+- **待实机验证**（需用户确认）：备份 C 盘稳定版 → 覆盖 MSV 版 → `sc start yuanguard` →
+  观察 `C:\Windows\yghv_progress.log`（期望 `bm step=0xc8 → bm msv start → msv deep
+  cr3 cloned → os resident delay enter=1 → bm msv done/stopped` + `resident alive`
+  递增；判据：存活 ≥30-60s 同进程切换 = H1 成立；<5s 硬冻结无 dump = H2 成立）→
+  `sc stop`（应干净 STOPPED）→ 恢复 C 盘稳定版。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.181 2026-08-15 MSV-1 实机结果：0x101 可诊断（非硬冻结），冻结点=guest 空闲 HLT 时钟中断
+
+- **执行**：用户确认后部署 MSV 门控版（`27A9C34A`）实机加载。
+- **结果**：**蓝屏 0x101 CLOCK_WATCHDOG_TIMEOUT**（09:43:03，转储
+  `C:\Windows\Minidump\081526-11296-01.dmp`，已归档
+  `D:\aaaaaavm\yghv_bsod_msv_20260815_0943.dmp`），机器重启后 C 盘已恢复稳定版
+  `70888311`，服务 STOPPED。
+- **进度日志**（崩溃前）：`bm step=0xc8 → bm msv start → os guest tss isolated →
+  os guest cr3 intercept enabled → **msv deep cr3 cloned=0x4219ff000** →
+  os guest cr3 cloned to=0x4219ff000 → os resident delay enter=1` → 无 `resident alive`
+  （<5s 内即 0x101）。
+- **转储分析（cdb !analyze）**：
+  - BugCheck **0x101**，Arg3=PRCB `ffffb5812e180180`，**Arg4=1（挂起核=核心 1 = guest
+    测试核）**；FAILURE_BUCKET `CLOCK_WATCHDOG_TIMEOUT_IDLE_THREAD_INVALID_CONTEXT_nt!
+    KeAccumulateTicks`；
+  - 核心 1 PRCB：**CurrentThread == IdleThread（System）** → 崩溃瞬间核心 1 处于
+    **空闲（HLT）状态**，未服务时钟中断；
+  - `yuanguard_hv` 已加载（base `fffff805594d0000`）。
+- **判据判定**：
+  - **不是硬冻结**（有转储、其它核存活）——独立深拷贝 CR3 把历史"无转储整机硬停"变成
+    **可诊断 0x101**（与 9.177 深拷贝 0x7E 同类：独立 CR3 改变失败形态，H1 方向获支持）；
+  - 但核心 1 仍 <5s 失败：**guest 空闲 HLT 时时钟中断未被服务** → 0x101。冻结点从
+    "内存侧（共享 CR3）"转移到"**中断/空闲 HLT 路径**"。
+- **机理推断**：step20 自旋稳定是因为 guest 永不 HLT、每次 CPUID VMEXIT、中断在宿主态收
+  （INTR/NMI 拦截 + host ISR）；阻塞常驻导致 guest 空闲执行 HLT，本机 SVM 在
+  "guest 态 HLT + 中断唤醒 → VMEXIT(INTR)" 路径上不工作（errata 1363 方向）→ 核心停在
+  halt、时钟中断不处理 → 0x101。**v97（HLT 拦截）当年在共享 CR3 上失败；与独立 CR3
+  组合（MSV-2）从未测过**——若拦截 HLT 使 guest 永不真正 halt（HLT→VMEXIT→RIP 推进→
+  重入，变成自旋式空闲），时钟中断经 INTR 退出在宿主态处理，0x101 应消失。
+- **MSV-2 提案（待用户确认）**：MSV 基线上加 `g_v97_hlt_intercept=TRUE`（拦截
+  HLT/MWAIT/MWAIT_COND，vmexit.c 已有 RIP 推进模拟），独立 CR3 + HLT 拦截组合首次测试；
+  判据同 MSV-1（存活 ≥30-60s = H1 成立；0x101/硬冻结 = 进一步收敛）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.182 2026-08-15 MSV-2 实机结果：HLT 拦截无效，仍 0x101 —— 中断路径是硬墙
+
+- **执行**：用户确认后部署 MSV-2 门控版（`2DC9C9C0`，= MSV + `g_v97_hlt_intercept=TRUE`
+  拦截 HLT/MWAIT/MWAIT_COND）实机加载。
+- **结果**：**仍蓝屏 0x101 CLOCK_WATCHDOG_TIMEOUT**（09:57:18，转储
+  `C:\Windows\Minidump\081526-8890-01.dmp`，已归档
+  `D:\aaaaaavm\yghv_bsod_msv2_20260815_0957.dmp`）。同一 bucket
+  `CLOCK_WATCHDOG_TIMEOUT_IDLE_THREAD_INVALID_CONTEXT`，Arg4=1（核心 1），
+  **核心 1 PRCB CurrentThread==IdleThread**（`!pcr 1` 复核）。PROCESS_NAME
+  `wetype_update.exe`（bugcheck 线程所在进程，非核心 1）。
+- **进度日志**：与 MSV-1 完全一致（`bm step=0xc8 → bm msv start → msv deep cr3 cloned →
+  os resident delay enter=1` → 无 `resident alive`，<5s 即 0x101）。HLT 拦截已接入
+  （step200 设 `g_v97_hlt_intercept`，delay 线程 VMCB 应用 HLT/MWAIT/MWAIT_COND）。
+- **判据判定**：
+  - **HLT 拦截未阻止 0x101** → 即使 guest 永不真正 halt（HLT→VMEXIT→RIP 推进→自旋），
+    核心 1 仍不服务时钟中断 → **0x101 不是"guest 空闲 HLT 中断唤醒坏"引起，而是更深层的
+    guest 态中断投递/服务路径失效**（errata 1363 方向）。
+  - 两次 MSV 形成清晰分离：**独立深拷贝 CR3 修好了内存侧**（硬冻结→可诊断 0x101，
+    H1 内存隔离方向获实证支持）；**但中断侧不受内存隔离/HLT 拦截影响，仍是硬墙**。
+- **结论（对路线的影响）**：
+  - **影子页表（选项 A）只解决内存侧**——MSV 证明内存侧已不再是硬冻结（变成可诊断），
+    但剩余 0x101 是**中断路径**，影子页表不覆盖 → **仅靠影子页表无法让阻塞 OS-as-guest
+    在本机跑起来**。
+  - 唯一理论上能处理中断路径的是**选项 B（APIC/中断完整虚拟化）**（9.179 推荐），但
+    AMD errata 1363（SVM guest 态中断死锁，无修复方案）→ **在本 CPU 上概率低**。
+  - 本机最终边界（两次 MSV 实证后更新）：独立 CR3 + 中断路径修复（B）仍可能不可达；
+    影子页表（A）单独不够。真阻塞 OS-as-guest 需换平台（或接硬件调试器验证 1363）。
+- **下一步候选（待用户决定）**：
+  - a) 尝试选项 B（APIC 虚拟化，在 step20 稳定基线上做 xAPIC MSR/MMIO 完整虚拟化 +
+    虚拟中断注入）——工程量中、针对 0x101 直接、但 1363 无修复概率低；
+  - b) 接受边界：本机维持"有界试点 + step20 自旋常驻（可干净卸载）"，OS-as-guest 常驻
+    换平台；
+  - c) 在 MSV 基线上继续细分中断路径（如 host ISR 路径注入虚拟中断 V_INTR、逐核观察
+    时钟中断计数）——诊断价值有限（已两次确认中断侧失效）。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- 提交：本记录。
+
+### 9.183 2026-08-15 决策：接受本机边界（用户选 b）—— OS-as-guest 常驻线收尾
+
+- **决策**：用户选择 **b（接受边界）**。本机 OS-as-guest 常驻线正式收尾。
+- **本机最终边界（两次 MSV 实证后定稿）**：
+  - **可达**：有界试点（step12/14/16 全 PASS）+ **step20 自旋常驻**（可加载/稳定/9.163
+    起可干净卸载）——这是本机可运行的 OS-as-guest 形态；
+  - **不可达**：真阻塞 OS-as-guest（guest 内 Windows 调度器真实切换）——两次 MSV
+    （9.181/9.182）实证：内存侧已被独立 CR3 修成可诊断 0x101，但**中断侧是硬件墙**
+    （guest 态时钟中断不被服务，errata 1363 无修复），影子页表（A）与 HLT 拦截均无法
+    绕过 → **换平台项**。
+- **MSV 实验价值**：把"无转储整机硬停"精确定位为"内存侧可解 + 中断侧硬件墙"，为
+  OS-as-guest 常驻线提供最终代码级结论；MSV 门控代码（step200 + 深拷贝 +
+  HLT 拦截组合）保留在树中（`YGHV_BAREMETAL_STEP=200`，默认构建不激活），供换平台时
+  复用（深拷贝 + CR3 写 fail-close + 有界 60s 等待 + HLT 拦截均为已验证可复用的实验件）。
+- **当前状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全。
+- **本轮提交**：`main.c`（MSV 全局/深拷贝/step200/辅助线程/HLT 拦截）、`vmexit.c`
+  （CR3 写 MSV fail-close + dispatch 尊重 CR handler 返回值）、交接文档 9.180-9.183。
+- 提交：本记录。

@@ -26,6 +26,10 @@ extern volatile ULONG64 g_os_resident_exits;
 extern volatile BOOLEAN g_os_guest_avic_timer_emu;
 extern volatile BOOLEAN g_v98_apic_shadow;
 extern volatile BOOLEAN g_os_guest_stop_requested;
+/* 9.180 MSV: minimal shadow validation flags (defined in main.c). */
+extern volatile BOOLEAN g_msv_test;
+extern volatile BOOLEAN g_msv_cr3_seen;
+extern volatile ULONG64 g_msv_cr3_writes;
 extern volatile BOOLEAN g_v100_monitor_active;
 extern volatile BOOLEAN g_v101_gp_seen;
 extern volatile uint64_t g_v101_gp_exitcode;
@@ -424,7 +428,10 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
     case SVM_EXIT_CR3_READ:  case SVM_EXIT_CR3_WRITE:
     case SVM_EXIT_CR4_READ:  case SVM_EXIT_CR4_WRITE:
     case SVM_EXIT_CR8_READ:  case SVM_EXIT_CR8_WRITE:
-        svm_handle_cr(vcpu);
+        /* svm_handle_cr is fail-closed (REV-009): non-emulated CR exits and the
+           MSV CR3-write stop return 1, which must stop the resident loop. */
+        if (svm_handle_cr(vcpu))
+            return 1;
         svm_finish_exit(vcpu);
         return 0;
 
@@ -702,6 +709,20 @@ static int svm_handle_cr(svm_vcpu_t *vcpu) {
         int rex_b = 0;
         uint8_t modrm, rm, reg;
         uint64_t *slot;
+
+        /* 9.180 MSV fail-close: under the minimal shadow validation the guest
+           must stay on the deep-copied independent CR3; a process-switch CR3
+           write would drag it back to the shared host tables (the 9.179
+           failure mode), so stop the guest cleanly on the first one instead
+           of letting it fall back / freeze.  No trace here: a file write in
+           the GIF=0 dispatch path can block and 0x139 (v100b lesson); the
+           host-side step200 block reports g_msv_cr3_seen after the stop. */
+        if (g_msv_test) {
+            g_msv_cr3_seen = TRUE;
+            g_msv_cr3_writes++;
+            g_os_guest_stop_requested = TRUE;
+            return 1;
+        }
 
         if (n >= 3) {
             /* skip REX prefix (0x40-0x4F); REX.B extends rm to r8-r15 */

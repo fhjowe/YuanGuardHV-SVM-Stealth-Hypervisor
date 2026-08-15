@@ -93,6 +93,16 @@ volatile BOOLEAN g_os_guest_tlb_flush_all = TRUE;
    freeze.  Lower page tables are shared with the host on purpose (the guest IS
    Windows; guest PTE updates must stay visible to the host). */
 volatile BOOLEAN g_os_guest_clone_cr3 = TRUE;
+/* 9.180 MSV: minimal shadow validation mode.  When TRUE (YGHV_BAREMETAL_STEP=200),
+   the OS-as-guest blocking delay thread runs on a DEEP-copied fully independent
+   page table (yghv_clone_host_cr3_deep), CR3 writes fail-close (stop the guest
+   cleanly instead of letting it fall back to shared host tables), and helper
+   System threads force same-process scheduler switching on the guest core —
+   the combination "independent CR3 + real context switch" never tested before. */
+volatile BOOLEAN g_msv_test = FALSE;
+volatile BOOLEAN g_msv_helper_stop = FALSE;
+volatile BOOLEAN g_msv_cr3_seen = FALSE;
+volatile ULONG64 g_msv_cr3_writes = 0;
 static uint64_t yghv_clone_host_cr3(void) {
     npt_entry_t *src_pml4 = NULL, *dst_pml4 = NULL;
     uint64_t src_pa, dst_pml4_pa = 0;
@@ -115,6 +125,105 @@ static uint64_t yghv_clone_host_cr3(void) {
     RtlCopyMemory(dst_pml4, src_pml4, 512 * sizeof(npt_entry_t));
     yghv_trace_u64("os guest cloned cr3", dst_pml4_pa);
     return dst_pml4_pa;
+}
+
+/* 9.180 MSV: page-table page allocator for the deep clone.  Uses -1
+   HighestAcceptableAddress so the tree may live above 4 GB (per 9.140). */
+static npt_entry_t *yghv_msv_pt_alloc(void) {
+    npt_entry_t *t = (npt_entry_t *)MmAllocateContiguousMemory(
+        HV_PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = -1LL });
+    if (t)
+        RtlZeroMemory(t, HV_PAGE_SIZE);
+    return t;
+}
+
+static npt_entry_t *yghv_msv_pa_to_va(uint64_t pa) {
+    return (npt_entry_t *)MmGetVirtualForPhysical(
+        (PHYSICAL_ADDRESS){ .QuadPart = pa });
+}
+
+/* 9.180 MSV: deep-copy the WHOLE host page table tree (PML4/PDPT/PD/PT pages
+   all private; leaf mappings still point at the same physical pages, since the
+   guest IS the same Windows).  This gives OS-as-guest a guest CR3 that never
+   aliases the host, and — unlike the shallow 9.177/9.178 clone — no lower-level
+   page-table page is shared, so the guest never walks a host-owned page table.
+   Invalid-PA protection (skip any present entry whose next-level page cannot be
+   resolved) fixes the 9.177 deep-copy 0x7E crash.  Returns new PML4 PA, or 0. */
+static uint64_t yghv_clone_host_cr3_deep(void) {
+    npt_entry_t *src_pml4, *dst_pml4;
+    uint64_t src_pa, dst_pml4_pa = 0;
+    ULONG i;
+
+    __asm__ volatile("mov %%cr3, %0" : "=r"(src_pa));  /* host CR3 = PML4 PA */
+    src_pml4 = yghv_msv_pa_to_va(src_pa);
+    if (!src_pml4)
+        return 0;
+    dst_pml4 = yghv_msv_pt_alloc();
+    if (!dst_pml4)
+        return 0;
+    dst_pml4_pa = MmGetPhysicalAddress(dst_pml4).QuadPart;
+
+    for (i = 0; i < 512; i++) {
+        uint64_t se = src_pml4[i].all;
+        npt_entry_t *src_pdpt, *dst_pdpt;
+        ULONG j;
+
+        if (!(se & 1))                     /* not present */
+            continue;
+        src_pdpt = yghv_msv_pa_to_va(se & 0x000FFFFFFFFFF000ULL);
+        if (!src_pdpt)                     /* invalid PA: skip */
+            continue;
+        dst_pdpt = yghv_msv_pt_alloc();
+        if (!dst_pdpt)
+            goto fail;
+        dst_pml4[i].all = MmGetPhysicalAddress(dst_pdpt).QuadPart | 0x3;
+
+        for (j = 0; j < 512; j++) {
+            uint64_t se2 = src_pdpt[j].all;
+            npt_entry_t *src_pd, *dst_pd;
+            ULONG k;
+
+            if (!(se2 & 1))
+                continue;
+            if (se2 & (1ULL << 7)) {       /* 1GB large page: copy verbatim */
+                dst_pdpt[j].all = se2;
+                continue;
+            }
+            src_pd = yghv_msv_pa_to_va(se2 & 0x000FFFFFFFFFF000ULL);
+            if (!src_pd)
+                continue;
+            dst_pd = yghv_msv_pt_alloc();
+            if (!dst_pd)
+                goto fail;
+            dst_pdpt[j].all = MmGetPhysicalAddress(dst_pd).QuadPart | 0x3;
+
+            for (k = 0; k < 512; k++) {
+                uint64_t se3 = src_pd[k].all;
+                npt_entry_t *src_pt, *dst_pt;
+
+                if (!(se3 & 1))
+                    continue;
+                if (se3 & (1ULL << 7)) {   /* 2MB large page: copy verbatim */
+                    dst_pd[k].all = se3;
+                    continue;
+                }
+                src_pt = yghv_msv_pa_to_va(se3 & 0x000FFFFFFFFFF000ULL);
+                if (!src_pt)
+                    continue;
+                dst_pt = yghv_msv_pt_alloc();
+                if (!dst_pt)
+                    goto fail;
+                dst_pd[k].all = MmGetPhysicalAddress(dst_pt).QuadPart | 0x3;
+                RtlCopyMemory(dst_pt, src_pt, 512 * sizeof(npt_entry_t));
+            }
+        }
+    }
+    yghv_trace_u64("msv deep cr3 cloned", dst_pml4_pa);
+    return dst_pml4_pa;
+
+fail:
+    yghv_trace("msv deep cr3 clone failed");
+    return 0;
 }
 /* 9.162: clean-unload for OS-as-guest resident (fixes 0xCE).  When
    g_os_guest_stop_requested is set, svm_dispatch_exit returns 1 so the
@@ -1006,7 +1115,7 @@ static void yghv_os_guest_clone_cr3_apply(svm_vcpu_t *v) {
 
     if (!v || !g_os_guest_clone_cr3)
         return;
-    cloned = yghv_clone_host_cr3();
+    cloned = g_msv_test ? yghv_clone_host_cr3_deep() : yghv_clone_host_cr3();
     if (!cloned) {
         LOG_ERROR("os guest clone cr3 failed, keeping host cr3");
         return;
@@ -1546,6 +1655,23 @@ static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
     }
 }
 
+/* 9.180 MSV: same-process scheduler-switch helpers.  Pinned to the guest core,
+   each loops on a 1 ms delay.  When the OS-as-guest delay thread blocks, the
+   scheduler (running inside guest mode) switches among these System-process
+   threads — same CR3, no CR3 write — exercising KiSwapThread on the independent
+   deep-copied CR3, the exact combination never tested before. */
+static VOID yghv_msv_helper_thread(PVOID ctx) {
+    uint32_t core = (uint32_t)(uintptr_t)ctx;
+    LARGE_INTEGER t;
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    t.QuadPart = -1LL * 10000LL;           /* 1 ms */
+    while (!g_msv_helper_stop) {
+        KeDelayExecutionThread(KernelMode, FALSE, &t);
+    }
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 static void *yghv_avic_alloc_page(uint64_t *pa_out) {
     void *page;
 
@@ -1768,7 +1894,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 102)
+    if (step > 200)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -1813,6 +1939,127 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
     if (step == 102) {
         g_v102_catchall = TRUE;
         step = 100;
+    }
+
+    /* 9.180 MSV: minimal shadow validation.  step23 shape (blocking delay
+       resident on core 1) but the guest runs on a DEEP-copied fully independent
+       page table (yghv_clone_host_cr3_deep via g_msv_test), CR3 writes
+       fail-close (svm_handle_cr stops the guest on the first process-switch
+       CR3 write), and 3 System-process helper threads force same-process
+       scheduler switching on the guest core.  Judge H1 (independent address
+       space fixes the freeze -> full shadow paging) vs H2 (errata-class
+       context-switch deadlock -> stop the line on this machine). */
+    if (step == 200) {
+        HANDLE thread = NULL, alive = NULL, watchdog = NULL;
+        HANDLE helpers[3] = { NULL, NULL, NULL };
+        NTSTATUS st200;
+        ULONG h;
+
+        yghv_trace("bm msv start");
+        g_msv_test = TRUE;
+        g_msv_cr3_seen = FALSE;
+        g_msv_cr3_writes = 0;
+        g_msv_helper_stop = FALSE;
+        KeInitializeEvent(&g_os_guest_done_events[1], NotificationEvent, FALSE);
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        g_os_guest_intr_intercept = TRUE;
+        g_os_guest_host_isr = TRUE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_delay_quiet = TRUE;   /* no guest-mode file I/O (0x139 lesson) */
+        g_v97_hlt_intercept = TRUE;      /* MSV-2: intercept HLT/MWAIT so guest
+                                            idle never actually halts in guest
+                                            mode (0x101 fix direction) */
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+
+        for (h = 0; h < 3; h++) {
+            st200 = PsCreateSystemThread(&helpers[h], THREAD_ALL_ACCESS, NULL,
+                                         NULL, NULL, yghv_msv_helper_thread,
+                                         (PVOID)(uintptr_t)1);
+            if (!NT_SUCCESS(st200)) {
+                LOG_ERROR("bm msv: helper %u create failed 0x%x", h, st200);
+                break;
+            }
+        }
+        st200 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
+                                     NULL, yghv_os_guest_resident_delay_thread,
+                                     (PVOID)(uintptr_t)1);
+        if (!NT_SUCCESS(st200)) {
+            LOG_ERROR("bm msv: thread create failed 0x%x", st200);
+            goto msv_fail;
+        }
+        st200 = PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL, NULL,
+                                     NULL, yghv_resident_alive_thread, NULL);
+        if (!NT_SUCCESS(st200)) {
+            LOG_ERROR("bm msv: alive create failed 0x%x", st200);
+            goto msv_fail;
+        }
+        st200 = PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL, NULL,
+                                     NULL, yghv_resident_watchdog_thread, NULL);
+        if (!NT_SUCCESS(st200)) {
+            LOG_ERROR("bm msv: watchdog create failed 0x%x", st200);
+            goto msv_fail;
+        }
+        {
+            LARGE_INTEGER msv_timeout;
+            NTSTATUS wait_st;
+
+            /* Bounded wait: the guest only stops itself on an MSV CR3-write
+               fail-close or a fault.  If H1 holds (independent address space
+               fixes the freeze) the guest runs indefinitely doing same-process
+               switches, so we must time out and stop it cleanly, otherwise
+               DriverEntry would hang in START_PENDING forever. */
+            msv_timeout.QuadPart = -60LL * 10000000LL;   /* 60 s */
+            wait_st = KeWaitForSingleObject(&g_os_guest_done_events[1],
+                                            Executive, KernelMode, FALSE,
+                                            &msv_timeout);
+            if (wait_st == STATUS_TIMEOUT) {
+                yghv_trace("msv survived 60s timeout - H1 supported");
+                g_os_guest_stop_requested = TRUE;
+                msv_timeout.QuadPart = -10LL * 10000000LL;   /* 10 s grace */
+                KeWaitForSingleObject(&g_os_guest_done_events[1], Executive,
+                                      KernelMode, FALSE, &msv_timeout);
+            } else {
+                yghv_trace("msv stopped by guest event");
+            }
+        }
+        /* Resident guest stopped (host_done) — MSV CR3-write fail-close, a
+           fault, or the 60s timeout.  Stop helpers and exit. */
+        g_msv_helper_stop = TRUE;
+        if (g_msv_cr3_seen)
+            yghv_trace_u64("msv stopped on cr3 write", g_msv_cr3_writes);
+        else
+            yghv_trace("msv stopped without cr3 write");
+        if (thread) ZwClose(thread);
+        if (alive) ZwClose(alive);
+        if (watchdog) ZwClose(watchdog);
+        for (h = 0; h < 3; h++)
+            if (helpers[h]) ZwClose(helpers[h]);
+        g_msv_test = FALSE;
+        g_os_resident_mode = FALSE;
+        g_os_guest_intr_intercept = FALSE;
+        g_os_guest_host_isr = FALSE;
+        g_os_guest_delay_quiet = FALSE;
+        g_v97_hlt_intercept = FALSE;
+        g_os_resident_log_active = FALSE;
+        yghv_trace("bm msv done");
+        return STATUS_SUCCESS;
+
+    msv_fail:
+        g_msv_test = FALSE;
+        g_msv_helper_stop = TRUE;
+        g_os_resident_mode = FALSE;
+        g_os_guest_intr_intercept = FALSE;
+        g_os_guest_host_isr = FALSE;
+        g_os_guest_delay_quiet = FALSE;
+        g_v97_hlt_intercept = FALSE;
+        g_os_resident_log_active = FALSE;
+        if (thread) ZwClose(thread);
+        if (alive) ZwClose(alive);
+        if (watchdog) ZwClose(watchdog);
+        for (h = 0; h < 3; h++)
+            if (helpers[h]) ZwClose(helpers[h]);
+        return st200;
     }
 
     if (step == 6) {
