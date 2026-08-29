@@ -3,6 +3,8 @@
 > AMD-V (SVM/NPT) 隐形 Hypervisor —— 把进程保护逻辑下沉到虚拟化层。
 > 前身是内核驱动版 YuanGuard（Minecraft/Forge 进程保护），本仓库将其保护能力迁移到 AMD SVM 虚拟化层实现。
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **⚠️ 实验性项目。** 本项目涉及内核模式虚拟化、驱动加载与反侦查（stealth）技术，仅供拥有合法授权的安全研究/学习用途。驱动加载需要管理员权限与测试签名环境，运行不当可能导致系统崩溃（蓝屏）。详见文末[合规与法律声明](#合规与法律声明)。
 
 ---
@@ -130,6 +132,18 @@ yuanguard/
 
 - 管理员权限，且内核已开启测试签名（`bcdedit /set testsigning on` 或使用已签名驱动）；
 - 测试证书 `yuanguard_test.cer`。
+
+### 本机开发/测试环境（2026-08 实测）
+
+| 项 | 值 |
+|---|---|
+| CPU | AMD Ryzen 5 5500（6C/12T） |
+| 内存 | 16 GB |
+| 宿主系统 | Windows 10 专业工作站版 22H2（10.0.19045，64 位） |
+| 测试虚拟机 | Windows 10 Pro 19045.2965（VMware 17.6.4） |
+| 构建工具链 | clang-cl（LLVM）+ MSVC link 14.44.35207 + WDK 10.0.19041/10.0.26100 + signtool |
+
+> 注：VM 内 AMD SVM 指令暴露受限（VMware `vhv.enable` 嵌套限制），VM+KD 通道已判定不可用，实机验证走裸机/KVM 路线。
 
 ---
 
