@@ -1,0 +1,270 @@
+# YuanGuardHV
+
+> AMD-V (SVM/NPT) 隐形 Hypervisor —— 把进程保护逻辑下沉到虚拟化层。
+> 前身是内核驱动版 YuanGuard（Minecraft/Forge 进程保护），本仓库将其保护能力迁移到 AMD SVM 虚拟化层实现。
+
+**⚠️ 实验性项目。** 本项目涉及内核模式虚拟化、驱动加载与反侦查（stealth）技术，仅供拥有合法授权的安全研究/学习用途。驱动加载需要管理员权限与测试签名环境，运行不当可能导致系统崩溃（蓝屏）。详见文末[合规与法律声明](#合规与法律声明)。
+
+---
+
+## 目录
+
+- [项目背景](#项目背景)
+- [核心架构](#核心架构)
+- [目录结构](#目录结构)
+- [功能里程碑](#功能里程碑)
+- [环境要求](#环境要求)
+- [构建](#构建)
+- [加载与运行](#加载与运行)
+- [客户端用法](#客户端用法)
+- [测试](#测试)
+- [文档索引](#文档索引)
+- [已知限制与路线图](#已知限制与路线图)
+- [合规与法律声明](#合规与法律声明)
+
+---
+
+## 项目背景
+
+- 早期版本是运行在 Ring 0 的内核驱动（YuanGuard），直接挂钩内核函数来保护 Minecraft/Forge 进程。
+- 本仓库（YuanGuardHV）把同样的一套保护逻辑（内存写保护、进程终止保护、句柄保护、常驻）**搬进 AMD SVM 虚拟化层**，通过 NPT（Nested Page Table）+ VMMCALL + VMEXIT 拦截实现：
+  - 保护语义与宿主 OS 解耦，宿主内核对保护逻辑“看不见”；
+  - 未来目标是把保护对象放进 guest 态，形成整机级隔离（OS-as-guest 路线，当前受平台限制停线，见[已知限制](#已知限制与路线图)）。
+- 当前主线是非驻留保护路线：驱动在真实 Windows 中运行，用合成 resident guest 承载 VMRUN 验证链；真实进程代码仍原生执行。
+
+---
+
+## 核心架构
+
+```
+                    ┌──────────────────────────────────┐
+   Ring 0 (kernel)  │   yuanguard_hv.sys (DriverEntry)  │
+                    │   ├─ svm_core    SVM 初始化/VMRUN   │
+                    │   ├─ npt_core    NPT 映射/NPF 权限  │
+                    │   ├─ vmexit      VMEXIT 分发        │
+                    │   ├─ vmmcall     VMMCALL 处理/认证  │
+                    │   ├─ multi_core  每核系统线程/DPC    │
+                    │   ├─ protect     保护逻辑           │
+                    │   ├─ control_device  IOCTL 控制面   │
+                    │   └─ loader_stealth  加载隐藏(门控)  │
+                    └──────────────┬───────────────────┘
+                                   │ DeviceIoControl (\\.\YuanGuardHV)
+                    ┌──────────────▼───────────────────┐
+   User mode        │  yghv_ctl.ps1  /  YghvCtl (Java)  │
+                    └──────────────────────────────────┘
+```
+
+- **SVM 虚拟化**：`VMRUN`/`VMLOAD`/`VMSAVE`/`CLGI`，VMCB 字段对照 AMD APM 实现；合成 guest 通过 VMMCALL 心跳与宿主通信。
+- **NPT**：16GB identity-map + NPF（Nested Page Fault）权限注入；支持 `perm / range / translate / split` API（v25 单测 PASS）。
+- **VMEXIT/VMMCALL**：VMEXIT 分发、VMMCALL 认证分层（控制面要求 SeDebugPrivilege / 目标绑定）。
+- **控制面**：内核驱动暴露 `\\.\YuanGuardHV` 设备，IOCTL 命令号统一（`0x5947` 文件标志），PowerShell/Java 客户端共用同一接口。
+- **多核**：每核一个系统线程进入 guest 态，双核 10000 轮心跳稳定。
+
+---
+
+## 目录结构
+
+```
+yuanguard/
+├── README.md                     # 本文件
+├── .gitignore                    # 构建产物/日志排除规则
+├── YuanGuardHV/                  # 主体
+│   ├── build.bat                 # 构建脚本（先跑静态检查，再编译+链接+签名）
+│   ├── hv/                       # 内核驱动源码
+│   │   ├── main.c                # DriverEntry、resident/OS-as-guest 实验框架
+│   │   ├── svm_core.c            # SVM 初始化、VMRUN、VMCB
+│   │   ├── npt_core.c            # NPT identity map + NPF 权限注入
+│   │   ├── vmexit.c              # VMEXIT 分发
+│   │   ├── vmmcall.c             # VMMCALL 处理与认证
+│   │   ├── multi_core.c          # 每核系统线程
+│   │   ├── protect.c             # 保护逻辑
+│   │   ├── control_device.c      # IOCTL 控制设备
+│   │   ├── loader_stealth.c      # 加载隐藏（门控，默认关）
+│   │   ├── svm_trampoline.S      # 进入/退出 guest 的汇编蹦床
+│   │   └── common/               # 头文件（vmcb/svm_defs/npt/msr/cpuid/…）
+│   ├── tools/
+│   │   ├── yghv_ctl.ps1          # PowerShell 客户端
+│   │   ├── yghv_stealth_check.ps1# 只读痕迹自查
+│   │   └── yghv_client/          # Java/JNI 客户端（YghvCtl）
+│   ├── tests/                    # 静态校验（编译自动执行）
+│   ├── unload_driver.ps1         # 无重启卸载驱动（NtUnloadDriver）
+│   ├── start_kd.ps1 / run_kd.bat # VM+KD 调试通道
+│   └── yuanguard_test.cer        # 测试签名证书（仅测试环境）
+├── docs/                         # 全程实验/决策/审计记录
+└── reference/                    # EPT 参考实现（研究用途，独立于正式构建）
+```
+
+> `bin/`、`*.sys`、`*.obj`、日志与 `svm_trampoline.asm` 均被 `.gitignore` 排除，不入库。
+
+---
+
+## 功能里程碑
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| Phase 1 | 骨架 + 核心头文件（VMCB/SVM/NPT/控制面） | ✅ |
+| Phase 2a | SVM init + VMRUN 单核，10000 轮 VMMCALL 心跳 | ✅ |
+| Phase 2b | NPT identity-map + NPF 权限注入验证 | ✅ |
+| Phase 2c | 多核 DPC（每核系统线程，双核心跳稳定） | ✅ |
+| Phase 2d | 物理机（裸机）回归 | ✅ |
+| Phase 3 v1 | 内存写保护 / 终止保护 / 句柄保护 / 常驻（v27–v31） | ✅ |
+| 真实目标 | Java/JNI 客户端、真实进程接入（`protect/unprotect/scan`） | ✅ |
+| R1 安全地基 | VMMCALL 认证分层、NPT 权限 API | ⏳ 部分（VMware 嵌套阻塞部分验证） |
+| 隐形 | 加载隐藏门控、痕迹自查工具 | ⏳ 默认关闭，待 kd 复核 |
+| OS-as-guest | 整机进 guest 的 B 路线（APIC 虚拟化等） | ⛔ 平台级硬冻结，已停线（见限制） |
+
+---
+
+## 环境要求
+
+构建机需要：
+
+| 工具 | 路径（本机示例） |
+|---|---|
+| clang-cl（LLVM） | `C:\Program Files\LLVM\bin\clang-cl.exe` |
+| MSVC link.exe | Visual Studio 2022 BuildTools `…\MSVC\14.44.35207\bin\Hostx64\x64\link.exe` |
+| Windows SDK / WDK | `C:\Program Files (x86)\Windows Kits\10`（Include 10.0.19041.0，signtool 10.0.26100） |
+| signtool | WDK `…\bin\10.0.26100.0\x64\signtool.exe` |
+
+运行（加载驱动）需要：
+
+- 管理员权限，且内核已开启测试签名（`bcdedit /set testsigning on` 或使用已签名驱动）；
+- 测试证书 `yuanguard_test.cer`。
+
+---
+
+## 构建
+
+```bat
+cd YuanGuardHV
+build.bat
+```
+
+流程（`build.bat`）：
+
+1. 先自动运行 `tests\run_static_checks.ps1`（接口一致性 + 命令一致性 + 安全红线），失败即中止；
+2. clang-cl 编译 `hv\*.c` + `svm_trampoline.S`；
+3. MSVC link 链接为 `bin\yuanguard_hv.sys`（WDM kernel driver）；
+4. signtool 用 `yuanguard_test.cer` 签名；
+5. 打印 SHA256 哈希。
+
+可用环境变量门控（`set YGHV_XXX=1` 后构建）：
+
+| 变量 | 作用 |
+|---|---|
+| `YGHV_LOADER_STEALTH` | 启用加载隐藏（模块摘链） |
+| `YGHV_UNLOAD_GUARD` | 反卸载守卫 |
+| `YGHV_BAREMETAL_NO_RESIDENT` | 裸机模式去 resident guest |
+| `YGHV_BAREMETAL_STEP` | 裸机 step 选择（OS-as-guest 实验用） |
+| `YGHV_SINGLECORE` | 单核 guest |
+| `YGHV_APIC_SHADOW` | APIC 影子（B-1full，裸机等价物） |
+| `YGHV_APIC_IDENTITY` / `YGHV_APIC_PASSTHROUGH` | APIC identity / passthrough 实验 |
+| `YGHV_NO_APIC_SHADOW` / `YGHV_NO_MSV_DEEP` / `YGHV_NO_CR3_INTERCEPT` | 关闭对应实验路径 |
+| `YGHV_HOST_ISR` | guest 中断改由宿主 ISR 服务 |
+| `YGHV_CATCHALL` | 拦截 guest 全异常 + HLT（诊断） |
+| `YGHV_V101_4VEC` | 只拦截 4 向量（#DF/#NP/#SS/#GP） |
+| `YGHV_R1_EXCLUDE_PRIVATE` / `YGHV_REAL_HOOK_TEST` | R1/真实 hook 实验 |
+
+输出：`YuanGuardHV\bin\yuanguard_hv.sys`
+
+---
+
+## 加载与运行
+
+以管理员身份在宿主/VM 中运行（测试签名已开启）：
+
+```powershell
+# 安装并启动内核服务（示例：驱动置于 C:\yuanguard_hv.sys）
+sc.exe create yuanguard type= kernel binPath= C:\yuanguard_hv.sys start= demand
+sc.exe start yuanguard
+
+# 查询状态
+sc.exe query yuanguard
+
+# 无重启卸载（仓库自带工具，NtUnloadDriver）
+powershell -NoProfile -ExecutionPolicy Bypass -File YuanGuardHV\unload_driver.ps1
+```
+
+- 服务名：`yuanguard`；控制设备：`\\.\YuanGuardHV`。
+- 加载后可用 `tools\yghv_ctl.ps1 state` 验证驱动响应。
+- 迭代流程（本仓库惯例）：构建 → 归档 `bin\yuanguard_hv.sys` → 拷贝到目标机 `C:\yuanguard_hv.sys` → `sc.exe start yuanguard` → 回归 → `unload_driver.ps1` 卸载（不重启可反复）。
+
+---
+
+## 客户端用法
+
+### PowerShell 客户端
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File YuanGuardHV\tools\yghv_ctl.ps1 <command>
+```
+
+常用命令：
+
+| 命令 | 说明 |
+|---|---|
+| `state` / `target` / `list-targets` / `list-pages` / `list-hooks` | 查询状态 |
+| `set-target <pid>` | 设置目标进程 |
+| `add-page <hex_va>` / `remove-page <hex_va>` | 增/删受保护页 |
+| `start` / `stop` | 启动/停止保护 |
+| `install-hook <name\|hex_va> [hook_id]` / `remove-hook <hook_id>` | 挂钩管理 |
+| `config [auto-disarm <0\|1> \| deny-status <hex>]` | 配置 |
+| `set-auto-start` / `unset-auto-start` / `harden-service` / `unharden-service` | 服务加固 |
+| `selftest` / `exit-test` | 自检 / 退出测试 |
+| `protect <pid> [maxPages]` / `unprotect` / `scan <pid> [maxPages]` | 一键保护 / 停止 / 只读扫描 |
+
+### Java/JNI 客户端（`tools\yghv_client`）
+
+```bat
+cd YuanGuardHV\tools\yghv_client
+build.bat          # 编译（含 JNI native）
+run.bat state      # 用法与 PowerShell 客户端一致
+```
+
+> **REV-019 注意**：`protect <pid>` 仅对调用进程自身 PID 生效（驱动把 ADD_PAGE 绑定到调用者 CR3，P0 自我保护目标）；保护其他进程需配合后续 OS-as-guest 里程碑。`scan <pid>` 为只读，可用于任意进程。
+
+---
+
+## 测试
+
+- **静态校验**（构建自动执行）：`tests\run_static_checks.ps1`
+  - `ioctl_parity.ps1`：C 头文件 ↔ PowerShell/Java 客户端 IOCTL 编号一致；
+  - `command_parity.ps1`：README ↔ 两客户端命令一致；
+  - `safety_checks.ps1`：安全红线静态检查。
+- **VMEXIT 验证链**：VMMCALL 心跳（10000 轮）、NPT translate/perm/range/split 单测、NPF 注入恢复。
+- **实机回归**：物理机加载 → 双核心跳 → 保护测试 → 卸载（不重启）。
+- **痕迹自查**：`tools\yghv_stealth_check.ps1`（只读，输出 `[VISIBLE]`/`[CLEAN]` 清单）。
+- **调试通道**：`start_kd.ps1` / `run_kd.bat`（VM 串口命名管道连 KD）。
+
+---
+
+## 文档索引
+
+| 文档 | 内容 |
+|---|---|
+| `docs/YUANMOD_HANDOFF_CURRENT.md` | 全程交接与决策记录（最高优先级） |
+| `docs/TASKS.md` | 任务清单与 P0 复核结论 |
+| `docs/YGHV_OS_AS_GUEST_RESEARCH_20260814.md` | OS-as-guest 研究 |
+| `docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md` | OS-as-guest 阶段性总结 |
+| `docs/YGHV_STEALTH_AUDIT_20260813.md` | 隐藏矩阵与反侦查审计 |
+| `docs/YGHV_FULL_REVIEW_20260814.md` | 全面代码审查报告（YGHV-REV-001..043） |
+| `docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md` | hook lock 与 0x5AA 重设计 |
+
+---
+
+## 已知限制与路线图
+
+1. **OS-as-guest 已停线**：让真实 Windows 整机跑进 guest 的路线在 Ryzen 5 5500 上遇到平台级硬冻结（AMD errata 1363 guest 中断死锁/1235 AVIC），B 路线（APIC 虚拟化）也无法绕过；唯一 PASS 形态是 step20 自旋 + INTR/NMI 拦截 + 宿主 ISR。因此“整机隐形”形态当前不可用，真实进程的 NPT/vmmcall 拦截有待该里程碑。
+2. **隐形是尽力而为**：内核驱动在真实 Windows 中加载，绝对隐形不现实；`loader_stealth` 默认关闭且未经 kd `!driver` 复核；不承诺绕过任何具体反作弊产品（ACE 仅尽力优化，不作验收标准）。
+3. **NPT 安全地基部分未验证**：ASID 多管理、向 guest 注入 #PF 等因 VMware 嵌套限制未完整验证。
+4. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
+5. **路线图**：R1 私有内存剔除 → `loader_stealth` 并入默认（先 kd 复核）→ MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
+
+---
+
+## 合规与法律声明
+
+- 本项目为安全研究与学习用途，仅限在**你拥有或获授权**的机器上使用。
+- 驱动加载需管理员权限与测试签名；内核级虚拟化若配置不当可能导致系统崩溃或数据丢失，风险自负。
+- 与反作弊系统对抗可能违反游戏/平台服务条款。使用者须自行确认用途合规，作者不对滥用造成的封号、法律后果等负责。
+- 本仓库当前**未附带开源许可证**（保留所有权利）；如需使用，请先联系作者获得授权。
