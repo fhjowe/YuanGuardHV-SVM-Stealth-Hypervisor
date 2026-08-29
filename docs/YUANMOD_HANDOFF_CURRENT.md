@@ -4123,3 +4123,142 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **下一步待定**：是否提交本轮改动（7 文件）；是否恢复 VM numvcpus=4。
 - **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 运行中（单核）。
 - 提交：本记录。
+
+### 9.220 2026-08-15 诊断实锤：变体 E"有画面无响应"= 跨核死锁（heartbeat 停）
+
+- **提交**：本轮 7 文件改动提交为 `f8f74fd`（工作区干净）。
+- **诊断**（变体 E 重新加载，VM 恢复 4 核后）：
+  - 加载后卡住（有画面无响应）；host 侧监控 vmware.log heartbeat：
+    基线 `heartbeat 147 (36s ago)`，60s 后**仍 147**（无递增），log 最后写入停在
+    20:06:08（无新日志），vmx CPU 查询为空；
+  - **结论**：heartbeat 停 = guest 态 Windows **未真正存活**；"有画面"是冻结的
+    最后一帧，vmx CPU 增长是 VMRUN 循环卡死空转。**变体 E 的"持续运行"表象实为
+    跨核 IPI 死锁**（9.216 core0 也死的延伸）。
+- **方向 3（深入"无响应"）判死**：无响应即死锁本身，不是独立的中断服务问题。
+- **下一步**：方向 1（伪装单核）——全核进 guest + CPUID 伪装逻辑处理器数为 1，
+  让 guest 态 Windows 调度器不做跨核调度（避免跨核死锁）；同时多核冗余避免单核
+  triple fault。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 运行中（4 核，变体 E
+  卡死，需 hard stop）。
+- 提交：本记录。
+
+### 9.221 2026-08-15 单核变体 H 复测：卡住（非重启）——无宿主核可用是预期，根因=guest 态中断/时钟服务
+
+- **复测**：VM 恢复单核（numvcpus=1）全新启动，kd 确认 `MP (1 procs)`（UP Windows）。
+  加载变体 H 后**卡住**（非上次的立即重启）。progress log：`bm step=0x11 → os
+  resident start → ctlD apic passthrough mapped → tss isolated → ctlE: host cr3
+  passthrough → os resident enter=0（core0 进 guest）→ bm os resident running →
+  bm done`，无 alive。
+- **关键判断**：**单核下无 alive 是预期**——core0（唯一核）进 guest 后，alive/
+  watchdog 线程 pin core0 但 core0 在 guest，宿主态无核可用。**不能据此判死锁**。
+- **重要收窄**：单核无跨核 IPI（UP Windows），但 guest 态**仍卡住** → **根因不是
+  跨核，而是"guest 态执行真实 Windows 时的中断/时钟服务"本身**（与裸机 9.197
+  "guest 态中断处理是墙"方向一致）。跨核只是多核下的放大器。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启（单核）。
+- 提交：本记录。
+
+### 9.222 2026-08-15 变体 I（单核+无 INTR 拦截）立即重启：单核问题=guest 态异常未捕获→triple fault
+
+- **变体 I 构建**：`YGHV_BAREMETAL_STEP=17` + `YGHV_APIC_PASSTHROUGH=1` +
+  `YGHV_NO_CR3_INTERCEPT=1` + `YGHV_SINGLECORE=1`（不设 HOST_ISR——guest 自己处理
+  时钟中断，最小干预极致）。SHA256
+  `5af5d5b0f39ff29b2a5904b1990fb2f608b7b48c0fd9ce2a7b183048a82faea0`，归档
+  `D:\aaaaaavm\yuanguard_hv_step17_singlecore_noin_tr_20260815.sys`。
+- **变体 I 实机（VM）**：`sc start` 后 **VM 立即软重启**（同变体 H）。单核形态无论
+  是否拦截 INTR（H 有 HOST_ISR / I 无）均立即重启。
+- **结论**：单核下 guest 态 UP Windows 立即重启 = **guest 态执行真实 Windows 时触发
+  的异常未被捕获 → triple fault → VM 复位**（vmware.log 无诊断，无 dump）。
+- **修复方向**：用现有 v101/v102 门控（`g_v101_gp_intercept`/`g_v102_catchall`——
+  拦截 guest 异常向量 + HLT，把 guest 态异常变成 VMEXIT 捕获而非 triple fault），
+  在单核形态下拦截异常，把"立即重启"变成"可诊断的 VMEXIT"，定位 guest 态崩在哪个
+  异常/指令。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启（单核）。
+- 提交：本记录。
+
+### 9.223 2026-08-15 变体 J（catchall）仍立即重启：VMware 嵌套下 L1 异常拦截不生效（根本障碍实锤）
+
+- **变体 J 构建**：`YGHV_BAREMETAL_STEP=17` + `YGHV_APIC_PASSTHROUGH=1` +
+  `YGHV_NO_CR3_INTERCEPT=1` + `YGHV_SINGLECORE=1` + `YGHV_CATCHALL=1`（main.c
+  step17 线程加 `#ifdef YGHV_CATCHALL`：exception_intercepts=0xFFFFFFFF + HLT 拦截
+  并 `yghv_trace("ctlJ: catchall intercepts armed")`；step17 编排 `g_v102_catchall
+  =TRUE`；build.bat 加传递）。SHA256
+  `f7ebc1607c325c21381e5d84dccb124d02144b921eee8b1d8f8fff2f0a218b90`，归档
+  `D:\aaaaaavm\yuanguard_hv_step17_catchall_20260815.sys`。
+- **变体 J 实机（VM）**：仍**立即软重启**。progress log：`bm step=0x11 → os resident
+  start → ctlJ: catchall intercepts armed → ctlD apic passthrough mapped → tss
+  isolated → ctlE: host cr3 passthrough → os resident enter=0`——**无 `r1 catchall`
+  记录，且 `bm os resident running` 都未出现**（DriverEntry 主线程等 event 未等到，
+  VM 在进 guest 后立即被 VMware L0 复位）。
+- **根本原因（决定性）**：**VMware 嵌套下 L1 的 exception_intercepts 不生效**——
+  VMware L0 不把 guest 异常路由给 L1 拦截，guest 态真实 Windows 的 triple fault 由
+  VMware L0 直接处理并复位 VM，**L1 的 catchall 永远无法捕获**。与此前一致
+  （"VMware 嵌套：MSRPM/IOPM 拦截不生效、不能剔除 NPT 私有页、不能写 CR0"）。
+- **最终判断**：VMware 嵌套下 **L1 对 guest 的异常/中断拦截不完整**——这是做
+  OS-as-guest 阻塞常驻的**根本平台障碍**（非代码可修）。有界/自旋 PASS 因合成 guest
+  不触发；真实 Windows 一进 guest 即跑偏 → VMware L0 复位。VM 路线**正式收尾**。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启（单核）。
+- 提交：本记录。
+
+### 9.224 2026-08-15 变体 K（4 向量异常拦截）仍立即重启：设置 L1 exception_intercepts 本身破坏 VMRUN
+
+- **变体 K 构建**：`YGHV_BAREMETAL_STEP=17` + `YGHV_APIC_PASSTHROUGH=1` +
+  `YGHV_NO_CR3_INTERCEPT=1` + `YGHV_SINGLECORE=1` + `YGHV_V101_4VEC=1`（main.c
+  step17 线程：`exception_intercepts = (1<<8)|(1<<11)|(1<<12)|(1<<13)` = #DF/#NP/#SS/
+  #GP，不拦 HLT；编排 `g_v102_catchall=TRUE`；build.bat 加 `YGHV_V101_4VEC` 传递）。
+  SHA256 `0615ba3fee85708fd88548e54e28b35fc956196e7e39bef5668f51f7e4c171a4`，归档
+  `D:\aaaaaavm\yuanguard_hv_step17_4vec_20260815.sys`。
+- **变体 K 实机（VM）**：仍**立即软重启**。progress log：`bm step=0x11 → os resident
+  start → ctlK: 4-vec intercepts armed → ctlD apic passthrough mapped → tss isolated
+  → ctlE: host cr3 passthrough → os resident enter=0`——**无 `r1 catchall` 记录，且
+  `bm os resident running` 未出现**。
+- **决定性对比**：变体 H/I（**无**异常拦截）走到 `bm os resident running` + `bm done`
+  （DriverEntry 返回）；变体 J/K（**有**异常拦截）连 `bm os resident running` 都未到
+  → **设置 exception_intercepts 后 VMRUN 行为异常，VM 崩得比不设置更早**。
+- **结论升级**：VMware L0 对 L1 的 exception_intercepts（哪怕仅 4 向量）存在实现缺陷
+  ——不是"拦截不转发"而是"**设置拦截本身破坏嵌套 VMRUN**"。VMware 嵌套下真实 Windows
+  OS-as-guest 阻塞常驻**平台级不可行**（非代码可修），VM 路线正式收尾。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启（单核）。
+- 提交：本记录。
+
+### 9.225 2026-08-15 变体 E（多核有画面）复测：全死锁（非跨核死锁）——alive 零输出
+
+- **复测**：VM 回 4 核（numvcpus=4），加载变体 E
+  `D:\aaaaaavm\yuanguard_hv_step17_apicpassthrough_20260815.sys`（step17 + APIC
+  passthrough + host CR3 passthrough，多核 core1 进 guest，core0 宿主态 alive/
+  watchdog）。执行后**几秒即无响应**（有画面冻结，符合 9.218-9.220）。
+- **决定性数据**：progress log 走到 `bm step=0x11 → os resident start → ctlD apic
+  passthrough mapped → tss isolated → os guest cr3 intercept enabled → cloned cr3 →
+  os resident enter=1（core1 进 guest）→ bm os resident running → bm done`，但
+  **`resident alive`（alive 线程 pin core0，每 5 秒一条）零输出**。
+- **结论修正（推翻 9.220 的"跨核死锁"诊断）**：alive 线程创建成功（main.c line
+  2799）但从未打印 → **core0 宿主态在 `bm done` 后立即停摆 = 全死锁**（所有核的
+  Windows 调度器都停），不是"宿主态活 + guest 态死"的跨核死锁模型。"有画面"是冻结帧。
+- **机制推测**：core1 进 guest 态后跑 Windows SMP 内核（调度器/自旋锁/时钟），
+  guest 态与宿主态共享宿主 CR3/内存，Windows 全局调度器锁（KiSchedulerLock 等）被
+  guest 态 core1 持有/破坏 → core0 宿主态调度器无法推进 → 全死锁。
+- **状态**：C 盘稳定版 `70888311`，服务 STOPPED，机器安全；VM 已重启（4 核）。
+- 提交：本记录。
+
+### 9.226 2026-08-15 裸机变体 M（APIC 影子 + host CR3 passthrough + host ISR）冻结重启：共享宿主 CR3 冻结根因钉死
+
+- **裸机等价物**（用户坚持裸机实验，已确认风险）：step17 + **APIC 影子**（B-1full，
+  非 passthrough——裸机无 VMware 虚拟 APIC，guest 碰物理 APIC=B-0 硬冻结）+ host CR3
+  passthrough + host ISR，多核 core1 进 guest。代码：step17 线程加 `yghv_v98_apic_shadow_apply`
+  （YGHV_APIC_SHADOW 门控 + 前置声明），step17 编排 `g_v98_apic_shadow=TRUE`，build.bat
+  加 `YGHV_APIC_SHADOW` 传递。SHA256
+  `8763cb818eec1c635b7de6bf1a3235eccfdce4153354caff5408362dd0b82f22`，归档
+  `D:\aaaaaavm\yuanguard_hv_step17_bm_shadow_20260815.sys`。
+- **裸机实机**：用户确认现在测试（接受物理重启风险）。`sc start` 返回 RUNNING
+  （DriverEntry 进入），progress log 走到 `bm step=0x11 → os resident start → ctlM:
+  apic shadow enabled → v98 apic shadow armed=0xc7c50000 → tss isolated → ctlE: host
+  cr3 passthrough → os resident enter=1 → bm os resident running → bm done`，之后
+  **无响应 → 冻结 → 用户物理重启**。
+- **决定性结论**：**APIC 影子成功武装 + core1 进 guest + DriverEntry 返回后仍冻结**。
+  与 VM 变体 E（passthrough + alive 零输出全死锁）结果一致 → **共享宿主 CR3（guest
+  态跑真实 Windows 内核）= 冻结根因**，与 APIC 处理（passthrough/影子）和 host ISR
+  无关。9.152 结论在"APIC 影子 + host ISR + host CR3 passthrough"新组合下再次验证。
+  结合 9.179（独立 CR3 不可行）→ **OS-as-guest 在本机（裸机 + VMware）平台级不可行，
+  非代码可修**。
+- **状态**：C 盘稳定版 `70888311` 未被覆盖（变体 M 在 C:\yuanguard_hv_bm_m.sys），
+  服务已 STOPPED，机器已恢复安全；VM 运行中（4 核）。
+- 提交：本记录。

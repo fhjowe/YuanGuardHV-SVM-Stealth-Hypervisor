@@ -1251,6 +1251,12 @@ static VOID yghv_os_guest_seamless_thread(PVOID ctx) {
     }
 }
 
+/* 9.226 裸机等价物: step17 线程在 YGHV_APIC_SHADOW=1 时使用 APIC 影子（B-1full，
+   guest 写 APIC 触发 NPF 由 host 转发），而非 passthrough——裸机无 VMware 虚拟
+   APIC，guest 直接碰物理 APIC = B-0 硬冻结（errata 1363）。前置声明供
+   yghv_os_guest_resident_thread 调用。 */
+static void yghv_v98_apic_shadow_apply(svm_vcpu_t *v);
+
 static VOID yghv_os_guest_resident_thread(PVOID ctx) {
     uint32_t core = (uint32_t)(uintptr_t)ctx;
     svm_vcpu_t *v;
@@ -1283,6 +1289,22 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
             INTR_GEN2(SVM_INTERCEPT_MWAIT_COND);
     }
     v->vmcb->control.exception_intercepts = 0;
+    /* 9.222 变体 J: YGHV_CATCHALL=1 时拦截 guest 全异常 + HLT——把单核下
+       guest 态真实 Windows 的 triple fault 变成可诊断 VMEXIT（定位崩在哪个
+       异常/指令），而非 VM 立即复位。 */
+#ifdef YGHV_CATCHALL
+    v->vmcb->control.exception_intercepts = 0xFFFFFFFFULL;
+    v->vmcb->control.general1_intercepts |=
+        INTR_GEN1(SVM_INTERCEPT_HLT);
+    yghv_trace("ctlJ: catchall intercepts armed");
+#elif defined(YGHV_V101_4VEC)
+    /* 9.224 变体 K: 只拦截 4 向量（#DF=8/#NP=11/#SS=12/#GP=13），不拦 HLT——
+       VMware 可能对 L1 的 0xFFFFFFFF 拦截组合 VMRUN 不兼容（变体 J 崩得比
+       H/I 更早），用最小向量集判别 VMware 是否转发 L1 异常拦截。 */
+    v->vmcb->control.exception_intercepts =
+        (1ULL << 8) | (1ULL << 11) | (1ULL << 12) | (1ULL << 13);
+    yghv_trace("ctlK: 4-vec intercepts armed (DF/NP/SS/GP)");
+#endif
     v->vmcb->control.tlb_control = 0;
     v->vmcb->control.vmcb_clean_bits = 0;
     v->resident_index = core;
@@ -1296,6 +1318,11 @@ static VOID yghv_os_guest_resident_thread(PVOID ctx) {
                                0xFEE00000ULL + HV_PAGE_SIZE) != STATUS_SUCCESS)
         LOG_ERROR("ctlD: identity-map APIC 2MB failed");
     yghv_trace("ctlD apic passthrough mapped");
+#endif
+#ifdef YGHV_APIC_SHADOW
+    /* 9.226 裸机等价物: APIC 影子（B-1full）——guest 写 APIC 触发 NPF 由 host
+       EOI/ICR/timer 转发，避免 guest 直接碰物理 APIC（裸机 B-0 硬冻结）。 */
+    yghv_v98_apic_shadow_apply(v);
 #endif
     yghv_os_guest_tlb_hygiene_apply(v, core);
     yghv_os_guest_tss_isolate_apply(v);
@@ -2762,6 +2789,15 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         g_os_guest_intr_intercept = TRUE;
         g_os_guest_host_isr = TRUE;
         g_os_guest_inject_intr = FALSE;
+#endif
+#if defined(YGHV_CATCHALL) || defined(YGHV_V101_4VEC)
+        /* 9.222 变体 J / 9.224 变体 K: 拦截 guest 异常，把 triple fault 变可诊断 VMEXIT */
+        g_v102_catchall = TRUE;
+#endif
+#ifdef YGHV_APIC_SHADOW
+        /* 9.226 裸机等价物: step17 用 APIC 影子（B-1full），非 passthrough */
+        g_v98_apic_shadow = TRUE;
+        yghv_trace("ctlM: apic shadow enabled for step17");
 #endif
         st17 = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, NULL, NULL,
                                     NULL, yghv_os_guest_resident_thread,
