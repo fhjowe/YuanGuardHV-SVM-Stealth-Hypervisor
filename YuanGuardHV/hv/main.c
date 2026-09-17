@@ -273,6 +273,18 @@ static volatile LONG g_v99_allcore_ready = 0;
 static volatile LONG g_v99_allcore_go = 0;
 static volatile LONG g_v99_allcore_abort = 0;
 static volatile LONG g_v99_allcore_online = 0;
+
+/* 9.227 step203: SimpleSvm-equivalent all-core OS-as-guest config (see
+ * docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md and yghv_os_guest_simplevm_thread).
+ * Gate: YGHV_BAREMETAL_STEP=203.  Thread handles live in g_s203_threads so
+ * DriverUnload can join every core's trampoline thread before teardown. */
+static HANDLE g_s203_threads[SVM_MAX_CORES];
+static volatile LONG g_s203_online = 0;
+static volatile LONG g_s203_ready = 0;
+static volatile LONG g_s203_go = 0;
+static volatile LONG g_s203_abort = 0;
+/* ~10ms CPUID-poll throttle at 3GHz TSC (wrap-safe unsigned subtraction). */
+#define YGHV_S203_POLL_TSC 30000000ULL
 volatile BOOLEAN g_os_resident_log_active = FALSE;
 volatile ULONG64 g_os_resident_exits = 0;
 volatile BOOLEAN g_v100_monitor_active = FALSE;
@@ -314,6 +326,7 @@ extern const uint8_t yghv_avic_eoi_isr[];
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD DriverUnload;
+static void yghv_join_system_thread(HANDLE h);   /* defined near DriverUnload */
 
 static void yghv_trace_init(void) {
     UNICODE_STRING name;
@@ -1751,6 +1764,90 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     }
 }
 
+/* 9.227 step203 — SimpleSvm 等价构型（全减法实验，YGHV_BAREMETAL_STEP=203）。
+ *
+ * 背景：此前全部裸机常驻系（v95/99、step17、变体 E/F/M）都保留了
+ * "INTR/NMI 拦截 + 宿主 ISR"或其他高频退出（RDTSC/MSR_PROT/CR3 拦截+克隆）。
+ * 而在 AMD 硬件上被实机验证可用的 OS-as-guest 实现（上游 SimpleSvm 驱动态、
+ * HelloAmdHv UEFI 态）只拦 CPUID/VMRUN(/EFER 写)，中断经 virtual wire 由
+ * guest 原生服务，CR3/TSS/ASID 一概不动。该构型从未在本机裸机测试过，
+ * step203 补上这一格（C1；C0 对照 = 直接实机运行原版 SimpleSvm，
+ * 见 docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md）。
+ *
+ * 相对 step99 线程的纯减法清单：
+ * - 拦截集 = CPUID(general1) + VMRUN|VMMCALL(general2，VMMCALL 属 fail-safe，
+ *   guest 态 Windows 不会执行)；去掉 RDTSC/SHUTDOWN/MSR_PROT/INTR/NMI，
+ *   异常/CR/DR 全 0。MSR_PROT 位为 0 时 MSRPM 内容（VM_CR/GS_BASE 位）惰性，
+ *   所有 MSR 直通。
+ * - 不做 tlb hygiene / TSS 隔离 / CR3 拦截 / CR3 克隆 / APIC 影子。
+ * - svm_trampoline_os_enter(v,1) 保留 IF → 物理中断由 guest（真实 Windows）
+ *   的 IDT 直接服务，VMM 不介入（与 B/D 系"宿主 ISR 代服务"路线分道）。
+ * - guest 延续体只做 ~10ms 节流的 CPUID(1) 心跳轮询：空闲时每核每 10ms 一次
+ *   VMEXIT，处理路径（svm_dispatch_exit CPUID 分支）为纯内存 + __cpuidex，
+ *   无任何 NT API（SimpleSvm issue #1 的 VMEXIT 岛纪律）。停止契约沿用
+ *   9.162/9.163：DriverUnload 置 g_os_guest_stop_requested → 下一次轮询
+ *   退出返回 1 → 本核 host_done 反虚拟化并线程退出；per-core EFER.SVME/
+ *   VM_HSAVE 由 svm_core_cleanup 的 IPI（svm_core_ipi_cleanup）恢复。
+ * - 全核同时进入（v99 barrier 机制），排除"一核 guest + 一核 host"混态。
+ */
+static VOID yghv_os_guest_simplevm_thread(PVOID ctx) {
+    uint32_t core = (uint32_t)(uintptr_t)ctx;
+    svm_vcpu_t *v;
+    uint64_t t0;
+    uint32_t a, b, c, d;
+
+    KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
+    v = svm_core_get_vcpu(core);
+    if (!v || g_vcpu_count <= core) {
+        InterlockedExchange(&g_s203_abort, 1);
+        if (core < SVM_MAX_CORES)
+            KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+        PsTerminateSystemThread(STATUS_INVALID_PARAMETER);
+    }
+    svm_prepare_vcpu(v, (uint64_t)svm_os_seamless_cont);
+    v->vmcb->state.rip = (uint64_t)svm_os_seamless_cont;
+    v->vmcb->state.rsp = 0;
+    /* 纯减法拦截集（对比 step99 线程的 CPUID|RDTSC|SHUTDOWN|MSR_PROT 组合）。 */
+    v->vmcb->control.general1_intercepts = INTERCEPT_CPUID;
+    v->vmcb->control.general2_intercepts =
+        INTR_GEN2(SVM_INTERCEPT_VMRUN) | INTR_GEN2(SVM_INTERCEPT_VMMCALL);
+    v->vmcb->control.exception_intercepts = 0;
+    v->vmcb->control.cr_read_intercepts = 0;
+    v->vmcb->control.cr_write_intercepts = 0;
+    v->vmcb->control.dr_read_intercepts = 0;
+    v->vmcb->control.dr_write_intercepts = 0;
+    v->vmcb->control.tlb_control = 0;
+    v->vmcb->control.vmcb_clean_bits = 0;
+    v->resident_index = core;
+    svm_core_set_npt(core, g_npt.pml4_pa);
+    g_os_resident_mode = TRUE;
+
+    InterlockedIncrement(&g_s203_ready);
+    while (!g_s203_go && !g_s203_abort) {
+        __asm__ volatile("pause");
+    }
+    if (g_s203_abort) {
+        yghv_trace_u64("s203 abort", core);
+        if (core < SVM_MAX_CORES)
+            KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+        PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
+    }
+
+    yghv_trace_u64("s203 enter", core);
+    if (core < SVM_MAX_CORES)
+        KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+    svm_trampoline_os_enter(v, 1);   /* IF=1: guest services interrupts natively */
+
+    /* ---- from here on this code executes in GUEST mode on this core ---- */
+    for (;;) {
+        t0 = __rdtsc();
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(1) : "memory");
+        while ((__rdtsc() - t0) < YGHV_S203_POLL_TSC)
+            __asm__ volatile("pause");
+    }
+}
+
 static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
     uint32_t core = (uint32_t)(uintptr_t)ctx;
     svm_vcpu_t *v;
@@ -2068,7 +2165,9 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    if (step > 202)
+    /* 9.227: bound raised from 202 -> 203 to admit the SimpleSvm-equivalent
+     * all-core resident step. */
+    if (step > 203)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -4055,6 +4154,82 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         return STATUS_SUCCESS;
     }
 
+    if (step == 203) {
+        ULONG i;
+        ULONG j;
+        ULONG bm_cores = g_vcpu_count;
+        HANDLE alive = NULL;
+        HANDLE watchdog = NULL;
+        NTSTATUS st203 = STATUS_SUCCESS;
+
+        yghv_trace("bm os simplevm resident start");
+        KeInitializeEvent(&g_os_resident_stop_event, NotificationEvent, FALSE);
+        /* 203 减法要点：不拦 INTR/NMI、不跑宿主 ISR、不注入——guest 原生服务
+         * 中断（与 v99/step17 的分水岭，SimpleSvm/HelloAmdHv 同款语义）。 */
+        g_os_guest_intr_intercept = FALSE;
+        g_os_guest_host_isr = FALSE;
+        g_os_guest_inject_intr = FALSE;
+        g_os_guest_avic_irr_inject = FALSE;
+        g_os_resident_mode = TRUE;
+        g_os_resident_log_active = TRUE;
+        InterlockedExchange(&g_s203_ready, 0);
+        InterlockedExchange(&g_s203_go, 0);
+        InterlockedExchange(&g_s203_abort, 0);
+        InterlockedExchange(&g_s203_online, (LONG)bm_cores);
+        for (i = 0; i < SVM_MAX_CORES; i++)
+            g_s203_threads[i] = NULL;
+
+        for (i = 0; i < bm_cores; i++) {
+            KeInitializeEvent(&g_os_guest_done_events[i], NotificationEvent, FALSE);
+            st203 = PsCreateSystemThread(&g_s203_threads[i], THREAD_ALL_ACCESS,
+                                         NULL, NULL, NULL,
+                                         yghv_os_guest_simplevm_thread,
+                                         (PVOID)(uintptr_t)i);
+            if (!NT_SUCCESS(st203)) {
+                LOG_ERROR("bm step 203: thread core %u failed 0x%x", i, st203);
+                break;
+            }
+        }
+        if (!NT_SUCCESS(st203)) {
+            /* go 从未置位：已创建的线程都在 ready-spin 里，abort 后自行退出。
+             * 必须 join（9.163 教训：失败路径也不能把线程留在模块里）。 */
+            InterlockedExchange(&g_s203_abort, 1);
+            g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
+            for (j = 0; j < SVM_MAX_CORES; j++) {
+                if (g_s203_threads[j])
+                    yghv_join_system_thread(g_s203_threads[j]);
+                g_s203_threads[j] = NULL;
+            }
+            return st203;
+        }
+
+        /* alive/watchdog 都在 guest 态运行：alive 的周期输出 = "Windows 调度器
+         * 在 VMM 之下仍活着"的直接证据（9.225 教训）；watchdog 停摆 3s 主动
+         * 0xE2 留 dump。创建失败不致命，只降级为警告。 */
+        if (!NT_SUCCESS(PsCreateSystemThread(&alive, THREAD_ALL_ACCESS, NULL,
+                                             NULL, NULL,
+                                             yghv_resident_alive_thread, NULL)))
+            LOG_ERROR("bm step 203: alive thread create failed");
+        else
+            g_os_guest_alive_thread = alive;
+        if (!NT_SUCCESS(PsCreateSystemThread(&watchdog, THREAD_ALL_ACCESS, NULL,
+                                             NULL, NULL,
+                                             yghv_resident_watchdog_thread, NULL)))
+            LOG_ERROR("bm step 203: watchdog thread create failed");
+        else
+            g_os_guest_watchdog_thread = watchdog;
+
+        /* Release the barrier: every core enters guest mode together. */
+        InterlockedExchange(&g_s203_go, 1);
+        for (i = 0; i < bm_cores; i++) {
+            KeWaitForSingleObject(&g_os_guest_done_events[i], Executive,
+                                  KernelMode, FALSE, NULL);
+        }
+        yghv_trace("bm os simplevm resident running");
+        return STATUS_SUCCESS;
+    }
+
     if (step == 100) {
         HANDLE thread;
         HANDLE alive;
@@ -4527,6 +4702,18 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     yghv_join_system_thread(g_os_guest_resident_thread);
     yghv_join_system_thread(g_os_guest_alive_thread);
     yghv_join_system_thread(g_os_guest_watchdog_thread);
+    /* 9.227 step203: join the all-core simplevm threads.  Each core's guest
+     * continuation VMEXITs on its ~10ms CPUID poll once stop_requested is set
+     * (svm_dispatch_exit returns 1 -> host_done -> PsTerminateSystemThread),
+     * so these joins complete in bounded time on a live system. */
+    {
+        ULONG s203;
+        for (s203 = 0; s203 < g_s203_online && s203 < SVM_MAX_CORES; s203++) {
+            if (g_s203_threads[s203])
+                yghv_join_system_thread(g_s203_threads[s203]);
+            g_s203_threads[s203] = NULL;
+        }
+    }
     g_os_guest_resident_thread = NULL;
     g_os_guest_alive_thread = NULL;
     g_os_guest_watchdog_thread = NULL;

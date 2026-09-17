@@ -4262,3 +4262,50 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：C 盘稳定版 `70888311` 未被覆盖（变体 M 在 C:\yuanguard_hv_bm_m.sys），
   服务已 STOPPED，机器已恢复安全；VM 运行中（4 核）。
 - 提交：本记录。
+
+### 9.227 2026-09-18 参考构型复审（SimpleSvm/HelloAmdHv）：平台判定降级为"未证实"；C0 上游构建完成 + C1 step203 入库（待实机）
+
+- 触发：用户指定 SimpleSvm/DdiMon/HelloAmdHvPkg/SimpleVisor + AMD APM 复审冻结线；
+  全部源码/issue 证据提取与构型对照见 `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md`。要点：
+  1. **SimpleSvm（驱动态 OS-as-guest）与 HelloAmdHv（UEFI 型）的参考构型 =
+     "只拦 CPUID/VMRUN（±EFER 写/#SX）、全核无缝进入、不拦 INTR（guest 原生服务
+     中断）、ASID=1、tlb_ctl=0、NPT identity 全 RW"**——恰为本仓库判定"必然冻结"的
+     同类构型；而本仓库全部裸机常驻系（v95/99、step17、变体 E/F/M）都保留了
+     INTR|NMI 拦截 + 宿主 ISR（在 GIF=0 的 VMEXIT 窗口里跑 Windows ISR/DPC 派发）
+     + RDTSC/MSR_PROT(VM_CR、KERNEL_GS_BASE)/CR3 拦截等高频退出，常驻循环内还有
+     ZwYieldExecution/KeSetEvent/文件 trace——正是 SimpleSvm issue #1 中作者点名的
+     反模式（IPI 不会送达正在处理 VMEXIT 的核 → 全局死锁），与 9.225
+     "全死锁、alive 零输出"观测精确同构。
+  2. **errata 1363 归因不牢**：本机实测 CPUID = Family 19h Model 50h（Zen3
+     Cezanne），1363/1235 为 Family 17h revision guide 编号系（9.173 web 检索所
+     得，本会话网络受限未取到原文复核覆盖面）；KVM svm.c 无 1363 处理；同硅片
+     家族上 Hyper-V/KVM 常态化跑 OS-as-guest；且 9.189 BIOS/AGESA 更新使硬冻结
+     变为可转储 0x101——行为依赖固件，非纯硅片。**"平台级不可修"降级为"未证实"，
+     交 C0 实机裁决。**
+- 产物（本轮）：
+  - **C0**：`thirdparty/SimpleSvm`（codeload tarball，gitignore 不入库）+ 两处可
+    加载性补丁（`ExAllocatePool2`→`ExAllocatePoolWithTag`+清零，不触碰任何虚拟化
+    语义；上游面向 Win11，本机 19045 无该导出）+ `YuanGuardHV/tools/build_simplesvm.bat`
+    （WDK 10.0.26100.0 头/库 + MSVC 14.44 + 测试证书签名，绕开 WDK-MSBuild 集成）。
+    构建成功；dumpbin 导入表全为 Win10 可用导出；SHA256
+    `2ce8c17c71f658689ca7d5d6b544b612dd0b7ffffbf043af7f728cce6d863a09`
+    （`thirdparty\SimpleSvm\bin\SimpleSvm.sys`）。
+  - **C1**：`main.c` 新增 `step203`（SimpleSvm 等价）：`yghv_os_guest_simplevm_thread`
+    （纯减法拦截集 = CPUID + VMRUN|VMMCALL；IF=1 原生中断；~10ms TSC 节流 CPUID
+    轮询；停止/卸载沿用 9.162/9.163 契约，并补齐 step203 线程的 DriverUnload
+    逐核 join）、`step == 203` 编排（alive/watchdog 挂入既有 join 全局）、
+    `yghv_join_system_thread` 前向声明。
+    **构建陷阱实录**：`yghv_baremetal_step_test` 顶部有 `if (step > 202) return
+    STATUS_NOT_IMPLEMENTED` 上界守卫，/O2 会折叠整个 step 函数——首次 203 门控构建
+    曾静默产出默认二进制。守卫修正为 `> 203`；验证方法固化为字符串级断言：trace 串
+    `bm os simplevm resident start`/`s203 enter` 只应存在于 203 构建（实测存在），
+    默认构建中不存在（实测 0 命中，默认构建同时静态检查全 PASS）。
+    203 构建 SHA256 `83b0c85b2ea5696e201625dddb12c8f6d37a1d823fdde38e4b672ae2066267a9`，
+    归档 `D:\aaaaaavm\yuanguard_hv_step203_20260918.sys`。
+- **待办（实机，顺序 C0 → C1）**：runbook 与分支决策树见
+  `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md` §4/§5；需重启预案，确认 Hyper-V/VBS
+  未占用 SVM。C0 原版稳定 ≥10min 即作废"平台级"判定；203 若仍冻结而 C0 稳 →
+  按 §5 决策树逐项隔离残余差异（clean-bits 强制 0、per-resume VM_HSAVE 重写、
+  v100 ring 写入等）。
+- **状态**：未上机；C 盘稳定版 `70888311` 未动，服务 STOPPED，机器安全。
+- 提交：本记录。

@@ -260,6 +260,7 @@ run.bat state      # 用法与 PowerShell 客户端一致
 | `docs/TASKS.md` | 任务清单与 P0 复核结论 |
 | `docs/YGHV_OS_AS_GUEST_RESEARCH_20260814.md` | OS-as-guest 研究 |
 | `docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md` | OS-as-guest 阶段性总结 |
+| `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md` | SimpleSvm/HelloAmdHv 构型复审 + C0/C1 实机验证方案 |
 | `docs/YGHV_STEALTH_AUDIT_20260813.md` | 隐藏矩阵与反侦查审计 |
 | `docs/YGHV_FULL_REVIEW_20260814.md` | 全面代码审查报告（YGHV-REV-001..043） |
 | `docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md` | hook lock 与 0x5AA 重设计 |
@@ -269,6 +270,7 @@ run.bat state      # 用法与 PowerShell 客户端一致
 ## 已知限制与路线图
 
 1. **OS-as-guest 已停线**：让真实 Windows 整机跑进 guest 的路线在 Ryzen 5 5500 上遇到平台级硬冻结（AMD errata 1363 guest 中断死锁/1235 AVIC），B 路线（APIC 虚拟化）也无法绕过；唯一 PASS 形态是 step20 自旋 + INTR/NMI 拦截 + 宿主 ISR。因此“整机隐形”形态当前不可用，真实进程的 NPT/vmmcall 拦截有待该里程碑。
+   **2026-09-18 复审降级**：此前全部裸机常驻实验都保留了 INTR/NMI 拦截 + 宿主 ISR 等高频异步退出，偏离上游 AMD OS-as-guest 参考构型（SimpleSvm/HelloAmdHv：不拦中断、只拦 CPUID/VMRUN、全核无缝进入）；且本机实测 CPUID = Family 19h Model 50h（Zen3 Cezanne），1363/1235 属 Family 17h 编号系——"平台级"归因**未证实**。裁决方案 = C0 原版 SimpleSvm 实机对照（构建已完成）+ C1 `step203`（SimpleSvm 等价门控，代码已入库），见 `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md`。
 2. **隐形是尽力而为**：内核驱动在真实 Windows 中加载，绝对隐形不现实；`loader_stealth` 默认关闭且未经 kd `!driver` 复核；不承诺绕过任何具体反作弊产品（ACE 仅尽力优化，不作验收标准）。
 3. **NPT 安全地基部分未验证**：ASID 多管理、向 guest 注入 #PF 等因 VMware 嵌套限制未完整验证。
 4. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
