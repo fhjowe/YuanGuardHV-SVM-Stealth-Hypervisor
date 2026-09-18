@@ -4479,3 +4479,39 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   C:\ 测试镜像已清；C 盘稳定版 `70888311` 未动；证据 dump/progress 归档 `D:\aaaaaavm\`；
   step204 代码已提交（f312ffe）。
 - 提交：本记录。
+
+### 9.232 2026-09-18 step205 = 忠实移植 SimpleSvm 进出模型（选项 A，离线完成，待一次实机）
+
+- 承 9.231 用户选 A1：不在 203 骨架上继续改，而是把 SimpleSvm 已在本机验证 600s+ 的
+  进出机制原样移植进 YGHV，作为全新门控 step205。逐行读 SimpleSvm
+  `SvVirtualizeProcessor`/`SvPrepareForVirtualization`/`SvLaunchVm`(asm)/`SvHandleVmExit`
+  与 YGHV trampoline diff 后确立 §7 规格（docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md）。
+- 产物：
+  - `hv/svm_simplevm_port.S`：忠实移植 `SvLaunchVm`——`mov rsp,&GuestVmcbPa`；环内
+    `VMLOAD guest; clgi; VMRUN`；VMEXIT 后 `VMSAVE guest` → 减 KTRAP_FRAME → PUSHAQ(16) →
+    取 `[rsp+0x220]=self` 与 GuestRegisters → 存 XMM0-5 → `call yghv_sv_handle_vmexit` →
+    还原 → POPAQ → 非零则 SvLV20（`mov rsp,rcx; mov ecx,'SVMP'; jmp rbx` 交还 bare-metal）。
+  - `hv/svm_simplevm_port.c`：`#if YGHV_BAREMETAL_STEP==205` 门控，否则空 TU+
+    `yghv_sv_handle_vmexit` 桩（保证默认构建里被无条件编译的 asm obj 可链接）。
+    自带 clang-cl 可用的 `p_read_msr/p_write_msr/p_cr*/p_tr/p_vmload/p_vmsave/p_stgi/
+    p_writeeflags/p_capture`（避开 intrin.h/__readcr/RtlCaptureContext）。VpData 布局配
+    `_Static_assert` 锁定 `Self==HostRsp+0x10` 与 VMCB 4KB 对齐。`p_virtualize_one`：先
+    `p_capture`（guest rip 落其后 installed-check），CPUID(0x4FFFFFFC)==SVP_MAGIC 判定
+    2nd-pass 已虚拟化即返回，否则开 SVME、建 VpData、`VM_HSAVE_PA`、`p_prepare`
+    （`vmsave` 抓 guest 段）、`vmsave host_vmcb`、`yghv_sv_launch`（成为该核 host 环）。
+    `p_run_on_each` 用 `KeSetSystemGroupAffinityThread` 逐核进入。NPT 复用 `g_npt`。VMEXIT 岛
+    只处理 CPUID(installed/卸载后门/否则 `__cpuidex` 透传)/VMRUN(注 #GP)，零 NT 调用零 I/O。
+  - `main.c`：上界改 `>205`；新增 `step==205`（`yghv_sv205_start(g_vcpu_count)` 后正常返回）。
+    `build.bat` 编译 `.c`+`.S`（→ `svm_simplevm_port_asm.obj`），**修了 .c/.S 同名 obj 覆盖坑**。
+- 构建验证（离线，全绿）：默认构建成功且不含 `bm step 205`（0）；STEP=205 成功且含该 trace；
+  step203-q 回归构建成功。205 镜像 `945f40e5...` 归档 `D:\aaaaaavm\yuanguard_hv_step205_20260918.sys`。
+- 实机脚本 `D:\aaaaaavm\run_c6_step205.ps1`：SVM 空闲时启动不耗重启；仅 ~200s 轻压测首测
+  （每崩一次耗一次重启故首测刻意短）；205 无干净卸载（后门未接 sc stop），测完重启清除。
+- 判读预案：
+  1. 稳定 ≥200s → faithful 移植成功，203 系失败确证为旧 trampoline 模型问题；下一步在 205
+     VMEXIT 岛叠加 NPF 页保护 / VMMCALL 认证 / NPT 自剔除，挂产品语义。
+  2. 仍崩 → port 与 SimpleSvm 仍有具体不一致（重点核 `p_capture` 的 rip 落点、VMLOAD/VMSAVE
+     时机、host 栈 RSP 起点、DriverEntry 返回时是否所有核已进入）；用 dump + 逐条 diff x64.asm 收敛。
+- 状态：代码+文档已提交；机器未加载 205（离线验证，本会话无新重启消耗）；稳定版
+  `70888311` 未动；测试服务均不在。等用户择机跑 run_c6。
+- 提交：本记录。
