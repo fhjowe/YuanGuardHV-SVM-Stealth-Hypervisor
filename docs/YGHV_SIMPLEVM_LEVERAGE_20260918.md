@@ -110,6 +110,20 @@ KERNEL_GS_BASE → 每次切换一次退出)、`ZwYieldExecution()`/KeSetEvent/�
 - 裁决逻辑：原版稳定 ≥10min → **"平台级限制"判定作废**，后续移植按 C1/§5；
   原版也冻结 → 归因升级为"SimpleSvm 构型在本硅片同样死"，回到固件/errata 线
   （比对上游成功机型清单 + 19h Revision Guide 原文 + 微码版本）。
+- **实测结果（2026-09-18，已执行）：PASS。** `sc start SimpleSvm` → RUNNING
+  （12 核无缝进 guest）；`yghv_stress 600s x6`（CPUID 风暴+调度 churn）全程心跳
+  无中断，期间系统级命令响应正常。历史判定"guest 执行真实 Windows 代码 <15-60s
+  必冻"在本构型下不成立 → 冻结为**构型问题**（INTR 拦截 + GIF=0 宿主服务窗口 +
+  高频退出/NT API 混入），非硅片问题。
+- **卸载 quirk（实测记录）**：SimpleSvm 的 `sc stop` 返回 1052
+  （NOT_STOPPABLE），`NtUnloadDriver` 返回 0xC0000010（尽管反汇编确认
+  DriverObject->DriverUnload(+0x68) 有效赋值）→ **只能重启清除**。服务注册已
+  `sc delete`，重启后不复加载；镜像暂存 `D:\aaaaaavm\SimpleSvm.sys.keep`。
+  另：git-bash 下 `sc create/config` 的 `binPath=` 会被路径转换破坏，需
+  `MSYS_NO_PATHCONV=1` + 双反斜杠。
+- 完整逐条记录见 handoff **9.228**；C1 的实机脚本：
+  `D:\aaaaaavm\run_c1_step203.ps1`（重启后一键：清理→部署 203→观测+压测→
+  sc stop 验干净卸载→结果写 `D:\aaaaaavm\c1_results.log`）。
 
 ## 5. C1：本仓库 step203「SimpleSvm 等价」门控（代码已入库）
 

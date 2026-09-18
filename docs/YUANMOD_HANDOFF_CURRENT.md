@@ -4309,3 +4309,43 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   v100 ring 写入等）。
 - **状态**：未上机；C 盘稳定版 `70888311` 未动，服务 STOPPED，机器安全。
 - 提交：本记录。
+
+### 9.228 2026-09-18 C0 实机完成：原版 SimpleSvm 在本机稳定 ≥10min（压测全程存活）——「平台级不可行」判定被证伪；卸载 quirk 记录
+
+- **预检**：管理员 ✓；testsigning=Yes（bcdedit 确认）✓；Hyper-V 未运行
+  （HypervisorPresent=False）✓；VMware 进程未运行（SVM 空闲）✓；
+  CrashDumpEnabled=0x7（automatic，页面文件 13824MB）✓；AutoReboot 原为 0，
+  **本次已置 1**（BSOD 后自动重启收集 dump）。
+- **负载工具**：`D:\aaaaaavm\yghv_stress.c/exe`（本次新增，gitignore 外）：
+  N 线程 CPUID(1)/CPUID(0)/CPUID(0x80000001)+RDTSC 风暴 + SwitchToThread +
+  线程创建/销毁 churn + 堆分配，5s 心跳打印。C0/C1 共用同一负载。
+- **C0 部署**：`copy thirdparty\SimpleSvm\bin\SimpleSvm.sys C:\SimpleSvm.sys`
+  （hash `2ce8c17c...` 核对一致）；`sc create SimpleSvm type= kernel start= demand`。
+  坑：git-bash 会把 `binPath=` 参数路径转换坏（首次落到 system32，启动报 2），
+  需 `MSYS_NO_PATHCONV=1 sc config SimpleSvm binPath= "C:\\SimpleSvm.sys"` 修正。
+- **C0 实机（08:19:22 起）**：`sc start SimpleSvm` → **RUNNING**（12 核全部无缝
+  进 guest、DriverEntry 正常返回）。随后 `yghv_stress 600s x6 线程`（08:20-08:30）：
+  **全程 121 个 5s 心跳无中断，600s 跑满正常退出**；期间多轮独立命令（sc query、
+  systeminfo、文件 IO）响应正常；服务始终 RUNNING。
+  → **决定性结果：上游原版 SimpleSvm（不拦 INTR、只拦 CPUID/VMRUN/EFER 的最小
+  拦截构型）在本机（Ryzen 5 5500，此前判定"平台级硬冻结"的那台）稳定运行并扛住
+  定向压测。**"让 guest 执行真实 Windows 内核代码（调度器切换/ISR）<15-60s 必冻"
+  的历史判定**被证伪**；"平台级限制（errata 1363 类）"归因不再成立——冻结是
+  构型问题（INTR 拦截 + GIF=0 宿主服务窗口 + 高频退出/NT API 混入），
+  不是硅片问题。C1（step203）由此具备明确的正向预期。
+- **C0 卸载 quirk（上游 SimpleSvm 自身问题，记录）**：`sc stop` → 1052
+  （NOT_STOPPABLE，CanStop=False）；`unload_driver.ps1`（NtUnloadDriver）→
+  0xC0000010 STATUS_INVALID_DEVICE_REQUEST。反汇编核实 DriverEntry 确有写
+  DriverObject->DriverUnload(+0x68)=0x140001320 且函数有效；对照组
+  yuanguard（未加载时 0xC0000034）证明脚本无毛病。推测与 DriverEntry 的返回
+  本身经由 VMEXIT/CPUID backdoor 路径完成有关（内核侧驱动记录状态不完整）。
+  **影响：SimpleSvm 无法在线卸载，需物理重启清除**（服务 DEMAND_START，
+  重启后不会自加载）。→ C1 前需重启一次；重启后先 `sc delete SimpleSvm`。
+- **待办**：重启 → 删除 SimpleSvm 服务与 C:\SimpleSvm.sys → **C1 step203 实机**
+  （runbook 见 `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md` §5：服务名 yuang203、
+  镜像 `D:\aaaaaavm\yuanguard_hv_step203_20260918.sys`→C:\yuanguard_hv_s203.sys，
+  看 C:\Windows\yghv_progress.log 的 s203 enter/alive 序列，sc stop 验证干净卸载）。
+- **状态**：本机当前运行于 SimpleSvm guest 之下（稳定）；服务注册已
+  `sc delete`（重启后不再加载，镜像存 `D:\aaaaaavm\SimpleSvm.sys.keep`）；
+  C 盘稳定版 `70888311` 未动；yuanguard 服务不存在（未注册）。
+- 提交：本记录（C0 部分）；9.229 留给 C1。
