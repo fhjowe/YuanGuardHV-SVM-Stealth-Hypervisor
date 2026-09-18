@@ -4515,3 +4515,33 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 状态：代码+文档已提交；机器未加载 205（离线验证，本会话无新重启消耗）；稳定版
   `70888311` 未动；测试服务均不在。等用户择机跑 run_c6。
 - 提交：本记录。
+
+### 9.233 2026-09-18 step205 首测实机：进入即卡死（无 dump、无 DriverEntry returns）→ 升级 step205b 诊断构型
+
+- 用户跑 `run_c6_step205.ps1`：机器**立即无响应**、手动重启。progress.log（逐行 write-through）
+  停在 `bm step 205 SimpleSvm-port start`，**无** `all cores virtualized, DriverEntry returns`；
+  无新 bugcheck/dump → 判定**卡死发生在 p_run_on_each 进入过程中**（第一个/前几个核 VMRUN 附近），
+  非运行期腐蚀。与 203 系（跑到 resident running、运行后腐蚀）不同。
+- 零重启静态复核：asm 栈/偏移平衡（self@`[rsp+0x220]`、loop rsp 收支对称）正确；`mov %%cr0..`
+  AT&T 内联 asm 有 203 先例（`yg_read_cr3`）非语法坑；VMCB 一致性检查项（4K 对齐、ASID=1、
+  必拦 VMRUN、vmsave 抓 guest 段/TR）逐条核过，未见明显非法。最可能：**首个 VMRUN 触发
+  `#VMEXIT_INVALID` → 我 default 分支"推进 rip 重 vmrun"→ 无效退出死循环 → 核打满、整机假死**
+  （无 dump，因是活锁非 bugcheck）。
+- 升级 **step205b**（`main` 改动见提交 5eab178，全离线，无新重启消耗）：
+  1. 每核 `VMRUN` 前 write-through trace `s205 pre-vmrun cpuN`（裸金属上下文，安全）+ 二次返回
+     `s205 guest-return cpuN`（guest 普通 syscall）；
+  2. `default:` 改**有界失效保护**：`BadExits` 连超 16 → `p_devirt` 逐核优雅退出（不再无限重进），
+     机器保命、DriverEntry 有机会返回；健康 CPUID 退出清零计数；
+  3. 抽出 `p_devirt`（卸载后门 + 失效保护共用，纯内存/特权指令，岛内安全）。
+- 构建验证（离线全绿）：205b 镜像 `60ba5a68...`（含两条 trace 串）归档为
+  `yuanguard_hv_step205_20260918.sys`（run_c6 直接复用）；默认构建无 205 串（0）；step203 回归通过。
+- 下一次 boot 的判读（run_c6 重跑，启动不耗重启、崩才耗）：
+  - progress 走到 `s205 pre-vmrun cpu0..cpuN` 逐个 + `guest-return` + `DriverEntry returns`
+    且系统响应 → 进入通了，问题在稳态（转 §205b-后续：叠加保护语义或继续观察存活）。
+  - 停在某 `pre-vmrun cpuK` 且机器**不假死**（因有界失效保护把坏核弹出）+ 出现
+    `DriverEntry returns` → 说明 cpuK 的 VMRUN 立刻无效退出，被 fail-safe 兜住；据此定位
+    cpuK 的 VMCB 差异（重点：`p_capture` 的 rip 是否为有效代码、guest segs/cr3、PAT/EFER）。
+  - 若仍在 `pre-vmrun` 处整机假死 → 无效退出发生在 `p_devirt` 兜住前的极早期，需回到 asm 级
+    逐条 diff（`Vpd->BadExits` 用内存计数不进日志，避免岛内 I/O）。
+- 状态：step205b 代码已提交；机器未加载 205；稳定版未动。等用户再跑一次 run_c6（诊断版）。
+- 提交：本记录。
