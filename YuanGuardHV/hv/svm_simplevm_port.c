@@ -1,0 +1,276 @@
+/* svm_simplevm_port.c — faithful port of SimpleSvm's OS-as-guest enter/exit model
+ * for YuanGuardHV step205 (option A). Compiled ONLY when YGHV_BAREMETAL_STEP==205;
+ * otherwise an empty translation unit (default build and step203/204 unaffected).
+ *
+ * Rationale (docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md §7): every YGHV variant that
+ * keeps our own svm_trampoline_os_enter model corrupts guest kernel structures,
+ * while upstream SimpleSvm runs 600s+ on THIS machine. So we port SimpleSvm's exact
+ * mechanism: the per-CPU virtualize routine IS the host loop (VpData-embedded host
+ * stack); the guest resumes at the captured RIP (the installed-check line), sees
+ * "hypervisor installed" on the 2nd pass and returns so the affinity loop advances.
+ * The VMEXIT handler is synchronous-only (CPUID/VMRUN), zero NT calls, zero I/O.
+ * NPT reuses g_npt.
+ */
+#include <ntddk.h>
+
+#if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 205)
+
+#include "vmcb.h"        /* YGHV vmcb_t { control; state; } */
+#include "svm_defs.h"    /* MSR_EFER, SVM_EXIT_*, INTERCEPT_* */
+#include "npt.h"         /* npt_mgr_t (g_npt) */
+
+extern npt_mgr_t g_npt;
+extern ULONG     g_vcpu_count;
+
+/* ---- low-level helpers (clang-cl; we avoid intrin.h / RtlCaptureContext) ---- */
+static uint64_t p_read_msr(uint32_t msr) {
+    uint32_t lo, hi; __asm__ volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static void p_write_msr(uint32_t msr, uint64_t v) {
+    uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+    __asm__ volatile("wrmsr"::"c"(msr),"a"(lo),"d"(hi));
+}
+static uint64_t p_cr0(void) { uint64_t v; __asm__ volatile("mov %%cr0,%0":"=r"(v)); return v; }
+static uint64_t p_cr2(void) { uint64_t v; __asm__ volatile("mov %%cr2,%0":"=r"(v)); return v; }
+static uint64_t p_cr3(void) { uint64_t v; __asm__ volatile("mov %%cr3,%0":"=r"(v)); return v; }
+static uint64_t p_cr4(void) { uint64_t v; __asm__ volatile("mov %%cr4,%0":"=r"(v)); return v; }
+static uint16_t p_tr(void)  { uint16_t t; __asm__ volatile("str %w0":"=r"(t)); return t; }
+static void p_vmsave(uint64_t pa) { __asm__ volatile("vmsave %0"::"r"(pa):"memory"); }
+static void p_vmload(uint64_t pa) { __asm__ volatile("vmload %0"::"r"(pa):"memory"); }
+static void p_stgi(void)    { __asm__ volatile("stgi"); }
+static void p_writeeflags(uint64_t f) { __asm__ volatile("push %0\n\tpopfq"::"r"(f):"cc","memory"); }
+
+typedef struct {
+    uint64_t rip, rsp, rflags;
+    uint16_t cs, ds, es, fs, gs, ss;
+} SVP_CTX;
+
+static void p_capture(SVP_CTX *c) {
+    __asm__ volatile(
+        "lea 0(%%rip), %0\n\t"
+        "mov %%rsp, %1\n\t"
+        "pushfq\n\t"
+        "pop %2\n\t"
+        "mov %%cs, %3\n\t"
+        "mov %%ds, %4\n\t"
+        "mov %%es, %5\n\t"
+        "mov %%fs, %6\n\t"
+        "mov %%gs, %7\n\t"
+        "mov %%ss, %8\n\t"
+        : "=r"(c->rip), "=r"(c->rsp), "=r"(c->rflags),
+          "=r"(c->cs), "=r"(c->ds), "=r"(c->es),
+          "=r"(c->fs), "=r"(c->gs), "=r"(c->ss)
+        : : "memory");
+}
+
+static uint32_t p_seg_limit(uint16_t sel) {
+    struct { uint16_t l; uint64_t b; } __attribute__((packed)) g;
+    __asm__ volatile("sgdt %0":"=m"(g));
+    uint64_t lo = ((uint64_t *)(g.b + (sel & ~7u)))[0];
+    uint32_t lim = (uint32_t)((lo & 0xFFFFu) | (((lo >> 32) & 0xFu) << 16));
+    if (lo & (1ULL << 55)) lim = (lim << 12) | 0xFFF;
+    return lim;
+}
+static uint16_t p_seg_attrib(uint16_t sel) {
+    struct { uint16_t l; uint64_t b; } __attribute__((packed)) g;
+    __asm__ volatile("sgdt %0":"=m"(g));
+    uint64_t lo = ((uint64_t *)(g.b + (sel & ~7u)))[0];
+    return (uint16_t)((lo >> 40) & 0xFFu);   /* access byte (type|S|DPL|P) */
+}
+
+/* ---- VpData layout: MUST match svm_simplevm_port.S (self at HostRsp+0x10) ---- */
+typedef struct _SVP_SHARED {
+    volatile LONG ProcessorsVirtualized;
+    volatile LONG Abort;
+} SVP_SHARED;
+
+#define SVP_HOST_STACK 0x4000
+#define SVP_TRAPFRAME  0x190
+
+typedef struct _SVP_VPD {
+    union {
+        DECLSPEC_ALIGN(PAGE_SIZE) uint8_t HostStackLimit[SVP_HOST_STACK];
+        struct {
+            uint8_t  StackContents[SVP_HOST_STACK - 6*8 - SVP_TRAPFRAME];
+            uint8_t  TrapFrame[SVP_TRAPFRAME];
+            uint64_t GuestVmcbPa;               /* HostRsp +0x00 */
+            uint64_t HostVmcbPa;                /* +0x08 */
+            struct _SVP_VPD *Self;              /* +0x10 (asm reads) */
+            SVP_SHARED *Shared;                 /* +0x18 */
+            uint64_t Padding1;
+            uint64_t Reserved1;
+        } hs;
+    };
+    DECLSPEC_ALIGN(PAGE_SIZE) vmcb_t GuestVmcb;   /* page-aligned */
+    DECLSPEC_ALIGN(PAGE_SIZE) vmcb_t HostVmcb;
+    DECLSPEC_ALIGN(PAGE_SIZE) uint8_t HostStateArea[PAGE_SIZE];
+} SVP_VPD, *PSVP_VPD;
+
+_Static_assert(offsetof(SVP_VPD, GuestVmcb) % PAGE_SIZE == 0, "GuestVmcb page-aligned");
+_Static_assert(offsetof(SVP_VPD, HostVmcb) % PAGE_SIZE == 0, "HostVmcb page-aligned");
+_Static_assert(offsetof(SVP_VPD, hs.Self) - offsetof(SVP_VPD, hs.GuestVmcbPa) == 0x10,
+               "Self at HostRsp+0x10");
+
+typedef struct _GUEST_REGS {
+    uint64_t R15, R14, R13, R12, R11, R10, R9, R8;
+    uint64_t Rdi, Rsi, Rbp;
+    uint64_t RspDummy;
+    uint64_t Rbx, Rdx, Rcx, Rax;
+} GUEST_REGS;
+
+void yghv_sv_launch(void *HostRsp);   /* svm_simplevm_port.S */
+
+#define SVP_CPUID_INSTALLED   0x4FFFFFFCu
+#define SVP_CPUID_UNLOAD      0x41414141u
+#define SVP_MAGIC             0x504D5653u   /* 'SVMP' */
+
+/* VMEXIT island: synchronous CPUID/VMRUN only, zero NT calls, zero I/O. */
+BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs);
+BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
+    BOOLEAN exit_vm = FALSE;
+    uint64_t leaf;
+
+    p_vmload(Vpd->hs.HostVmcbPa);          /* restore host segments/GS (KPCR) */
+    Regs->Rax = Vpd->GuestVmcb.state.rax;  /* reflect guest RAX (host overwrote it) */
+
+    switch (Vpd->GuestVmcb.control.exitcode) {
+    case SVM_EXIT_CPUID:
+        leaf = Regs->Rax;
+        if (leaf == SVP_CPUID_INSTALLED) {
+            Regs->Rax = SVP_MAGIC; Regs->Rbx = 0; Regs->Rcx = 0; Regs->Rdx = 0;
+        } else if (leaf == SVP_CPUID_UNLOAD) {
+            if ((Vpd->GuestVmcb.state.ss_attrib & 0x60u) == 0) {   /* DPL0 */
+                /* per-CPU devirtualize (SvLaunchVm SvLV20 tail contract):
+                 * RBX=return rip, RCX=guest rsp, RDX:RAX=vpd. */
+                Regs->Rax = (uint32_t)(UINT_PTR)Vpd;
+                Regs->Rdx = (uint64_t)((UINT_PTR)Vpd >> 32);
+                Regs->Rbx = Vpd->GuestVmcb.control.next_rip;
+                Regs->Rcx = Vpd->GuestVmcb.state.rsp;
+                p_vmload(Vpd->hs.GuestVmcbPa);           /* load guest segs */
+                p_write_msr(MSR_EFER, p_read_msr(MSR_EFER) & ~(uint64_t)EFER_SVME);
+                p_stgi();                                /* re-enable interrupts */
+                p_writeeflags(Vpd->GuestVmcb.state.rflags);
+                exit_vm = TRUE;
+                break;
+            }
+            { int o[4]; __cpuidex(o, (int)leaf, (int)Regs->Rcx);
+              Regs->Rax=o[0]; Regs->Rbx=o[1]; Regs->Rcx=o[2]; Regs->Rdx=o[3]; }
+        } else {
+            int o[4]; __cpuidex(o, (int)leaf, (int)Regs->Rcx);
+            Regs->Rax=o[0]; Regs->Rbx=o[1]; Regs->Rcx=o[2]; Regs->Rdx=o[3];
+        }
+        Vpd->GuestVmcb.state.rip = Vpd->GuestVmcb.control.next_rip;
+        Vpd->GuestVmcb.state.rax = Regs->Rax;
+        break;
+    case SVM_EXIT_VMRUN:
+        /* guest executed VMRUN (would nest) — inject #GP. */
+        Vpd->GuestVmcb.control.event_injection =
+            (1ULL << 31) | (3ULL << 8) | 13ULL;
+        break;
+    default:
+        /* unexpected synchronous exit: advance & continue (never BugCheck in-window). */
+        Vpd->GuestVmcb.state.rip = Vpd->GuestVmcb.control.next_rip;
+        break;
+    }
+    return exit_vm;
+}
+
+static void p_prepare(PSVP_VPD v, SVP_CTX *c, uint64_t ncr3) {
+    vmcb_t *g = &v->GuestVmcb;
+    struct { uint16_t l; uint64_t b; } __attribute__((packed)) gdtr, idtr;
+    __asm__ volatile("sgdt %0":"=m"(gdtr));
+    __asm__ volatile("sidt %0":"=m"(idtr));
+
+    g->control.general1_intercepts  = INTERCEPT_CPUID;
+    g->control.general2_intercepts  = INTR_GEN2(SVM_INTERCEPT_VMRUN);
+    g->control.exception_intercepts = 0;
+    g->control.cr_read_intercepts   = 0;
+    g->control.cr_write_intercepts  = 0;
+    g->control.guest_asid           = 1;
+    g->control.tlb_control          = 0;
+    g->control.ncr3                 = ncr3;
+    g->control.np_enable            = 1;
+
+    g->state.gdtr_base = gdtr.b; g->state.gdtr_limit = gdtr.l;
+    g->state.idtr_base = idtr.b; g->state.idtr_limit = idtr.l;
+    g->state.cs_selector = c->cs; g->state.ds_selector = c->ds;
+    g->state.es_selector = c->es; g->state.fs_selector = c->fs;
+    g->state.gs_selector = c->gs; g->state.ss_selector = c->ss;
+    g->state.cs_attrib = p_seg_attrib(c->cs); g->state.cs_limit = p_seg_limit(c->cs);
+    g->state.ds_attrib = p_seg_attrib(c->ds); g->state.ds_limit = p_seg_limit(c->ds);
+    g->state.es_attrib = p_seg_attrib(c->es); g->state.es_limit = p_seg_limit(c->es);
+    g->state.ss_attrib = p_seg_attrib(c->ss); g->state.ss_limit = p_seg_limit(c->ss);
+    g->state.tr_selector = p_tr();
+    g->state.cr0 = p_cr0(); g->state.cr2 = p_cr2();
+    g->state.cr3 = p_cr3(); g->state.cr4 = p_cr4();
+    g->state.efer = p_read_msr(MSR_EFER);
+    g->state.rflags = c->rflags;
+    g->state.rsp = c->rsp;
+    g->state.rip = c->rip;
+    g->state.g_pat = p_read_msr(0x277);
+    p_vmsave(v->hs.GuestVmcbPa);           /* capture FS/GS/TR/KernelGs into guest VMCB */
+    v->hs.Reserved1 = ~0ULL;
+}
+
+static NTSTATUS p_virtualize_one(SVP_SHARED *shared) {
+    SVP_CTX c;
+    PSVP_VPD v;
+    SIZE_T total;
+    int cp[4];
+
+    p_capture(&c);                          /* c.rip = installed-check on 2nd pass */
+    __cpuidex(cp, SVP_CPUID_INSTALLED, 0);
+    if ((uint32_t)cp[0] == SVP_MAGIC)       /* already virtualized (guest 2nd pass) */
+        return STATUS_SUCCESS;
+
+    total = (sizeof(SVP_VPD) + PAGE_SIZE - 1) & ~(SIZE_T)(PAGE_SIZE - 1);
+    v = (PSVP_VPD)MmAllocateContiguousMemory(total, (PHYSICAL_ADDRESS){ .QuadPart = -1 });
+    if (!v) return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(v, total);
+
+    p_write_msr(MSR_EFER, p_read_msr(MSR_EFER) | EFER_SVME);
+
+    v->hs.GuestVmcbPa = MmGetPhysicalAddress(&v->GuestVmcb).QuadPart;
+    v->hs.HostVmcbPa  = MmGetPhysicalAddress(&v->HostVmcb).QuadPart;
+    v->hs.Self        = v;
+    v->hs.Shared      = shared;
+    p_write_msr(0xC0010117, MmGetPhysicalAddress(v->HostStateArea).QuadPart); /* VM_HSAVE_PA */
+    p_prepare(v, &c, g_npt.pml4_pa);
+    p_vmsave(v->hs.HostVmcbPa);             /* snapshot host segs for VMLOAD on exit */
+    InterlockedIncrement(&shared->ProcessorsVirtualized);
+
+    yghv_sv_launch(&v->hs.GuestVmcbPa);     /* host loop; returns only after unload */
+    MmFreeContiguousMemory(v);              /* reached only if this CPU was unloaded */
+    return STATUS_SUCCESS;
+}
+
+static void p_run_on_each(SVP_SHARED *shared, ULONG n) {
+    GROUP_AFFINITY old, ga;
+    ULONG i;
+    PROCESSOR_NUMBER pn;
+    for (i = 0; i < n; i++) {
+        if (KeGetProcessorNumberFromIndex(i, &pn) != STATUS_SUCCESS) continue;
+        RtlZeroMemory(&ga, sizeof(ga));
+        ga.Group = pn.Group; ga.Mask = (KAFFINITY)(1ULL << pn.Number);
+        RtlZeroMemory(&old, sizeof(old));
+        KeSetSystemGroupAffinityThread(&ga, &old);
+        (void)p_virtualize_one(shared);
+        KeRevertToUserGroupAffinityThread(&old);
+    }
+}
+
+void yghv_sv205_start(ULONG cores);
+void yghv_sv205_start(ULONG cores) {
+    SVP_SHARED shared; shared.ProcessorsVirtualized = 0; shared.Abort = 0;
+    p_run_on_each(&shared, cores);
+}
+
+#else
+/* Non-205 builds still compile+link svm_simplevm_port.S (the launch loop), which
+ * references yghv_sv_handle_vmexit. Nothing ever calls yghv_sv_launch here, so
+ * provide a stub so the (dead) asm object links; the real handler is above. */
+typedef int svp_unused_t;
+unsigned char yghv_sv_handle_vmexit(void *vpd, void *regs);
+unsigned char yghv_sv_handle_vmexit(void *vpd, void *regs) { (void)vpd; (void)regs; return 0; }
+#endif

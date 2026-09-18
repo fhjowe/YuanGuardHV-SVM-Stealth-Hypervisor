@@ -2265,9 +2265,9 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
 
     if (!v)
         return STATUS_NOT_FOUND;
-    /* 9.227: bound raised from 202 -> 203 to admit the SimpleSvm-equivalent
-     * all-core resident step. */
-    if (step > 204)
+    /* 9.227/9.232: bound raised to 205 to admit step203/204 (SimpleSvm-equivalent)
+     * and step205 (faithful SimpleSvm port). */
+    if (step > 205)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -4251,6 +4251,19 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         for (i = 0; i < bm_cores; i++)
             if (threads[i]) ZwClose(threads[i]);
         yghv_trace("bm os allcore resident running");
+        return STATUS_SUCCESS;
+    }
+
+    /* 9.232 step205: faithful SimpleSvm port (independent launch/VpData model,
+     * see svm_simplevm_port.c). Runs after svm_core_init has enabled SVM + built
+     * g_npt. Virtualizes every core sequentially via affinity; each core's host
+     * loop persists in its own VpData-embedded stack. No observer, no poll thread,
+     * zero NT calls in the VMEXIT island. Reboot to unload (no stop channel yet). */
+    if (step == 205) {
+        extern void yghv_sv205_start(ULONG cores);
+        yghv_trace("bm step 205 SimpleSvm-port start");
+        yghv_sv205_start(g_vcpu_count);
+        yghv_trace("bm step 205 all cores virtualized, DriverEntry returns");
         return STATUS_SUCCESS;
     }
 

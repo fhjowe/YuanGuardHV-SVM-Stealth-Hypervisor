@@ -80,10 +80,14 @@ set "LINKS=%LINKS% /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VER%\km\x64""
 echo   WDK Version: %WDK_VER%
 echo   Compiling...
 
-for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth) do call :compile %%f || goto :error
+for %%f in (main svm_core npt_core vmexit vmmcall multi_core protect control_device loader_stealth svm_simplevm_port) do call :compile %%f || goto :error
 
 echo   svm_trampoline.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_trampoline.obj" "%HV_DIR%\svm_trampoline.S"
+if errorlevel 1 goto :error
+
+echo   svm_simplevm_port.S
+"%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_simplevm_port_asm.obj" "%HV_DIR%\svm_simplevm_port.S"
 if errorlevel 1 goto :error
 
 echo   Linking (MSVC)...
@@ -97,6 +101,8 @@ echo   Linking (MSVC)...
     "%BIN_DIR%\protect.obj" ^
     "%BIN_DIR%\control_device.obj" ^
     "%BIN_DIR%\loader_stealth.obj" ^
+    "%BIN_DIR%\svm_simplevm_port.obj" ^
+    "%BIN_DIR%\svm_simplevm_port_asm.obj" ^
     "%BIN_DIR%\svm_trampoline.obj" ^
     ntoskrnl.lib
 if errorlevel 1 goto :error
