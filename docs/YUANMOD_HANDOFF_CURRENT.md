@@ -4349,3 +4349,51 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `sc delete`（重启后不再加载，镜像存 `D:\aaaaaavm\SimpleSvm.sys.keep`）；
   C 盘稳定版 `70888311` 未动；yuanguard 服务不存在（未注册）。
 - 提交：本记录（C0 部分）；9.229 留给 C1。
+
+### 9.229 2026-09-18 C1/C1s/diag/diag2 全弧线实机：203 从"静默硬锁"进化到"可诊断 0xB8"；冻结定性为驱动侧 VMEXIT 进出模型问题（非平台、可修）
+
+- 承接 9.227。顺序：C1 全核 → C1s 单核 → 203-diag(加窗口内 trace) → 203-diag2(修掉窗口写)。
+  镜像/证据（SHA256 前缀）：all-core 203 `83b0c85b`、single-core 203-s `6fe17e55`、
+  diag `30d0431a`、diag2 `9b512f32`（归档 `D:\aaaaaavm\yuanguard_hv_step203*_.sys`）。
+- **C1 全核 203（09:11 实机）**：`sc start` → progress.log 逐核 `s203 enter`（写通），
+  随后整机静默冻结、无 dump（watchdog 也没跑成 0xE2 → 连 host core0 都停摆）。用户物理重启。
+- **C1s 单核 203（core1 guest + core0 host，09:36 实机）**：`s203 enter=0x1 → resident
+  running → bm done → resident alive` 连出 3 拍后，约 15s 整机再次静默硬锁、无 dump。
+  → 关键排除：不是"多核/全核进入"专属，单核 guest 也死。
+- **203-diag（加"VMEXIT 岛内写 trace"，09:58 实机）**：**0x139 KERNEL_SECURITY_CHECK_FAILURE**
+  首次留 dump。`!analyze` 栈：`KiGeneralProtectionFault→KiAbEntryGetLockedHeadEntry→
+  KiAbProcessContextSwitch→KiSwapThread→KeWaitForSingleObject→NtWriteFile→yuanguard_hv_s203d+0x132d`。
+  **破案：是我自己加的诊断写文件踩了仓库早就记录的地雷**（vmexit.c 早已注释"不要在 GIF=0
+  dispatch 路径里 file I/O，会 block→0x139，v100b 教训"）——在 VMEXIT 窗口里 `yghv_trace`
+  阻塞于文件锁，guest 线程上下文被切走 → 安全检查失败。**非 203 本体逻辑。**
+- **203-diag2（窗口纯内存 fail-close + 宿主观察者线程每 500ms 落盘，10:15/10:19 实机）**：
+  - 短跑：obs exits 187→8642（全 CPUID 0x72、零意外退出），`sc stop` 干净退出 1.8s、
+    `os guest host done=0x1`、全机存活 → **VMEXIT 岛本身证明是干净可用的**。
+  - 6min soak：**撑到约 115s**（远超 C1s 的 15s；差异只是调度运气）后 **0xB8
+    ATTEMPTED_SWITCH_FROM_DPC**（dump 已存 `D:\aaaaaavm\yghv_bsod_c3diag2_0xB8.dmp`，
+    2f8cc822）。faulting thread = 空闲线程 `KiIdleLoop→SwapContext`，栈地址
+    `fffffa012322fbd8` 落在 **per-CPU DPC 栈**（运行内核基址 fffff806`41a00000 之外）——
+    即"DPC/高 IRQL 下发生上下文切换"。progress.log 尾部显示崩溃前 obs 一路正常。
+- **综合定性**：
+  1. **不是平台级**（C0 同硬件 SimpleSvm 600s+ 稳，已钉死）；
+  2. 不是 VMEXIT 岛里的 NT API（diag2 证明岛干净）；
+  3. 根因收敛到**我们 203 的进出（entry/exit）+ 宿主态恢复模型**与 SimpleSvm 的差异：
+     203 每次退出走 `VMSAVE/VMLOAD host_vmcb` + 4 页 host_stack、guest 靠 `svm_os_seamless_cont`
+     的 `ret` 回到那个 yghv 系统线程栈继续 `cpuid/pause`。当 guest 核在该之上取到真实时钟
+     中断进 DPC 时，进出未能像 SimpleSvm 那样把 IRQL/DPC 状态干净交还，累积到 0xB8。
+     （C1s 15s vs diag2 115s 只是命中竞争的快慢。）
+  4. 观察：SimpleSvm 能跑的关键，可能还包括它 guest 侧延续体**根本不做 cpuid 轮询循环**
+     （guest 就是被 DriverEntry 线程 `ret` 之后正常接管该核的 Windows 代码），而 203 让一个
+     专门的 yghv 线程在 guest 里持续 cpuid+pause 轮询——这条 guest 侧轮询线程在 guest 调度器
+     眼里是普通线程，但它 `ret` 进 guest 时的栈/IRQL 交接可能是 0xB8 的近因。
+- **下一步（驱动侧可修，待用户拍板，不再连续烧重启）**：
+  A. **对齐 SimpleSvm 进出模型**（首选）：guest 延续体不轮询、进入后即 `ret` 让出该核；
+     停止/观测改由"另一个仍在 host 常态的核 + 极少量不触发 guest 调度的 CPUID 心跳"或
+     干脆像 SimpleSvm 那样把退出处理做到与之一致（VMLOAD guest vmcb 复位 host 段）。逐项 diff
+     `svm_vmrun_trampoline`/`os_enter_*` 与 SimpleSvm `SvLaunchVm/SvHandleVmExit` 的 RSP/CR/EFER/GS 恢复。
+  B. 或先做一个"203 但 guest 延续体 = 立即 `ret`（不轮询）"的最小变体，直接验证
+     "轮询线程 vs DPC 交接"假设——若这样能 600s 稳，则锁定轮询线程。
+  C. 每次仍是一次重启，建议先离线 diff（A）再决定跑哪一个，避免再烧 boot。
+- **状态**：机器已重启、SVM 空闲；测试服务 `yuang203e/yuang203d/yuang203/SimpleSvm` 均已
+  `sc delete`；C 盘稳定版 `70888311` 未动；证据 dump/progress 归档 `D:\aaaaaavm\`。
+- 提交：本记录（含 203-diag2 代码：窗口纯内存 fail-close + 观察者线程 + g_s203_* 诊断门控）。

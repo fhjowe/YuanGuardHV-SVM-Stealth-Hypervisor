@@ -26,6 +26,10 @@ extern volatile ULONG64 g_os_resident_exits;
 extern volatile BOOLEAN g_os_guest_avic_timer_emu;
 extern volatile BOOLEAN g_v98_apic_shadow;
 extern volatile BOOLEAN g_os_guest_stop_requested;
+/* 9.229 self-diagnosis flags for step203-lean (defined in main.c). */
+extern volatile BOOLEAN g_s203_lean;
+extern volatile LONG g_s203_exit_log;
+extern volatile uint64_t g_s203_unexpected_exit;
 /* 9.180 MSV: minimal shadow validation flags (defined in main.c). */
 extern volatile BOOLEAN g_msv_test;
 extern volatile BOOLEAN g_msv_cr3_seen;
@@ -530,6 +534,37 @@ int svm_dispatch_exit(svm_vcpu_t *vcpu) {
         return 1;
     }
     vcpu->resident_exits++;
+    /* 9.229 self-diagnosis (203-lean). C1 (all-core) and C1s (single-core) both
+     * hard-froze this machine within seconds..15s of entering guest, with zero
+     * exit evidence on disk (the memory ring is lost on a power cycle). This
+     * block turns a frozen boot into a diagnosable one:
+     *   - any exit other than the expected three is a config deviation: record
+     *     it write-through, then fail-close ONLY this guest core (the stop flag
+     *     makes every core exit at its next poll) so the host survives and
+     *     progress.log keeps the cause;
+     *   - the first 40 exits (expected CPUID storm) are logged with guest RIP;
+     *   - after that, one heartbeat every 1024 exits lets the log tail date the
+     *     moment of death relative to guest polling. */
+    if (g_s203_lean) {
+        /* 9.229c2 lesson: the FIRST version of this block logged trace INSIDE
+         * the VMEXIT window -> ZwWriteFile blocked on a file lock -> the switch
+         * out happened on a half-guest context -> KiAbProcessContextSwitch #GP
+         * -> 0x139 fastfail (the exact v100b landmine this file already
+         * documents).  The window must stay pure memory: unexpected exits are
+         * detected here but only set flags; the ring (yghv_v100_record above)
+         * carries the evidence and the host-side observer thread flushes it to
+         * the progress log from normal context. */
+        if (exitcode != SVM_EXIT_CPUID && exitcode != SVM_EXIT_VMRUN &&
+            exitcode != SVM_EXIT_VMMCALL) {
+            g_s203_unexpected_exit = exitcode;
+            g_os_resident_mode = FALSE;      /* watchdog must not kill a healthy host */
+            g_os_guest_stop_requested = TRUE;
+            return 1;
+        }
+        InterlockedDecrement(&g_s203_exit_log);   /* ring budget bookkeeping; observer
+                                                   * reads last_exitcode/rip, no
+                                                   * in-window logging (c2 lesson) */
+    }
     if (g_os_guest_test_active &&
         vcpu->resident_exits >= YGHV_OS_GUEST_EXIT_LIMIT)
         return 1;

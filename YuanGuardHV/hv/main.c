@@ -279,12 +279,21 @@ static volatile LONG g_v99_allcore_online = 0;
  * Gate: YGHV_BAREMETAL_STEP=203.  Thread handles live in g_s203_threads so
  * DriverUnload can join every core's trampoline thread before teardown. */
 static HANDLE g_s203_threads[SVM_MAX_CORES];
+static HANDLE g_s203_observer = NULL;
 static volatile LONG g_s203_online = 0;
 static volatile LONG g_s203_ready = 0;
 static volatile LONG g_s203_go = 0;
 static volatile LONG g_s203_abort = 0;
 /* ~10ms CPUID-poll throttle at 3GHz TSC (wrap-safe unsigned subtraction). */
 #define YGHV_S203_POLL_TSC 30000000ULL
+/* 9.229 self-diagnosis: while TRUE, svm_dispatch_exit logs the first exits
+ * write-through and fail-closes any non-CPUID/VMRUN/VMMCALL exit (only the
+ * guest core exits; the host stays up and progress.log keeps the cause). */
+volatile BOOLEAN g_s203_lean = FALSE;
+volatile LONG g_s203_exit_log = 0;
+/* 9.229c2: set (pure memory) by the dispatch island when an unexpected exit
+ * occurs; the observer thread logs it from normal host context. */
+volatile uint64_t g_s203_unexpected_exit = 0;
 volatile BOOLEAN g_os_resident_log_active = FALSE;
 volatile ULONG64 g_os_resident_exits = 0;
 volatile BOOLEAN g_v100_monitor_active = FALSE;
@@ -1764,6 +1773,42 @@ static VOID yghv_os_guest_allcore_thread(PVOID ctx) {
     }
 }
 
+/* 9.229c2: observer thread. The VMEXIT window must stay pure memory (c2 lesson:
+ * a file write in the window blocked on a file lock, the context switch then
+ * #GP'd in KiAbProcessContextSwitch -> 0x139). The observer runs in NORMAL
+ * host context and flushes the guest core's latest exit/counter/RIP to the
+ * progress log every ~500ms: a silent lock leaves the last flushed state on
+ * disk within 0.5s of death, which dates the death relative to guest polling. */
+static VOID yghv_s203_observer_thread(PVOID ctx) {
+    uint32_t watch_core = (uint32_t)(uintptr_t)ctx;
+    LARGE_INTEGER delay;
+    ULONG ticks = 0;
+    uint64_t reported_unexpected = 0;
+
+    KeSetSystemAffinityThread((KAFFINITY)1);
+    delay.QuadPart = -5LL * 10000LL;   /* 5ms sample */
+    for (;;) {
+        svm_vcpu_t *v;
+        if (g_os_guest_stop_requested)
+            break;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        if (g_s203_unexpected_exit &&
+            g_s203_unexpected_exit != reported_unexpected) {
+            reported_unexpected = g_s203_unexpected_exit;
+            yghv_trace_u64("s203 UNEXPECTED EXIT", g_s203_unexpected_exit);
+        }
+        if (++ticks < 100)
+            continue;                  /* flush once per ~500ms */
+        ticks = 0;
+        v = svm_core_get_vcpu(watch_core);
+        if (!v)
+            continue;
+        yghv_trace_u64("s203 obs exits", v->resident_exits);
+        yghv_trace_u64("s203 obs last", v->last_exitcode);
+        yghv_trace_u64("s203 obs rip", v->last_rip);
+    }
+}
+
 /* 9.227 step203 — SimpleSvm 等价构型（全减法实验，YGHV_BAREMETAL_STEP=203）。
  *
  * 背景：此前全部裸机常驻系（v95/99、step17、变体 E/F/M）都保留了
@@ -1795,6 +1840,7 @@ static VOID yghv_os_guest_simplevm_thread(PVOID ctx) {
     svm_vcpu_t *v;
     uint64_t t0;
     uint32_t a, b, c, d;
+    static volatile LONG s203_dumped = 0;
 
     KeSetSystemAffinityThread((KAFFINITY)(1ULL << core));
     v = svm_core_get_vcpu(core);
@@ -1836,6 +1882,23 @@ static VOID yghv_os_guest_simplevm_thread(PVOID ctx) {
     yghv_trace_u64("s203 enter", core);
     if (core < SVM_MAX_CORES)
         KeSetEvent(&g_os_guest_done_events[core], IO_NO_INCREMENT, FALSE);
+    /* 9.229: write the exact VMCB state going into VMRUN so a frozen boot can
+     * be diffed offline against SimpleSvm's VMCB (the only known-good AMD
+     * OS-as-guest on this silicon). Only the first core logs the full dump to
+     * keep the write-through log small. */
+    if (!InterlockedExchange(&s203_dumped, 1)) {
+        volatile uint8_t *ctl = (volatile uint8_t *)v->vmcb;
+        yghv_trace_u64("s203 VMCB g1", *(volatile uint32_t *)(ctl + 0x0C));
+        yghv_trace_u64("s203 VMCB g2", *(volatile uint32_t *)(ctl + 0x10));
+        yghv_trace_u64("s203 VMCB exc", *(volatile uint32_t *)(ctl + 0x08));
+        yghv_trace_u64("s203 VMCB asid", *(volatile uint32_t *)(ctl + 0x58));
+        yghv_trace_u64("s203 VMCB tlb", *(volatile uint8_t *)(ctl + 0x5C));
+        yghv_trace_u64("s203 VMCB ncr3", *(volatile uint64_t *)(ctl + 0xB0));
+        yghv_trace_u64("s203 VMCB np_en", *(volatile uint64_t *)(ctl + 0x90));
+        yghv_trace_u64("s203 VMCB cr3", v->vmcb->state.cr3);
+        yghv_trace_u64("s203 VMCB efer", v->vmcb->state.efer);
+        yghv_trace_u64("s203 VMCB rflags", v->vmcb->state.rflags);
+    }
     svm_trampoline_os_enter(v, 1);   /* IF=1: guest services interrupts natively */
 
     /* ---- from here on this code executes in GUEST mode on this core ---- */
@@ -4158,6 +4221,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         ULONG i;
         ULONG j;
         ULONG bm_cores = g_vcpu_count;
+        ULONG s203_base = 0;      /* first core index entering guest */
         HANDLE alive = NULL;
         HANDLE watchdog = NULL;
         NTSTATUS st203 = STATUS_SUCCESS;
@@ -4172,6 +4236,27 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         g_os_guest_avic_irr_inject = FALSE;
         g_os_resident_mode = TRUE;
         g_os_resident_log_active = TRUE;
+        /* 9.229: arm the self-diagnosis dispatch island (first-40 exits logged
+         * write-through; any non-CPUID/VMRUN/VMMCALL exit fail-closes only the
+         * guest core so the host survives and progress.log keeps the cause). */
+        g_s203_lean = TRUE;
+        InterlockedExchange(&g_s203_exit_log, 40);
+        yghv_trace("s203 lean diag armed");
+#ifdef YGHV_SINGLECORE
+        /* 203-s 单变量隔离：只让 core1 进 guest（原生 tick/上下文切换照旧），
+         * core0 保持宿主态——alive/watchdog/DriverEntry 尾日志都在 host 侧产出，
+         * guest 停摆时 watchdog 能数到 3s 主动 0xE2 留 dump。
+         * 区分"guest 原生中断处理即死" vs "全核/SMP 进入才是变量"。 */
+        if (bm_cores < 2) {
+            g_os_resident_mode = FALSE;
+            g_os_resident_log_active = FALSE;
+            LOG_ERROR("bm step 203 SINGLECORE: need >=2 cores");
+            return STATUS_UNSUCCESSFUL;
+        }
+        bm_cores = 1;
+        s203_base = 1;
+        yghv_trace("s203 single-core mode (guest=core1, core0 host)");
+#endif
         InterlockedExchange(&g_s203_ready, 0);
         InterlockedExchange(&g_s203_go, 0);
         InterlockedExchange(&g_s203_abort, 0);
@@ -4180,13 +4265,14 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
             g_s203_threads[i] = NULL;
 
         for (i = 0; i < bm_cores; i++) {
-            KeInitializeEvent(&g_os_guest_done_events[i], NotificationEvent, FALSE);
+            ULONG c = s203_base + i;
+            KeInitializeEvent(&g_os_guest_done_events[c], NotificationEvent, FALSE);
             st203 = PsCreateSystemThread(&g_s203_threads[i], THREAD_ALL_ACCESS,
                                          NULL, NULL, NULL,
                                          yghv_os_guest_simplevm_thread,
-                                         (PVOID)(uintptr_t)i);
+                                         (PVOID)(uintptr_t)c);
             if (!NT_SUCCESS(st203)) {
-                LOG_ERROR("bm step 203: thread core %u failed 0x%x", i, st203);
+                LOG_ERROR("bm step 203: thread core %u failed 0x%x", c, st203);
                 break;
             }
         }
@@ -4220,10 +4306,20 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         else
             g_os_guest_watchdog_thread = watchdog;
 
+        /* 9.229c2 observer: pins to core0 (host in single-core mode), flushes the
+         * guest core's latest exit evidence to progress.log from normal context.
+         * The v100 monitor stays on so the ring records every exit in pure memory. */
+        g_v100_monitor_active = TRUE;
+        if (!NT_SUCCESS(PsCreateSystemThread(&g_s203_observer, THREAD_ALL_ACCESS,
+                                             NULL, NULL, NULL,
+                                             yghv_s203_observer_thread,
+                                             (PVOID)(uintptr_t)s203_base)))
+            LOG_ERROR("bm step 203: observer thread create failed");
+
         /* Release the barrier: every core enters guest mode together. */
         InterlockedExchange(&g_s203_go, 1);
         for (i = 0; i < bm_cores; i++) {
-            KeWaitForSingleObject(&g_os_guest_done_events[i], Executive,
+            KeWaitForSingleObject(&g_os_guest_done_events[s203_base + i], Executive,
                                   KernelMode, FALSE, NULL);
         }
         yghv_trace("bm os simplevm resident running");
@@ -4714,6 +4810,12 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
             g_s203_threads[s203] = NULL;
         }
     }
+    /* observer breaks on stop_requested and exits ~5ms later; join in host ctx */
+    yghv_join_system_thread(g_s203_observer);
+    g_s203_observer = NULL;
+    g_s203_lean = FALSE;
+    g_s203_unexpected_exit = 0;
+    g_v100_monitor_active = FALSE;
     g_os_guest_resident_thread = NULL;
     g_os_guest_alive_thread = NULL;
     g_os_guest_watchdog_thread = NULL;
