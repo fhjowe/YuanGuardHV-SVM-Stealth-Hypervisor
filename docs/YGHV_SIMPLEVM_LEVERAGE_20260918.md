@@ -177,3 +177,46 @@ del C:\yuanguard_hv_s203.sys
 - `.gitignore`：`thirdparty/`。
 - 证据引用：SimpleSvm master `SimpleSvm.cpp`/`x64.asm`/issue #1；HelloAmdHvPkg
   `Drivers/HelloAmdHvDxe/Setup.c`；本仓库 handoff 9.84-9.226。
+
+## 7. step204 之后：faithful 移植规格（2026-09-18 逐行比对 ground truth 得出）
+
+实机弧线 C1/C1s/diag/diag2/203-q/204 全部 FAIL，但已把根因从"平台"彻底移到
+"我们 `svm_trampoline_os_enter` 的进出模型"。本轮把 SimpleSvm 的
+`SvVirtualizeProcessor`/`SvPrepareForVirtualization`/`SvLaunchVm`(asm)/`SvHandleVmExit`
+逐行读完，并回读 YGHV trampoline 做 diff。**两个曾怀疑的具体点被证伪**（都已在 YGHV 里）：
+- host 段/GS：`os_enter_exit` 有 `vmsave guest; vmload host_vmcb`（等价 SimpleSvm
+  `SvHandleVmExit` 首行 `__svm_vmload(HostVmcbPa)`）；
+- CPUID 的 RAX：`svm_finish_exit→svm_writeback_gprs` 有 `vmcb->state.rax = regs.rax`
+  （等价 SimpleSvm 869 行）。
+所以 203/204 的 `CORRUPT_LIST_ENTRY`/`0xB8` **不是**这两处，离线静态审查已到收益递减点。
+
+**结构性差异（SimpleSvm 有、203 无，且尚未等价）——即 faithful 移植的必修项：**
+1. **guest 入口来源**：SimpleSvm 的 guest 就是"DriverEntry 线程 vmrun 之后的自身继续"
+   （`SvLaunchVm` 的 vmrun 下一条即 guest 起点），**没有**独立的 yghv 常驻线程在 guest 里
+   跑；YGHV 203 用一个 PsCreateSystemThread 线程进入并在其中轮询/ret，204 让其
+   PsTerminate——但 host 环的**栈/上下文来源仍是那个 yghv 线程**，与 SimpleSvm 的
+   "DriverEntry 线程即 host 环、guest 即其 vmrun 后延续"不同。
+2. **host 栈布局**：SimpleSvm 把 host 栈**内嵌在 VpData 尾部**（`HostStackLayout`，
+   rsp 设到 `&HostStackLayout.GuestVmcbPa`，与 GuestVmcb/HostVmcb/HostStateArea 同页对齐
+   连续体）；YGHV 用**独立** `host_stack`(4页)+`host_vmcb`+`hsave` 分离分配，
+   `os_enter_resume` 每轮重 `wrmsr VM_HSAVE_PA` 并强制 `vmcb_clean_bits=0`。
+3. **退出处理器最小化**：SimpleSvm 的 `SvHandleVmExit` 只 `vmload host` + 处理
+   CPUID/MSR/VMRUN，**绝不** `KeRaiseIrqlToDpcLevel` 以下做任何可阻塞/文件/内存分配；
+   连日志都被刻意禁（"NT API in VMEXIT → deadlock/corruption"）。YGHV 的
+   `svm_dispatch_exit` 在 diag 版里曾写 trace（已挪到观察者），但观察者线程本身仍是
+   guest 态普通线程做 NtWriteFile——204 的 `CORRUPT_LIST_ENTRY` 正落在这条写日志路径上，
+   说明此时内核链表已被破坏（破坏源在别处，写日志只是先崩）。
+
+**移植做法（推荐，避免重造 trampoline）**：不要在 203 骨架上继续改，而是
+**把 SimpleSvm 的 `SvLaunchVm`+`SvPrepareForVirtualization`+`SvHandleVmExit` 原样
+port 成 YGHV 内的 step205**（其 host 环用 SimpleSvm 的 VpData/HostStackLayout 布局与
+"DriverEntry 线程即 host 环"模型），仅把两处 handler 换成 YGHV 语义：CPUID 处理里
+加 VMMCALL/心跳识别、以及后续挂 NPF 页保护。**NPT 复用 YGHV 现有 `g_npt`。**
+这样"能跑的进出模型"逐字来自 C0 已验证的 SimpleSvm，差异只剩我们主动加的 hook，
+可二分定位。**代价**：205 是新 trampoline + 新 VpData 布局，实现约 200-300 行
+（含 asm），且**每轮验证要一次 boot**；预计 2-4 轮收敛。C0（原版 SimpleSvm）已是
+"移植正确即会工作"的下界证明——若 205 port 忠实却仍不如 C0，即说明差异在我们引入的
+NPT 初始化或 handler，而不是进出模型。
+
+**执行前必须与用户确认**：这仍是持续消耗物理重启的硬活；C0 已达成关键科学结论
+（OS-as-guest 在本机可行）。是否现在就投入 205 移植，由用户定。
