@@ -291,6 +291,13 @@ static volatile LONG g_s203_abort = 0;
  * guest core exits; the host stays up and progress.log keeps the cause). */
 volatile BOOLEAN g_s203_lean = FALSE;
 volatile LONG g_s203_exit_log = 0;
+/* 9.231 step204: when TRUE, the guest continuation does NOT keep a yghv poll
+ * thread on the core — it PsTerminateSystemThreads in GUEST mode immediately,
+ * returning the core to the normal guest OS (the SimpleSvm-like steady state:
+ * a persistent per-core host loop only services synchronous CPUID/VMRUN
+ * VMEXITs; no host/guest split-brain, no busy poll thread mutating scheduler
+ * state on a core that Windows still thinks is a normal processor). */
+volatile BOOLEAN g_s204_ret_immediately = FALSE;
 /* 9.229c2: set (pure memory) by the dispatch island when an unexpected exit
  * occurs; the observer thread logs it from normal host context. */
 volatile uint64_t g_s203_unexpected_exit = 0;
@@ -1902,6 +1909,18 @@ static VOID yghv_os_guest_simplevm_thread(PVOID ctx) {
     svm_trampoline_os_enter(v, 1);   /* IF=1: guest services interrupts natively */
 
     /* ---- from here on this code executes in GUEST mode on this core ---- */
+    if (g_s204_ret_immediately) {
+        /* 9.231 step204: hand this core straight back to the guest OS. The
+         * per-core host loop inside svm_trampoline_os_enter persists and
+         * services only synchronous CPUID/VMRUN VMEXITs; nothing of ours runs
+         * continuously on the core and no core stays in host mode — the exact
+         * shape C0's SimpleSvm has and that survives on this silicon. The guest
+         * thread terminates normally IN guest context (a plain Windows thread
+         * exit), so the host_stack (separately allocated in svm_prepare_vcpu)
+         * is unaffected. Reboot clears this experiment (no fast stop channel). */
+        yghv_trace_u64("s204 ret-to-guest", core);
+        PsTerminateSystemThread(STATUS_SUCCESS);
+    }
 #ifdef YGHV_203Q
     /* 203-q single-variable experiment (hypothesis: the busy `pause` spin-loop
      * this yghv thread runs IN guest is what, once the guest also takes a real
@@ -2248,7 +2267,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         return STATUS_NOT_FOUND;
     /* 9.227: bound raised from 202 -> 203 to admit the SimpleSvm-equivalent
      * all-core resident step. */
-    if (step > 203)
+    if (step > 204)
         return STATUS_NOT_IMPLEMENTED;
     yghv_trace_u64("bm step", (uint64_t)step);
     yghv_trace("bm start");
@@ -4235,7 +4254,7 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         return STATUS_SUCCESS;
     }
 
-    if (step == 203) {
+    if (step == 203 || step == 204) {
         ULONG i;
         ULONG j;
         ULONG bm_cores = g_vcpu_count;
@@ -4260,20 +4279,24 @@ static NTSTATUS yghv_baremetal_step_test(int step) {
         g_s203_lean = TRUE;
         InterlockedExchange(&g_s203_exit_log, 40);
         yghv_trace("s203 lean diag armed");
+        g_s204_ret_immediately = (step == 204) ? TRUE : FALSE;
+        if (step == 204)
+            yghv_trace("s204 all-core ret-to-guest mode armed");
 #ifdef YGHV_SINGLECORE
         /* 203-s 单变量隔离：只让 core1 进 guest（原生 tick/上下文切换照旧），
          * core0 保持宿主态——alive/watchdog/DriverEntry 尾日志都在 host 侧产出，
          * guest 停摆时 watchdog 能数到 3s 主动 0xE2 留 dump。
          * 区分"guest 原生中断处理即死" vs "全核/SMP 进入才是变量"。 */
-        if (bm_cores < 2) {
+        if (step == 203 && bm_cores >= 2) {
+            bm_cores = 1;
+            s203_base = 1;
+            yghv_trace("s203 single-core mode (guest=core1, core0 host)");
+        } else if (step == 203) {
             g_os_resident_mode = FALSE;
             g_os_resident_log_active = FALSE;
             LOG_ERROR("bm step 203 SINGLECORE: need >=2 cores");
             return STATUS_UNSUCCESSFUL;
         }
-        bm_cores = 1;
-        s203_base = 1;
-        yghv_trace("s203 single-core mode (guest=core1, core0 host)");
 #endif
         InterlockedExchange(&g_s203_ready, 0);
         InterlockedExchange(&g_s203_go, 0);
