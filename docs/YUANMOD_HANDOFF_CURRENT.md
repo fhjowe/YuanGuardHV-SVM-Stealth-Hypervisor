@@ -4397,3 +4397,45 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：机器已重启、SVM 空闲；测试服务 `yuang203e/yuang203d/yuang203/SimpleSvm` 均已
   `sc delete`；C 盘稳定版 `70888311` 未动；证据 dump/progress 归档 `D:\aaaaaavm\`。
 - 提交：本记录（含 203-diag2 代码：窗口纯内存 fail-close + 观察者线程 + g_s203_* 诊断门控）。
+
+### 9.230 2026-09-18 203-q 单变量实验：busy-pause 不是近因；定性收敛到「部分核 guest + 共享 CR3」架构不自洽
+
+- 承接 9.229 下一步选项 A。构建 `YGHV_203Q=1 + SINGLECORE + STEP=203`
+  （镜像 `yuanguard_hv_step203q_20260918.sys`，SHA256 `e2fb24ff...`）：
+  **唯一改动** = guest 核延续体把 `while(rdtsc delta) pause` 忙等自旋，换成
+  `KeDelayExecutionThread(5ms)` + 每轮一次 CPUID（停止响应不变）。目的：验证
+  "guest 核上的 busy-pause 轮询与真实 DPC 交接不干净" 是否为 0xB8 近因。
+- **实机结果：更早就崩**。soak 刚开始（`c4_soak_q.log` 仅 `soak start` 一行，
+  round 1 未到）约 1 分钟内 → **0x139 KERNEL_SECURITY_CHECK_FAILURE**（非 diag2 的
+  0xB8）。dump（`yghv_bsod_203q_0x139.dmp`，`...7765-01.dmp`）栈：崩溃线程含
+  `yuanguard_hv_s203q+0x30b2 → KeDelayExecutionThread`，以及
+  `RtlpGetStackLimits ← IoGetStackLimits ← FLTMGR!FltpFastIoWrite ← IopWriteFile ←
+  NtWriteFile ← yuanguard_hv_s203q+0x132d`（观察者/trace 的 ZwWriteFile）→ 内核栈边界
+  完整性检查失败。progress.log 尾部：obs exits 停在 0x64（100 次）即崩，比 diag2
+  的 ~115s 明显更早。
+- **判定：把 busy-pause 换成 sleep 不但没修好，反而更早、换码死 → busy-pause 不是近因，
+  变量被排除。** 结合两次不同 bugcheck（0xB8 idle/DPC、0x139 stack-limit）都落在
+  "调度器/栈/DPC 记账被破坏" 一类，根因收敛到**架构级不自洽**：
+  1. 203 是"**部分核进 guest、其余核保持 host 常态，且两者共享同一个 Windows 内核实例 +
+     同一份 CR3 + 同一套 KPCR/DPC 队列/调度器结构**"；guest 核每次 VMEXIT 又切到
+     我们 per-core 的 4 页 host_stack、以 VMM 的 GS 跑一段 dispatch 再 VMRUN 回去。
+  2. 于是 guest 核既是"运行普通 Windows 线程的处理器"（会真取时钟中断/DPC/上下文切换、
+     会改共享内核结构），又周期性被我们的 host 窗口劫持；两条时间线交错破坏
+     调度器/栈/DPC 记账 → 0xB8 / 0x139，快慢只是命中竞争的运气（C1s 15s、diag2 115s、
+     203-q 60s）。
+- **唯一被本机实机验证可用的对照 = C0 原版 SimpleSvm**，它的关键与 203 的差异：
+  - 全部核都从**各自的 DriverEntry 线程上下文无缝进 guest**（`ret` 回真实 OS 代码流），
+    **没有"一部分核 guest + 一部分核 host 共享一个内核"的混态**；
+  - VMEXIT 处理器**只处理同步退出（CPUID/VMRUN/EFER 写），绝不跑 NT API、无独立
+    4 页 host_stack 调度劫持**；guest = 正常 Windows 服务自己的所有中断/DPC/调度。
+- **下一步方向（选项 2，需较大改动，但离线可做，之后仅需一次重启验证）**：
+  放弃"203 部分核 guest"骨架，改为**照搬 SimpleSvm 的进出与宿主态模型**——
+  全核从各自线程无缝进入、退出岛仅同步退出零 NT 调用、去掉 observer 的 ZwWriteFile
+  （改纯内存计数 + 需要时经控制面在 host 常态线程里落盘）。把 YGHV 的保护语义
+  （NPF 页保护 / VMMCALL 认证）作为"同步退出处理器"挂上去，而非依赖轮询/宿主 ISR。
+  这是一次结构重写，不是又一个门控变体；实现可全部离线完成后，再用一次实机重启验证。
+- **状态**：203/203-s/diag/diag2/203-q 系列实机全部 FAIL，但每次都把问题从"静默无解"
+  推进到"有 dump 有结论"，最终锁定架构根因；C0 成功仍成立（非平台）。测试服务已清、
+  C:\ 测试镜像已删、稳定版 `70888311` 未动、SVM 空闲。dump/progress 证据归档
+  `D:\aaaaaavm\`（`yghv_bsod_203q_0x139.dmp`、`c4_progress.log` 等）。
+- 提交：本记录（含 203-q 代码：YGHV_203Q 门控 + build.bat 透传）。

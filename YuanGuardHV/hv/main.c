@@ -1902,6 +1902,23 @@ static VOID yghv_os_guest_simplevm_thread(PVOID ctx) {
     svm_trampoline_os_enter(v, 1);   /* IF=1: guest services interrupts natively */
 
     /* ---- from here on this code executes in GUEST mode on this core ---- */
+#ifdef YGHV_203Q
+    /* 203-q single-variable experiment (hypothesis: the busy `pause` spin-loop
+     * this yghv thread runs IN guest is what, once the guest also takes a real
+     * clock interrupt/DPC on this core, leaves the IRQL/DPC handoff unclean ->
+     * 0xB8 ATTEMPTED_SWITCH_FROM_DPC). Replace busy-wait with a NORMAL sleep so
+     * this core yields like any other guest thread. Keep one CPUID/iteration as
+     * the stop-sensing VMEXIT (dispatch returns 1 on stop -> host_done). */
+    for (;;) {
+        LARGE_INTEGER nap;
+        if (g_os_guest_stop_requested)
+            break;
+        nap.QuadPart = -5LL * 10000LL;   /* 5 ms, like a normal guest worker */
+        KeDelayExecutionThread(KernelMode, FALSE, &nap);
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(1) : "memory");
+    }
+#else
     for (;;) {
         t0 = __rdtsc();
         __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
@@ -1909,6 +1926,7 @@ static VOID yghv_os_guest_simplevm_thread(PVOID ctx) {
         while ((__rdtsc() - t0) < YGHV_S203_POLL_TSC)
             __asm__ volatile("pause");
     }
+#endif
 }
 
 static VOID yghv_os_guest_resident_delay_thread(PVOID ctx) {
