@@ -22,6 +22,11 @@
 extern npt_mgr_t g_npt;
 extern ULONG     g_vcpu_count;
 
+/* step205b diagnostics: write-through traces, used ONLY in bare-metal / guest
+ * syscall context (never inside the VMEXIT island). */
+void yghv_trace(const char *msg);
+void yghv_trace_u64(const char *label, uint64_t v);
+
 /* ---- low-level helpers (clang-cl; we avoid intrin.h / RtlCaptureContext) ---- */
 static uint64_t p_read_msr(uint32_t msr) {
     uint32_t lo, hi; __asm__ volatile("rdmsr":"=a"(lo),"=d"(hi):"c"(msr));
@@ -105,6 +110,10 @@ typedef struct _SVP_VPD {
     DECLSPEC_ALIGN(PAGE_SIZE) vmcb_t GuestVmcb;   /* page-aligned */
     DECLSPEC_ALIGN(PAGE_SIZE) vmcb_t HostVmcb;
     DECLSPEC_ALIGN(PAGE_SIZE) uint8_t HostStateArea[PAGE_SIZE];
+    /* step205b (appended AFTER the page-aligned regions so their offsets are
+     * untouched): this CPU's index + a bounded bad-exit counter for fail-safe. */
+    ULONG CpuIndex;
+    volatile LONG BadExits;
 } SVP_VPD, *PSVP_VPD;
 
 _Static_assert(offsetof(SVP_VPD, GuestVmcb) % PAGE_SIZE == 0, "GuestVmcb page-aligned");
@@ -125,6 +134,20 @@ void yghv_sv_launch(void *HostRsp);   /* svm_simplevm_port.S */
 #define SVP_CPUID_UNLOAD      0x41414141u
 #define SVP_MAGIC             0x504D5653u   /* 'SVMP' */
 
+/* Devirtualize THIS cpu (pure memory + privileged ops; safe inside the GIF=0
+ * VMEXIT island — no NT calls). Sets the SvLV20 return contract so the asm
+ * resumes bare metal at the instruction after the faulting/backdoor CPUID. */
+static void p_devirt(PSVP_VPD Vpd, GUEST_REGS *Regs) {
+    Regs->Rax = (uint32_t)(UINT_PTR)Vpd;
+    Regs->Rdx = (uint64_t)((UINT_PTR)Vpd >> 32);
+    Regs->Rbx = Vpd->GuestVmcb.control.next_rip;
+    Regs->Rcx = Vpd->GuestVmcb.state.rsp;
+    p_vmload(Vpd->hs.GuestVmcbPa);           /* load guest segs */
+    p_write_msr(MSR_EFER, p_read_msr(MSR_EFER) & ~(uint64_t)EFER_SVME);
+    p_stgi();                                /* re-enable interrupts */
+    p_writeeflags(Vpd->GuestVmcb.state.rflags);
+}
+
 /* VMEXIT island: synchronous CPUID/VMRUN only, zero NT calls, zero I/O. */
 BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs);
 BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
@@ -141,16 +164,7 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
             Regs->Rax = SVP_MAGIC; Regs->Rbx = 0; Regs->Rcx = 0; Regs->Rdx = 0;
         } else if (leaf == SVP_CPUID_UNLOAD) {
             if ((Vpd->GuestVmcb.state.ss_attrib & 0x60u) == 0) {   /* DPL0 */
-                /* per-CPU devirtualize (SvLaunchVm SvLV20 tail contract):
-                 * RBX=return rip, RCX=guest rsp, RDX:RAX=vpd. */
-                Regs->Rax = (uint32_t)(UINT_PTR)Vpd;
-                Regs->Rdx = (uint64_t)((UINT_PTR)Vpd >> 32);
-                Regs->Rbx = Vpd->GuestVmcb.control.next_rip;
-                Regs->Rcx = Vpd->GuestVmcb.state.rsp;
-                p_vmload(Vpd->hs.GuestVmcbPa);           /* load guest segs */
-                p_write_msr(MSR_EFER, p_read_msr(MSR_EFER) & ~(uint64_t)EFER_SVME);
-                p_stgi();                                /* re-enable interrupts */
-                p_writeeflags(Vpd->GuestVmcb.state.rflags);
+                p_devirt(Vpd, Regs);
                 exit_vm = TRUE;
                 break;
             }
@@ -162,6 +176,7 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
         }
         Vpd->GuestVmcb.state.rip = Vpd->GuestVmcb.control.next_rip;
         Vpd->GuestVmcb.state.rax = Regs->Rax;
+        Vpd->BadExits = 0;                    /* healthy exit resets the bail */
         break;
     case SVM_EXIT_VMRUN:
         /* guest executed VMRUN (would nest) — inject #GP. */
@@ -169,8 +184,15 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
             (1ULL << 31) | (3ULL << 8) | 13ULL;
         break;
     default:
-        /* unexpected synchronous exit: advance & continue (never BugCheck in-window). */
+        /* step205b bounded fail-safe: an unexpected exit (e.g. #VMEXIT_INVALID from
+         * a bad VMCB) would otherwise spin VMRUN->VMEXIT_INVALID forever and silently
+         * hard-lock the box. After 16 consecutive bad exits, devirtualize THIS cpu
+         * so the machine survives and DriverEntry can return. No in-window trace. */
         Vpd->GuestVmcb.state.rip = Vpd->GuestVmcb.control.next_rip;
+        if (InterlockedIncrement(&Vpd->BadExits) > 16) {
+            p_devirt(Vpd, Regs);
+            exit_vm = TRUE;
+        }
         break;
     }
     return exit_vm;
@@ -218,16 +240,20 @@ static NTSTATUS p_virtualize_one(SVP_SHARED *shared) {
     PSVP_VPD v;
     SIZE_T total;
     int cp[4];
+    ULONG cpu = KeGetCurrentProcessorNumber();
 
     p_capture(&c);                          /* c.rip = installed-check on 2nd pass */
     __cpuidex(cp, SVP_CPUID_INSTALLED, 0);
-    if ((uint32_t)cp[0] == SVP_MAGIC)       /* already virtualized (guest 2nd pass) */
+    if ((uint32_t)cp[0] == SVP_MAGIC) {     /* already virtualized (guest 2nd pass) */
+        yghv_trace_u64("s205 guest-return cpu", (uint64_t)cpu);  /* normal guest syscall */
         return STATUS_SUCCESS;
+    }
 
     total = (sizeof(SVP_VPD) + PAGE_SIZE - 1) & ~(SIZE_T)(PAGE_SIZE - 1);
     v = (PSVP_VPD)MmAllocateContiguousMemory(total, (PHYSICAL_ADDRESS){ .QuadPart = -1 });
     if (!v) return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(v, total);
+    v->CpuIndex = cpu;
 
     p_write_msr(MSR_EFER, p_read_msr(MSR_EFER) | EFER_SVME);
 
@@ -240,6 +266,9 @@ static NTSTATUS p_virtualize_one(SVP_SHARED *shared) {
     p_vmsave(v->hs.HostVmcbPa);             /* snapshot host segs for VMLOAD on exit */
     InterlockedIncrement(&shared->ProcessorsVirtualized);
 
+    /* step205b: last safe (bare-metal) milestone before this cpu enters guest.
+     * If the next boot stops here, entry into VMRUN for THIS cpu is where it hangs. */
+    yghv_trace_u64("s205 pre-vmrun cpu", (uint64_t)cpu);
     yghv_sv_launch(&v->hs.GuestVmcbPa);     /* host loop; returns only after unload */
     MmFreeContiguousMemory(v);              /* reached only if this CPU was unloaded */
     return STATUS_SUCCESS;
