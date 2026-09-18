@@ -4439,3 +4439,43 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   C:\ 测试镜像已删、稳定版 `70888311` 未动、SVM 空闲。dump/progress 证据归档
   `D:\aaaaaavm\`（`yghv_bsod_203q_0x139.dmp`、`c4_progress.log` 等）。
 - 提交：本记录（含 203-q 代码：YGHV_203Q 门控 + build.bat 透传）。
+
+### 9.231 2026-09-18 step204（全核 ret-to-guest）也 FAIL：单变量增量法耗尽，根因锁定在我们 trampoline 的 guest↔host 状态交接
+
+- 承接 9.230 选项 A。step204 = 最贴近 SimpleSvm 语义、但**不重写整套 trampoline** 的
+  最小增量：**全部核**进入 guest；guest 延续体进入后**立即 `PsTerminateSystemThread`
+  （在 guest 上下文的普通线程退出）**——即"交还该核给正常 guest OS"，**去掉占用 guest
+  核的常驻 cpuid/pause 轮询线程**；退出岛仍只处理同步 CPUID/VMRUN/VMMCALL、零 NT 调用；
+  observer 落盘保留（全核 guest 下 observer 是普通 guest 线程）。代码 `main.c`：
+  `g_s204_ret_immediately` + 进入后 ret-to-guest 分支 + `step==203||204` 共用编排 +
+  上界守卫 `>204`；构建 `YGHV_BAREMETAL_STEP=204`（镜像 `d1f82dcd...`，字符串级验证
+  `s204 all-core ret-to-guest mode armed` 命中、单核串 0 命中）。默认构建 + 静态检查全 PASS。
+- **实机（机器本次 SVM 空闲，启动未耗重启，11:45 崩）：仍 FAIL，且更早。** bugcheck
+  **0x139 KERNEL_SECURITY_CHECK_FAILURE，subtype 3 = CORRUPT_LIST_ENTRY**。dump 栈：
+  `KeBugCheckEx←KiFastFailDispatch←KiRaiseSecurityCheckFailure←KeWaitForSingleObject←
+  IopWaitForLockAlertable←…IopWriteFile←NtWriteFile←yuanguard_hv_s204+0x132d`
+  （+0x132d = 我们的 trace/ZwWriteFile 站点）。progress.log 尾部：仅进了一半核（7/12）
+  就崩，无 `bm done`。归档 `D:\aaaaaavm\yghv_bsod_204_0x139_cl.dmp`；已删 1.2GB 全量
+  MEMORY.DMP，保留 Minidump + 归档。
+- **查证 + 结论**：核对 `svm_prepare_vcpu`——VMEXIT 后 `VMLOAD host_vmcb` 的 host GS/
+  KERNEL_GS/TR 来源已在 441-442 行 `vmsave vmcb_pa` + `vmsave host_vmcb_pa` 正确快照，
+  故"host GS 未初始化"假设**排除**。0x139_CORRUPT_LIST_ENTRY 是 guest Windows 内部
+  dispatcher 链表被破坏，由我们 observer 的文件写**最先撞上**（症状点≠根因点）——
+  与历史 `KiAbProcessContextSwitch MISSING_GSFRAME`（9.165/9.170/9.175）同族。
+- **单变量增量法到此耗尽**：已逐一排除 平台(C0 PASS)/全核vs单核(C1s)/窗口内 NT API
+  (diag2 岛干净、sc stop 1.8s)/busy-pause(203-q)/**常驻轮询线程(204 已移除仍崩)**。
+  剩余唯一未排除变量 = **我们 `svm_os_seamless_cont`+`svm_trampoline_os_enter` 进出模型的
+  某处 guest↔host 状态交接细节**（RSP 切换/seamless-ret 帧/host_stack 复用/段与 MSR 快照
+  时机）与 SimpleSvm `SvLaunchVm`/`SvHandleVmExit` 的差异——这需要**逐行对齐移植 + 多轮
+  dump 验证**，不是一轮猜能锁死的。
+- **决策（停止盲试）**：不再连续消耗用户重启做盲猜增量。下一步二选一，交用户定：
+  (A) **专门立项做 SimpleSvm-faithful 进出移植**：以 thirdparty/SimpleSvm 的 `SvLaunchVm`
+      (asm) + `SvHandleVmExit` + VpData/HostStackLayout 为准逐行重写我们 OS-as-guest 进出，
+      每轮一次 boot+dump 收敛（预计数轮）；风险高、耗重启多，但直接消除已知唯一差异。
+  (B) **收口**：把"OS-as-guest 整机隐形"作为**已知需换用 SimpleSvm 式专用骨架**的远期项，
+      当前非驻留保护主线（已全绿）不受影响；本 9.227-9.231 弧线作为"为何不能用现有
+      trampoline 做常驻 OS-guest"的完备负结果档案封存。
+- **状态**：机器 11:46 崩溃后已重启、SVM 空闲；测试服务 `yuang204`/`yuang203*` 均不在；
+  C:\ 测试镜像已清；C 盘稳定版 `70888311` 未动；证据 dump/progress 归档 `D:\aaaaaavm\`；
+  step204 代码已提交（f312ffe）。
+- 提交：本记录。
