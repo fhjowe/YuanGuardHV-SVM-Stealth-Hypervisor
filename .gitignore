@@ -41,3 +41,6 @@ _dsh_probe*.js
 # 上游参考克隆（SimpleSvm 等，见 docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md；
 # 重新拉取：curl -L -o ss.tar.gz https://codeload.github.com/tandasat/SimpleSvm/tar.gz/refs/heads/master）
 thirdparty/
+
+# clang-cl 编译 svm_simplevm_port.S 生成的中间汇编（与 svm_trampoline.asm 同类）
+YuanGuardHV/svm_simplevm_port.asm

@@ -90,7 +90,25 @@ echo   svm_simplevm_port.S
 "%CLANG_CL%" %CFLAGS% %INCLUDES% /c /Fo"%BIN_DIR%\svm_simplevm_port_asm.obj" "%HV_DIR%\svm_simplevm_port.S"
 if errorlevel 1 goto :error
 
+set "SVP206_OBJS="
+if not "%YGHV_BAREMETAL_STEP%"=="206" goto :no206
+rem step206-A: vendored VERBATIM upstream SimpleSvm as the entry vehicle.
+rem C++ .cpp via MSVC cl + .asm via ml64, using the proven build_simplesvm flags.
+set "MSVC_DIR=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207"
+set "SS_INC=%WDK_ROOT%\Include\10.0.26100.0\km\crt;%WDK_ROOT%\Include\10.0.26100.0\km;%WDK_ROOT%\Include\10.0.26100.0\shared;%WDK_ROOT%\Include\10.0.26100.0\shared\win32;%WDK_ROOT%\Include\10.0.26100.0\ucrt;%MSVC_DIR%\include"
+set "SS_LIB=%WDK_ROOT%\Lib\10.0.26100.0\km\x64;%MSVC_DIR%\lib\x64"
+echo   svm_simplevm206_x64.asm (ml64)...
+"%MSVC_DIR%\bin\Hostx64\x64\ml64.exe" /nologo /c /Fo"%BIN_DIR%\svm_simplevm206_asm.obj" "%HV_DIR%\svm_simplevm206_x64.asm"
+if errorlevel 1 goto :error
+echo   svm_simplevm206.cpp (cl)...
+set "INCLUDE=%SS_INC%"
+"%MSVC_DIR%\bin\Hostx64\x64\cl.exe" /nologo /c /kernel /O2 /GS- /GR- /EHs-c- /Zl /std:c++17 /utf-8 /D_AMD64_ /DNDEBUG /DNTDDI_VERSION=0x0A000005 /D_WIN32_WINNT=0x0A00 /DYGHV_BAREMETAL_STEP=%YGHV_BAREMETAL_STEP% /Fo"%BIN_DIR%\svm_simplevm206.obj" "%HV_DIR%\svm_simplevm206.cpp"
+if errorlevel 1 goto :error
+set "SVP206_OBJS="%BIN_DIR%\svm_simplevm206.obj" "%BIN_DIR%\svm_simplevm206_asm.obj""
+:no206
+
 echo   Linking (MSVC)...
+set "LIB=%SS_LIB%"
 "%MSVC_LINK%" %LINKS% /OUT:"%BIN_DIR%\yuanguard_hv.sys" ^
     "%BIN_DIR%\main.obj" ^
     "%BIN_DIR%\svm_core.obj" ^
@@ -104,6 +122,7 @@ echo   Linking (MSVC)...
     "%BIN_DIR%\svm_simplevm_port.obj" ^
     "%BIN_DIR%\svm_simplevm_port_asm.obj" ^
     "%BIN_DIR%\svm_trampoline.obj" ^
+    !SVP206_OBJS! ^
     ntoskrnl.lib
 if errorlevel 1 goto :error
 

@@ -4767,3 +4767,40 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 状态：205k 结论落档；机器未加载；稳定版 `70888311` 未动；SimpleSvm 服务需重启清除
   （无在线卸载，同 C0）。
 - 提交：本记录。
+
+### 9.244 2026-10-03 step206-A 实现完成（用户选"搬上游原码进树"）：vendored 逐字上游 SimpleSvm 作为进入载体，三套构建全绿，离线验证签名，待用户一次 boot
+
+- 承 9.243 判决：手抄副本 = bug 源；正确做法 = **不再重写，编译上游原码进我方工程**。
+- **step206-A 集成（三个缝合点，vendored 代码逐字保留）**：
+  1. `hv/svm_simplevm206.cpp/.hpp/_x64.asm` = 上游 SimpleSvm master 的逐字拷贝
+     （含 C0 的两处 ExAllocatePool 兼容补丁与 205k 无关；MIT (c) Satoshi Tanda，
+     版权头原样保留）。缝合仅两处：`DriverEntry`→`Sv206Entry`（避免与 main.c 冲突）、
+     asm 符号 `SvLaunchVm`→`Sv206LaunchVm`；其余零改动。
+  2. `main.c DriverEntry` 顶部：`#if YGHV_BAREMETAL_STEP == 206 → return Sv206Entry(d,r)`
+     ——**先于** yghv 自身 init 序列，行为=C0 的 SimpleSvm.sys 独立加载等价（不碰 SVM
+     初始化/NPT/trace），只是住进我们的镜像。
+  3. `build.bat`：STEP=206 时 ml64 编 asm + MSVC cl 编 cpp（/GS-、26100 SDK include/lib
+     通道，参数与 build_simplesvm 相同经验证），两 obj 条件入链；非 206 完全跳过。
+- **离线验证（全绿）**：默认构建成功且 vendored 标记（宽串 `PowerState`，仅 Sv206Entry
+  引用）=0；STEP=205 =0（回归不受污染）；STEP=206 =1（**硬判据：vendored 码确实入链
+  且门控隔离**）。镜像 `90e0b924...` 归档 `D:\aaaaaavm\yuanguard_hv_step206a_20260918.sys`
+  （注：曾一度构建出带 thirdparty 205k 判据补丁污染的 `6e47719a`，已撤销该补丁重建为
+  干净 206-A；`InterceptException=0xFFFFBFFF`/SHUTDOWN 块与 handler 0x2050b 出口均恢复
+  上游原样——206-A 基线必须 C0 行为等价，否则会把 Windows 的良性 #GP 探针变成本实验的
+  0xE2。diff 证实 vendored 副本与上游仅剩 4 处缝合：include 改名、SvLaunchVm→Sv206LaunchVm、
+  DriverEntry→Sv206Entry、C0 pool 兼容补丁；hpp/asm 逐字一致）。
+  坑实录：SS_INC 误指 19041（无 shared/basetsd.h）→改 26100；/GS 拉入
+  `__security_check_cookie` 未解析→/GS-。
+- **验证脚本 `D:\aaaaaavm\run_c7_step206.ps1`**（用户执行）：清理残留服务→部署→
+  `sc create/start yuang206`→4 轮 CPUID/调度压测 ~7min（C0 同剖面）。**不 sc stop**：
+  上游无在线卸载通道（9.228 quirk），测完重启清除（demand-start 不自加载）。
+- **预期与判读**：
+  - 成功（预期高，= C0 行为等价）：进入 + 7min 压测存活 → **OS-as-guest 进入基座正式
+    进入 YGHV 代码库**；下一步 206-B = NCr3 切 `g_npt`（保持上游逐字，只改这一行）+
+    接 control device/VMMCALL 认证；206-C = 在 handler 的 default/CPUID 扩展点挂
+    NPF 页保护与卸载通道（把 sc stop 补回来）。
+  - 若 206-A 反而冻（C0 单独不冻的话）：说明"住进 yuanguard 镜像"引入了新变量
+    （PE 布局/加载顺序/与既有未用代码交互），届时用"206-A 与 C0 同镜像环境二分"处理。
+- 状态：代码+文档本次提交；机器未加载 206；稳定版 `70888311` 未动；SimpleSvm/yuang203-205
+  残留服务由 run_c7 启动前自动 delete。
+- 提交：本记录。

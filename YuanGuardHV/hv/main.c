@@ -4917,6 +4917,21 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     ULONG i;
     ULONG online;
 
+#if YGHV_BAREMETAL_STEP == 206
+    /* step206-A (9.244): run the VERBATIM vendored upstream SimpleSvm entry body
+     * (svm_simplevm206.cpp/.hpp/.asm; only renamed DriverEntry->Sv206Entry) as
+     * the OS-as-guest entry vehicle. 205k proved this exact upstream code + our
+     * control-area deltas enters real Windows fine; hand-copied variants (205x)
+     * all froze at first VMRUN, so we stop re-writing and compile the original.
+     * Its own NPT (SvBuildNestedPageTables) stays in place for 206-A to keep the
+     * only changed variable vs C0 = "coexists with yuanguard in one image";
+     * switching NCr3 to g_npt is the 206-B follow-up once entry is proven. */
+    {
+        extern NTSTATUS Sv206Entry(struct _DRIVER_OBJECT *, PUNICODE_STRING);
+        return Sv206Entry(d, r);
+    }
+#endif
+
 #if YGHV_LOADER_STEALTH
     yghv_loader_stealth(d, r);
 #endif
