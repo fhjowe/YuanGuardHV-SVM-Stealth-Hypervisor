@@ -110,14 +110,23 @@ typedef struct _SVP_VPD {
     DECLSPEC_ALIGN(PAGE_SIZE) vmcb_t GuestVmcb;   /* page-aligned */
     DECLSPEC_ALIGN(PAGE_SIZE) vmcb_t HostVmcb;
     DECLSPEC_ALIGN(PAGE_SIZE) uint8_t HostStateArea[PAGE_SIZE];
-    /* step205b (appended AFTER the page-aligned regions so their offsets are
-     * untouched): this CPU's index + a bounded bad-exit counter for fail-safe. */
+    /* step205f: valid MSRPM (2 pages) + IOPM (3 pages), all-zero = permit every
+     * MSR / IO port natively. Every proven-good config on this machine (upstream
+     * SimpleSvm, YGHV 203) sets NON-ZERO page-aligned bases; leaving them 0 is
+     * the one remaining delta and a candidate VMEXIT_INVALID source. We still do
+     * NOT enable the MSR_PROT / IOIO intercepts, so the maps are simply valid
+     * and unused. */
+    DECLSPEC_ALIGN(PAGE_SIZE) uint8_t Msrpm[PAGE_SIZE * 2];
+    DECLSPEC_ALIGN(PAGE_SIZE) uint8_t Iopm[PAGE_SIZE * 3];
+    /* step205b diagnostics (appended after page-aligned regions): */
     ULONG CpuIndex;
     volatile LONG BadExits;
 } SVP_VPD, *PSVP_VPD;
 
 _Static_assert(offsetof(SVP_VPD, GuestVmcb) % PAGE_SIZE == 0, "GuestVmcb page-aligned");
 _Static_assert(offsetof(SVP_VPD, HostVmcb) % PAGE_SIZE == 0, "HostVmcb page-aligned");
+_Static_assert(offsetof(SVP_VPD, Msrpm) % PAGE_SIZE == 0, "Msrpm page-aligned");
+_Static_assert(offsetof(SVP_VPD, Iopm) % PAGE_SIZE == 0, "Iopm page-aligned");
 _Static_assert(offsetof(SVP_VPD, hs.Self) - offsetof(SVP_VPD, hs.GuestVmcbPa) == 0x10,
                "Self at HostRsp+0x10");
 
@@ -148,6 +157,18 @@ static void p_devirt(PSVP_VPD Vpd, GUEST_REGS *Regs, uint64_t resume_rip) {
     p_write_msr(MSR_EFER, p_read_msr(MSR_EFER) & ~(uint64_t)EFER_SVME);
     p_stgi();                                /* re-enable interrupts */
     p_writeeflags(Vpd->GuestVmcb.state.rflags);
+}
+
+/* step205f: park THIS cpu forever (host mode, GIF=0 already cleared by VMEXIT,
+ * cli+hlt -> only NMI/SMI could wake and the loop re-halts). Used for exits we
+ * cannot resume safely (VMEXIT_INVALID / unknown exitcode, where state.rip and
+ * nRIP are untrustworthy) — resuming there is what produced the wild jumps that
+ * corrupted unrelated kernel threads (stornvme 0xD1). A parked cpu keeps the
+ * machine ALIVE so the write-through progress log (VMCB dump) stays readable. */
+__declspec(noreturn) static void p_park_cpu(void) {
+    for (;;) {
+        __asm__ volatile("cli\n\thlt");
+    }
 }
 
 /* VMEXIT island: synchronous CPUID/VMRUN only, zero NT calls, zero I/O. */
@@ -191,15 +212,16 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
             (1ULL << 31) | (3ULL << 8) | 13ULL;
         break;
     default:
-        /* step205d: ANY guest exception (or unexpected exit) during entry means
-         * broken guest state. Record it memory-only (island-safe — NO file I/O,
-         * see 9.229) and devirtualize THIS cpu at once. A triple fault would
-         * otherwise drop the CPU into shutdown state = the observed silent
-         * hard hang with no dump. NOTE: do NOT touch state.rip here — for
-         * fault-like exits nRIP is invalid, so devirtualizing must resume bare
-         * metal at the FAULTING instruction (state.rip); the OS then raises the
-         * fault observably (bugcheck + dump) instead of jumping to rip 0 and
-         * shutting down silently again. */
+        /* step205f: whitelist handling. ANY guest exception during the entry
+         * window means broken guest state: record it memory-only (island-safe —
+         * NO file I/O, see 9.229), then devirtualize resuming at the FAULTING
+         * instruction (state.rip — nRIP is invalid on fault-like exits) so the
+         * OS raises the fault observably (bugcheck + dump). For ANY other
+         * unexpected exitcode (VMEXIT_INVALID, NPF, INTR, ...) state.rip and
+         * nRIP are untrustworthy — resuming there is what produced the wild
+         * jumps that corrupted unrelated kernel threads (stornvme 0xD1) — so
+         * park THIS cpu instead: the machine stays alive and the write-through
+         * VMCB dump in progress.log stays readable. */
         {
             SVP_SHARED *sh = Vpd->hs.Shared;
             if (sh && InterlockedCompareExchange(&sh->FaultSeen, 1, 0) == 0) {
@@ -210,8 +232,13 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
                 sh->FaultInfo2 = Vpd->GuestVmcb.control.exitinfo2;
             }
         }
-        p_devirt(Vpd, Regs, Vpd->GuestVmcb.state.rip);
-        exit_vm = TRUE;
+        if (exitcode >= SVM_EXIT_EXCEPTION_BASE &&
+            exitcode <  SVM_EXIT_EXCEPTION_BASE + 32) {
+            p_devirt(Vpd, Regs, Vpd->GuestVmcb.state.rip);
+            exit_vm = TRUE;
+        } else {
+            p_park_cpu();   /* noreturn */
+        }
         break;
     }
     return exit_vm;
@@ -235,6 +262,11 @@ static void p_prepare(PSVP_VPD v, PCONTEXT c, uint64_t ncr3) {
     g->control.tlb_control          = 0;
     g->control.ncr3                 = ncr3;
     g->control.np_enable            = 1;
+    /* step205f: valid, page-aligned, all-zero (permit-all) maps — matches every
+     * proven-good config (upstream SimpleSvm sets MSRPM; YGHV 203 sets MSRPM).
+     * The MSR_PROT/IOIO intercepts stay CLEAR, so these are valid but unused. */
+    g->control.msrpm_base_pa = MmGetPhysicalAddress(v->Msrpm).QuadPart;
+    g->control.iopm_base_pa  = MmGetPhysicalAddress(v->Iopm).QuadPart;
 
     g->state.gdtr_base = gdtr.b; g->state.gdtr_limit = gdtr.l;
     g->state.idtr_base = idtr.b; g->state.idtr_limit = idtr.l;
