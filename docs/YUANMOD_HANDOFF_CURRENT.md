@@ -4644,3 +4644,24 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   第一次能在线读到意外退出码与 RIP，据此直击根因；若蓝屏则照旧有 dump+记录。
 - 状态：205g 已提交；镜像归档；机器未加载 205；稳定版未动。
 - 提交：本记录。
+
+### 9.239 2026-09-18 205g 实机判读（用户提供现场）：静默硬冻=重新变盲 + SegSs 不可靠实锤；step205h = 除 #PF 外全异常拦截 + SS 硬件直读
+
+- 用户自行跑 205g：**静默硬冻**（无 dump、无新 bugcheck、progress 停在 cpu0 的 VMCB dump、
+  无 PARK 行）——与 205c 时代同型：无异常拦截时故障链（#GP/#UD→#DF→triple fault→shutdown）
+  无人接=盲。**三轮对照已把异常拦截的最优点钉死**：全拦（205d/e，抓到 CS.L 但合法 #PF
+  误伤→stornvme 0xD1）/全不拦（205g，静默冻）/驻车（205f，0x101）→ **甜点=除 #PF 外全拦**。
+- **新实锤：RtlCaptureContext 的 x64 SegSs 不可靠**——205e/f 读出 `ss=0x0000`、205g 读出
+  `ss=0x493`（=KGDT_R0_DATA 真描述符 `0x004093...`：D/B=1、G=0，1MB 限长，长模式下数据段
+  限长被忽略所以 Windows 用这种条目），同代码跨启动不同值=CONTEXT 字段陈旧/栈垃圾。
+  VMRUN 用 SS 描述符核 CPL，不能喂垃圾 → SS 选择子/属性改为 **`mov %%ss` 硬件直读**。
+- **step205h**（离线，构建/回归全绿，镜像 `f8f6ef67...`）：
+  1. 入口窗口 `exception_intercepts = 0xFFFFFFFF & ~(1<<14)`（除 #PF 全拦）；首个健康
+     CPUID 退出后清 0（恢复原生缺页流）；
+  2. `p_read_ss()`（`mov %%ss`）取 SS 选择子/属性（值读取无帧问题）；
+  3. 保留 MSR_PROT/EFER 写拦截（#GP）、非异常意外退出→park 前写穿记录、VMCB dump。
+- 下次 run_c6（用户执行）：若仍是 #PF 之外的致命故障 → 记录+devirt 可观测蓝屏（exit/rip
+  落日志）；若 park → park exit/rip 落日志；若进通 → guest-return 逐核 + DriverEntry
+  returns。三种路径全部有输出，不再有盲区。
+- 状态：205h 已提交；镜像归档；机器未加载 205；稳定版未动。
+- 提交：本记录。
