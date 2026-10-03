@@ -51,6 +51,12 @@ static uint64_t p_cr2(void) { uint64_t v; __asm__ volatile("mov %%cr2,%0":"=r"(v
 static uint64_t p_cr3(void) { uint64_t v; __asm__ volatile("mov %%cr3,%0":"=r"(v)); return v; }
 static uint64_t p_cr4(void) { uint64_t v; __asm__ volatile("mov %%cr4,%0":"=r"(v)); return v; }
 static uint16_t p_tr(void)  { uint16_t t; __asm__ volatile("str %w0":"=r"(t)); return t; }
+/* step205h: read SS from the register itself. RtlCaptureContext's SegSs is NOT
+ * reliable on x64 (205e/f read 0x0000 vs 205g 0x493 across boots with identical
+ * code — the field is stale/garbage), and VMRUN validates guest CPL from the SS
+ * descriptor, so the VMCB must get the hardware value. A plain value read has
+ * no frame problem (unlike the old p_capture). */
+static uint16_t p_read_ss(void) { uint16_t s; __asm__ volatile("mov %%ss,%0":"=r"(s)); return s; }
 static void p_vmsave(uint64_t pa) { __asm__ volatile("vmsave %0"::"r"(pa):"memory"); }
 static void p_vmload(uint64_t pa) { __asm__ volatile("vmload %0"::"r"(pa):"memory"); }
 static void p_stgi(void)    { __asm__ volatile("stgi"); }
@@ -184,6 +190,9 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
     switch (exitcode) {
     case SVM_EXIT_CPUID:
         leaf = Regs->Rax;
+        /* step205h: the guest is demonstrably executing — drop the entry-window
+         * exception interception so native page faults flow. */
+        Vpd->GuestVmcb.control.exception_intercepts = 0;
         if (leaf == SVP_CPUID_INSTALLED) {
             Regs->Rax = SVP_MAGIC; Regs->Rbx = 0; Regs->Rcx = 0; Regs->Rdx = 0;
         } else if (leaf == SVP_CPUID_UNLOAD) {
@@ -267,13 +276,17 @@ static void p_prepare(PSVP_VPD v, PCONTEXT c, uint64_t ncr3) {
 
     g->control.general1_intercepts  = INTERCEPT_CPUID | INTERCEPT_MSR_PROT;
     g->control.general2_intercepts  = INTR_GEN2(SVM_INTERCEPT_VMRUN);
-    /* step205g: control area now BYTE-IDENTICAL to upstream SimpleSvm (CPUID +
-     * MSR_PROT + VMRUN; exceptions NOT intercepted — the entry-window all-
-     * exception interception of 205d/205e/205f never produced a useful capture
-     * and is the last remaining control-area delta). MSRPM intercepts only the
-     * EFER write (protect SVME), APM layout: quadrant 0x1800 = writes of
-     * C000_0000-C000_1FFF, 1 bit per MSR: byte 0x1800 + (0x80/8) = 0x1810. */
-    g->control.exception_intercepts = 0;
+    /* step205h: intercept every exception EXCEPT #PF during the ENTRY window.
+     * Lessons across 205c..205g: with NO exception interception (205g) the fatal
+     * fault chain (#GP/#UD -> #DF -> triple fault -> cpu shutdown) is invisible
+     * = the silent hard freeze; with ALL interception (205d/e) we caught the
+     * CS.L bug but ALSO legit #PFs (stornvme 0xD1). Sweet spot: #PF flows
+     * natively (the OS pages constantly), every other fault is captured and
+     * devirtualized observably. The first healthy CPUID exit clears this back
+     * to 0 (VMCB clean bits are 0 -> control area re-read on every VMRUN).
+     * MSRPM intercepts only the EFER write (protect SVME), APM quadrant 0x1800
+     * layout: byte 0x1800 + (0x80/8) = 0x1810, bit 0. */
+    g->control.exception_intercepts = 0xFFFFFFFFu & ~(1u << 14);
     v->Msrpm[0x1810] |= 0x01;
     g->control.cr_read_intercepts   = 0;
     g->control.cr_write_intercepts  = 0;
@@ -291,11 +304,11 @@ static void p_prepare(PSVP_VPD v, PCONTEXT c, uint64_t ncr3) {
     g->state.idtr_base = idtr.b; g->state.idtr_limit = idtr.l;
     g->state.cs_selector = (uint16_t)c->SegCs; g->state.ds_selector = (uint16_t)c->SegDs;
     g->state.es_selector = (uint16_t)c->SegEs; g->state.fs_selector = (uint16_t)c->SegFs;
-    g->state.gs_selector = (uint16_t)c->SegGs; g->state.ss_selector = (uint16_t)c->SegSs;
+    g->state.gs_selector = (uint16_t)c->SegGs; g->state.ss_selector = p_read_ss();
     g->state.cs_attrib = p_seg_attrib((uint16_t)c->SegCs); g->state.cs_limit = p_seg_limit((uint16_t)c->SegCs);
     g->state.ds_attrib = p_seg_attrib((uint16_t)c->SegDs); g->state.ds_limit = p_seg_limit((uint16_t)c->SegDs);
     g->state.es_attrib = p_seg_attrib((uint16_t)c->SegEs); g->state.es_limit = p_seg_limit((uint16_t)c->SegEs);
-    g->state.ss_attrib = p_seg_attrib((uint16_t)c->SegSs); g->state.ss_limit = p_seg_limit((uint16_t)c->SegSs);
+    g->state.ss_attrib = p_seg_attrib(p_read_ss()); g->state.ss_limit = p_seg_limit(p_read_ss());
     g->state.tr_selector = p_tr();
     g->state.cr0 = p_cr0(); g->state.cr2 = p_cr2();
     g->state.cr3 = p_cr3(); g->state.cr4 = p_cr4();
