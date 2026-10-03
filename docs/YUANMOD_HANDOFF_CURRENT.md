@@ -4545,3 +4545,31 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
     逐条 diff（`Vpd->BadExits` 用内存计数不进日志，避免岛内 I/O）。
 - 状态：step205b 代码已提交；机器未加载 205；稳定版未动。等用户再跑一次 run_c6（诊断版）。
 - 提交：本记录。
+
+### 9.234 2026-09-18 step205 首测根因锁定（高置信）：p_capture 真实函数帧 → guest rip/rsp 落错 → triple fault → CPU shutdown（= 无 dump 静默假死）；修复 = step205c
+
+- **推理**：205 首测"进入即假死、无 dump、无 DriverEntry returns"——无 dump + 不自动重启
+  = 不是 bugcheck，而是 **guest 内 triple fault → CPU 进 shutdown 态**（205 未拦 SHUTDOWN，
+  整机静默挂死），这与 progress.log 停在 `SimpleSvm-port start` 完全一致。
+- **根因（与 SimpleSvm 逐行对比得出）**：SimpleSvm 依赖 **`RtlCaptureContext`（intrinsic/
+  ntoskrnl 导出）"捕获调用者上下文"的契约**——guest rip = SvVirtualizeProcessor 的
+  installed-check 行、guest rsp = 该函数自己的帧，二次进入时非易失寄存器完好、plain return
+  正确解栈。而我的 `p_capture` 是**普通 C 函数**：捕获到的 rip 落在 helper 内部、rsp 是
+  helper 帧 → 第一次 VMRUN 后 guest 从 helper 尾部执行、帧结构全错 → `ret` 到野地址 →
+  guest #PF/#GP（未拦异常）→ triple fault → shutdown。**完全解释首测全部现象。**
+- **修复（step205c，离线，零重启消耗）**：删除 `SVP_CTX`/`p_capture`；手工声明
+  `NTKERNELAPI VOID RtlCaptureContext(PCONTEXT)`（ntoskrnl 导出）；`p_virtualize_one`
+  重排为 SvVirtualizeProcessor 同构：`RtlCaptureContext(&ctx)` → installed-check（2nd pass
+  在此恢复并 return）→ 建链/准备/`yghv_sv_launch` → 其后 `KeBugCheck(MANUALLY_INITIATED_CRASH)`
+  （正常永不可达，镜像 SimpleSvm fail-loud）。`p_prepare` 改收 `PCONTEXT`（SegCs.. 为 DWORD）。
+  step205b 的 per-core trace 与 16 次有界失效保护保留。
+- **构建验证（全绿）**：205c 镜像 `a0c6021f...`（RtlCaptureContext 链接解析成功、
+  pre-vmrun trace 在）归档 `yuanguard_hv_step205_20260918.sys`；默认构建 + step203 回归通过。
+- 下一次 run_c6 判读升级：
+  - 走到逐核 `pre-vmrun` + `guest-return` + `DriverEntry returns` 且系统响应 → **进入模型通了**，
+    转稳态观察/叠保护语义；
+  - 仍崩但**这次有 dump**（三重故障被 fail-safe 或另有 bugcheck）→ 按新 dump 精确定位；
+  - 仍静默假死且 progress 停在 `pre-vmrun cpu0` → 剩余嫌疑收敛到 VMRUN 一致性检查或
+    `p_prepare` 字段，回到 asm 级逐条 diff x64.asm。
+- 状态：205c 代码已提交（89b746c）；机器未加载 205；稳定版未动。等用户再跑一次 run_c6。
+- 提交：本记录。
