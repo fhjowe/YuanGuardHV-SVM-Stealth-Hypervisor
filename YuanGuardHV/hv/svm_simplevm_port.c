@@ -22,6 +22,16 @@
 extern npt_mgr_t g_npt;
 extern ULONG     g_vcpu_count;
 
+/* 9.234 root-cause fix: the ntoskrnl-exported RtlCaptureContext captures the
+ * CALLER's rip/rsp/gprs (SimpleSvm relies on exactly this contract for its
+ * seamless 2nd-pass entry). Our previous p_capture was a REAL C call, so it
+ * captured its own frame: guest rip landed inside the helper and guest rsp was
+ * the helper's stack -> on the guest 2nd pass the frame was garbage -> ret to
+ * a wild address -> triple fault (no SHUTDOWN intercept) -> CPU shutdown state
+ * = the observed silent hard hang with no dump. NEVER wrap the capture in a
+ * helper function. */
+NTKERNELAPI VOID RtlCaptureContext(PCONTEXT ContextRecord);
+
 /* step205b diagnostics: write-through traces, used ONLY in bare-metal / guest
  * syscall context (never inside the VMEXIT island). */
 void yghv_trace(const char *msg);
@@ -45,29 +55,6 @@ static void p_vmsave(uint64_t pa) { __asm__ volatile("vmsave %0"::"r"(pa):"memor
 static void p_vmload(uint64_t pa) { __asm__ volatile("vmload %0"::"r"(pa):"memory"); }
 static void p_stgi(void)    { __asm__ volatile("stgi"); }
 static void p_writeeflags(uint64_t f) { __asm__ volatile("push %0\n\tpopfq"::"r"(f):"cc","memory"); }
-
-typedef struct {
-    uint64_t rip, rsp, rflags;
-    uint16_t cs, ds, es, fs, gs, ss;
-} SVP_CTX;
-
-static void p_capture(SVP_CTX *c) {
-    __asm__ volatile(
-        "lea 0(%%rip), %0\n\t"
-        "mov %%rsp, %1\n\t"
-        "pushfq\n\t"
-        "pop %2\n\t"
-        "mov %%cs, %3\n\t"
-        "mov %%ds, %4\n\t"
-        "mov %%es, %5\n\t"
-        "mov %%fs, %6\n\t"
-        "mov %%gs, %7\n\t"
-        "mov %%ss, %8\n\t"
-        : "=r"(c->rip), "=r"(c->rsp), "=r"(c->rflags),
-          "=r"(c->cs), "=r"(c->ds), "=r"(c->es),
-          "=r"(c->fs), "=r"(c->gs), "=r"(c->ss)
-        : : "memory");
-}
 
 static uint32_t p_seg_limit(uint16_t sel) {
     struct { uint16_t l; uint64_t b; } __attribute__((packed)) g;
@@ -198,7 +185,7 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
     return exit_vm;
 }
 
-static void p_prepare(PSVP_VPD v, SVP_CTX *c, uint64_t ncr3) {
+static void p_prepare(PSVP_VPD v, PCONTEXT c, uint64_t ncr3) {
     vmcb_t *g = &v->GuestVmcb;
     struct { uint16_t l; uint64_t b; } __attribute__((packed)) gdtr, idtr;
     __asm__ volatile("sgdt %0":"=m"(gdtr));
@@ -216,33 +203,38 @@ static void p_prepare(PSVP_VPD v, SVP_CTX *c, uint64_t ncr3) {
 
     g->state.gdtr_base = gdtr.b; g->state.gdtr_limit = gdtr.l;
     g->state.idtr_base = idtr.b; g->state.idtr_limit = idtr.l;
-    g->state.cs_selector = c->cs; g->state.ds_selector = c->ds;
-    g->state.es_selector = c->es; g->state.fs_selector = c->fs;
-    g->state.gs_selector = c->gs; g->state.ss_selector = c->ss;
-    g->state.cs_attrib = p_seg_attrib(c->cs); g->state.cs_limit = p_seg_limit(c->cs);
-    g->state.ds_attrib = p_seg_attrib(c->ds); g->state.ds_limit = p_seg_limit(c->ds);
-    g->state.es_attrib = p_seg_attrib(c->es); g->state.es_limit = p_seg_limit(c->es);
-    g->state.ss_attrib = p_seg_attrib(c->ss); g->state.ss_limit = p_seg_limit(c->ss);
+    g->state.cs_selector = (uint16_t)c->SegCs; g->state.ds_selector = (uint16_t)c->SegDs;
+    g->state.es_selector = (uint16_t)c->SegEs; g->state.fs_selector = (uint16_t)c->SegFs;
+    g->state.gs_selector = (uint16_t)c->SegGs; g->state.ss_selector = (uint16_t)c->SegSs;
+    g->state.cs_attrib = p_seg_attrib((uint16_t)c->SegCs); g->state.cs_limit = p_seg_limit((uint16_t)c->SegCs);
+    g->state.ds_attrib = p_seg_attrib((uint16_t)c->SegDs); g->state.ds_limit = p_seg_limit((uint16_t)c->SegDs);
+    g->state.es_attrib = p_seg_attrib((uint16_t)c->SegEs); g->state.es_limit = p_seg_limit((uint16_t)c->SegEs);
+    g->state.ss_attrib = p_seg_attrib((uint16_t)c->SegSs); g->state.ss_limit = p_seg_limit((uint16_t)c->SegSs);
     g->state.tr_selector = p_tr();
     g->state.cr0 = p_cr0(); g->state.cr2 = p_cr2();
     g->state.cr3 = p_cr3(); g->state.cr4 = p_cr4();
     g->state.efer = p_read_msr(MSR_EFER);
-    g->state.rflags = c->rflags;
-    g->state.rsp = c->rsp;
-    g->state.rip = c->rip;
+    g->state.rflags = c->EFlags;
+    g->state.rsp = c->Rsp;
+    g->state.rip = c->Rip;
     g->state.g_pat = p_read_msr(0x277);
     p_vmsave(v->hs.GuestVmcbPa);           /* capture FS/GS/TR/KernelGs into guest VMCB */
     v->hs.Reserved1 = ~0ULL;
 }
 
 static NTSTATUS p_virtualize_one(SVP_SHARED *shared) {
-    SVP_CTX c;
+    CONTEXT ctx;
     PSVP_VPD v;
     SIZE_T total;
     int cp[4];
     ULONG cpu = KeGetCurrentProcessorNumber();
 
-    p_capture(&c);                          /* c.rip = installed-check on 2nd pass */
+    /* SvVirtualizeProcessor-exact shape. RtlCaptureContext (ntoskrnl export)
+     * captures THIS function's rip/rsp/gprs; the guest 2nd pass resumes at the
+     * installed-check line below with callee-saved registers intact, so the
+     * plain `return` unwinds the affinity loop correctly. */
+    RtlCaptureContext(&ctx);
+
     __cpuidex(cp, SVP_CPUID_INSTALLED, 0);
     if ((uint32_t)cp[0] == SVP_MAGIC) {     /* already virtualized (guest 2nd pass) */
         yghv_trace_u64("s205 guest-return cpu", (uint64_t)cpu);  /* normal guest syscall */
@@ -262,15 +254,16 @@ static NTSTATUS p_virtualize_one(SVP_SHARED *shared) {
     v->hs.Self        = v;
     v->hs.Shared      = shared;
     p_write_msr(0xC0010117, MmGetPhysicalAddress(v->HostStateArea).QuadPart); /* VM_HSAVE_PA */
-    p_prepare(v, &c, g_npt.pml4_pa);
+    p_prepare(v, &ctx, g_npt.pml4_pa);
     p_vmsave(v->hs.HostVmcbPa);             /* snapshot host segs for VMLOAD on exit */
     InterlockedIncrement(&shared->ProcessorsVirtualized);
 
-    /* step205b: last safe (bare-metal) milestone before this cpu enters guest.
-     * If the next boot stops here, entry into VMRUN for THIS cpu is where it hangs. */
+    /* step205b: last safe (bare-metal) milestone before this cpu enters guest. */
     yghv_trace_u64("s205 pre-vmrun cpu", (uint64_t)cpu);
     yghv_sv_launch(&v->hs.GuestVmcbPa);     /* host loop; returns only after unload */
-    MmFreeContiguousMemory(v);              /* reached only if this CPU was unloaded */
+    /* Unreachable in normal operation (the SvLV20 unload tail jumps back into the
+     * guest's flow, not here). Mirror SimpleSvm's fail-loud: */
+    KeBugCheck(MANUALLY_INITIATED_CRASH);
     return STATUS_SUCCESS;
 }
 
