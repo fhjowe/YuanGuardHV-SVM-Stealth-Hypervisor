@@ -4715,3 +4715,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   有效判据（区分"核死"与"系统活但调度瘫"）。
 - 状态：205j 已提交；镜像归档；机器未加载 205；稳定版未动。
 - 提交：本记录。
+
+### 9.242 2026-09-18 205j 实机判读 + 排除法闭合 + 205k 决胜实验（SimpleSvm 载体 + 我方控制区）
+
+- 用户自行跑 205j：**仍冻**，且 c6 脚本日志停在第一行（21:26:31）——`sc start` 未返回 =
+  死在 DriverEntry 进入循环；`vcores=0xB` ✓、rec pa ✓、看门狗核已保留，但无 0xE2、无
+  dump。解释：0xE2 的转储写入本身被坏死的存储栈卡死，或 wedged 级别连原生核一并拖死。
+- **排除法闭合**：C0（原版 SimpleSvm）600s ✓ → 硅片无罪；203-diag2 在 **同一 g_npt +
+  同一 svm_core_init 环境** 用旧 trampoline 进 guest 跑了 10514 次真实 Windows 退出 →
+  NPT 与驱动环境无罪；**逐指令反汇编对照**：我的 `yghv_sv_launch` 与上游 `SvLaunchVm`
+  逐条一致（仅多一个 203 已证明无害的 clgi）→ launch asm 无罪。**唯一嫌疑人 = 我
+  VMCB 控制区与 SimpleSvm 的三项差异：入口期异常拦截(0xFFFFBFFF)/SHUTDOWN(1)/MSRPM。**
+- **205k 决胜实验（已离线备好，镜像 `8b97cf19...` = `D:\aaaaaavm\SimpleSvm_205k.sys`）**：
+  把我方控制区三项原值装进**上游 SimpleSvm 的进入载体**（thirdparty 打补丁：
+  `InterceptException=0xFFFFBFFF`、`InterceptMisc1|=SHUTDOWN`，其 handler default 对
+  异常 `KeBugCheckEx(0xE2, 0x2050B, exitcode, rip, info1)` 可观测出口）。**一次 boot
+  二分**：静默冻 = 控制区即根因（205l = 我方 port 降到 SimpleSvm-exact 控制区）；
+  0xE2（数秒内，载体的异常出口）= 控制区无罪 → bug 在我 port 的 struct/init 细节。
+  注意：SimpleSvm 无在线卸载，实验后需重启清除（与 C0 同）。
+- 状态：205k 镜像归档；205 系代码维持 205j；机器未加载；稳定版未动。
+- 提交：本记录。
