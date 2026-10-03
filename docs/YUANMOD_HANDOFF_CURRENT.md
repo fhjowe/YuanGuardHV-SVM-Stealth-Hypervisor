@@ -4595,3 +4595,28 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   打通**。若仍有异常，205d 机制会给出精确 fault exit/rip 记录，不会再静默。
 - 状态：205e 已提交；机器未加载 205；稳定版 `70888311` 未动。
 - 提交：本记录。
+
+### 9.237 2026-09-18 205e 实机判读（用户提供现场）：CS.L 修复生效；新失败=stornvme 0xD1（wild-resume 破坏）；step205f 完整加固
+
+- 用户自行跑 205e 版 run_c6（**教训已固化：本机一切会碰机器的命令只给文本由用户执行**）。
+  只读取证：VMCB `cs=0x29B`（bit9=**L=1** ✓，与内核 CS 描述符 `0x00209B00...` 逐位吻合）
+  → **CS 修复生效，guest 正确进入 64 位长模式**。但 progress 仍无 guest-return/DriverEntry
+  returns；蓝屏换为 **0xD1（DISPATCH 写 0x00000000DFE34000，指令 `stornvme!ProcessCommandInSpecificQueue`）**。
+- 判读：stornvme 真实线程以**被破坏的指针**写队列 → #PF（205d 全异常拦截捕获）→ 205d 的
+  devirt 按 faulting rip 恢复裸金属 → DISPATCH 下同址再炸 → 0xD1。 wild-resume（对不可信
+  state.rip 的跳转）是破坏源头；且异常拦截仍未被"首个 CPUID"清除 = cpu0 guest 未走到
+  cpuid，与"VMRUN 即 INVALID"假说一致——**唯一剩余与已验证配置的差异 = msrpm_base_pa=0**
+  （SimpleSvm/203 均为有效页）。
+- **step205f（完整实现，离线，构建/回归全绿）**：
+  1. VPD 内新增页对齐 **MSRPM(2页)/IOPM(3页) 全零映**（=放行一切 MSR/IO；仍不启用
+     MSR_PROT/IOIO 拦截，仅使基址有效），`p_prepare` 设置两个基址 + `_Static_assert` 对齐；
+  2. **退出白名单**：CPUID 正常处理；异常段(0x40..0x5F)→记录后 devirt 按 **state.rip**
+     （faulting rip）可观测恢复；**其余一切退出码（VMEXIT_INVALID/NPF/INTR/未知）→
+     `p_park_cpu()`（cli;hlt 驻车，noreturn）**——机器保活、VMCB dump 留在 progress.log，
+     彻底消灭 wild-jump；
+  3. 回归：默认/203 构建全绿；205f 镜像 `ceb91474...` 归档（run_c6 直接复用）。
+- 下次 run_c6（由用户执行）判读：guest-return 逐核 + DriverEntry returns + 系统存活 =
+  进入打通；若 park，则机器存活、progress.log 的 VMCB dump 可现场读取，把 log 交回即可；
+  若蓝屏，则 fault 记录 + dump 仍精确。
+- 状态：205f 已提交；镜像归档；机器未加载 205；稳定版未动。
+- 提交：本记录。
