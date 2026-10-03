@@ -4735,3 +4735,35 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   注意：SimpleSvm 无在线卸载，实验后需重启清除（与 C0 同）。
 - 状态：205k 镜像归档；205 系代码维持 205j；机器未加载；稳定版未动。
 - 提交：本记录。
+
+### 9.243 2026-09-18 205k 决胜实验实机：决定性判决——控制区/平台/进入能力全部无罪；嫌疑收敛到"我的 port 副本 vs 上游原码"；缓存类型也已排除
+
+- 用户自行跑 205k（上游 SimpleSvm 载体 + 我方控制区三项）。结果：**成功进入并运行，
+  过一会蓝屏 0xE2（Arg1=0x2050b=我方 tag, Arg2=0x4D, Arg3=0xFFFFF80223809B2D, Arg4=0）**。
+- **解码**：Arg2=0x4D = VMEXIT exitcode 0x4D = **exception 向量 13 = #GP**；Arg3 反汇编
+  = `nt!KiCustomRecurseRoutine4+0xd: mov eax,[rdx]`——**PatchGuard/SEH 的"故意探针"例程**
+  （正常机器上 guest 自己 IDT+SEH 默默吞掉该 #GP）。即：上游载体带着我方控制区
+  **一路跑进了真实 Windows 内核深处**才触发这条良性 #GP，被 205k 的"异常拦截+可观测出口"
+  拦下 → 按设计 bugcheck。**进入完全成功。**
+- **判读（终局排除法）**：
+  1. **控制区无罪**：205k 用的就是我方三项（异常 0xFFFFBFFF + SHUTDOWN + MSRPM），照样进得去
+     → 之前所有"控制区差异"嫌疑（含 205g 不拦异常也冻）全部否定；那条良性 #GP 恰恰证明
+     "拦异常能进入、且进入后正常 OS 会发 #GP"——我的 port 把良性 #GP 当致命去 devirt，
+     是设计错误，但不是"进不去"的原因。
+  2. **平台/硅片无罪**（C0 + 205k 双重）；
+  3. **NPT(g_npt)/驱动环境无罪**（203-diag2 用同一 g_npt 跑 10514 次真实退出）；
+  4. **launch asm 无罪**（反汇编逐指令对照一致，仅多无害 clgi）；
+  5. **缓存类型无罪**（上游 `ExAllocatePoolWithTag(NonPagedPool)` 与我方
+     `MmAllocateContiguousMemory` 均为 cached 非分页，一致）。
+- **剩余唯一嫌疑**：我的 step205 port 的**进入实现副本**（C 侧 p_virtualize_one/p_prepare
+  + asm）与上游原码之间存在**尚未定位的具体差异**——但已逐字段/逐指令 diff 到离线手段
+  穷尽。继续"改我的 port 副本 + boot 试错"ROI 极低（9 次 boot 无进入成功）。
+- **正确的 faith 实现路径（下一步 = step206）**：不再手写 port 副本，而是**把
+  thirdparty/SimpleSvm 原码（已双重验证能进入）整体搬入 YGHV 源码树作为进入基座**：
+  原样复制 x64.asm + SvVirtualizeProcessor/SvPrepareForVirtualization/SvHandleVmExit，
+  仅把其自带 NPT 建表替换为复用 `g_npt.pml4_pa`，handler 保留上游 CPUID 后门语义并预留
+  NPF/VMMCALL 保护扩展点。这是"在验证过的载体上做增量"，与在坏载体上反复 debug 相比可控。
+  step206 门控 `YGHV_BAREMETAL_STEP==206`，默认/既有 step 不受影响；每 boot 仍由用户执行。
+- 状态：205k 结论落档；机器未加载；稳定版 `70888311` 未动；SimpleSvm 服务需重启清除
+  （无在线卸载，同 C0）。
+- 提交：本记录。
