@@ -177,6 +177,25 @@ __declspec(noreturn) static void p_park_cpu(void) {
     }
 }
 
+/* step205i: dedicated magic-tagged record page. Its PA is logged (host context)
+ * at start; after a failed boot we grep the full memory dump for 'SVPRCD1' and
+ * read the fields — deterministic recovery, no needle-in-haystack. Island-safe:
+ * pure memory writes. */
+static unsigned char *g_svp_rec_page = NULL;
+
+static void p_record_fatal(uint64_t exitcode, PSVP_VPD Vpd) {
+    volatile ULONG64 *r;
+    if (!g_svp_rec_page) return;
+    r = (volatile ULONG64 *)g_svp_rec_page;
+    r[0] = 0x3131444352505653ULL;    /* memory bytes: 'S','V','P','R','C','D','1',0 */
+    r[1] = exitcode;
+    r[2] = Vpd->GuestVmcb.state.rip;
+    r[3] = Vpd->GuestVmcb.control.exitinfo1;
+    r[4] = Vpd->GuestVmcb.control.exitinfo2;
+    r[5] = Vpd->CpuIndex;
+    r[6] = Vpd->GuestVmcb.control.exitintinfo;
+}
+
 /* VMEXIT island: synchronous CPUID/VMRUN only, zero NT calls, zero I/O. */
 BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs);
 BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
@@ -243,24 +262,23 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
                 sh->FaultInfo1 = Vpd->GuestVmcb.control.exitinfo1;
                 sh->FaultInfo2 = Vpd->GuestVmcb.control.exitinfo2;
             }
+            /* step205i: ALSO mirror the record into the dedicated magic-tagged
+             * page (pure memory, island-safe). After the reboot, the full dump
+             * is searched for the 'SVPRCD1' magic — deterministic record
+             * recovery, no needle-in-haystack scanning. */
+            p_record_fatal(exitcode, Vpd);
         }
         if (exitcode >= SVM_EXIT_EXCEPTION_BASE &&
             exitcode <  SVM_EXIT_EXCEPTION_BASE + 32) {
             p_devirt(Vpd, Regs, Vpd->GuestVmcb.state.rip);
             exit_vm = TRUE;
         } else {
-            /* Terminal path: best-effort write-through of the fault record
-             * BEFORE parking. The 9.229 no-I/O rule protects the RESUMABLE
-             * dispatch path; here the cpu is being parked forever, so a
-             * blocking write cannot worsen the outcome — and the 205f boot
-             * showed a silent park just 0x101s 15s later with the evidence
-             * stuck in RAM. If this write itself faults, the dump IS the
-             * evidence. */
-            yghv_trace("s205 PARK cpu (unexpected exit)");
-            yghv_trace_u64("s205 park exit", exitcode);
-            yghv_trace_u64("s205 park rip", Vpd->GuestVmcb.state.rip);
-            yghv_trace_u64("s205 park info1", Vpd->GuestVmcb.control.exitinfo1);
-            yghv_trace_u64("s205 park info2", Vpd->GuestVmcb.control.exitinfo2);
+            /* step205i: park SILENTLY. The 205g/h boots proved that even a
+             * "terminal" ZwWriteFile from the VMEXIT island deadlocks the whole
+             * box before a single byte reaches the disk (the island thread is
+             * the only one running the island; blocking it wedges the watchdog
+             * too). The record page (above) + the 0x101 dump carry the
+             * evidence instead. */
             p_park_cpu();   /* noreturn */
         }
         break;
@@ -274,7 +292,8 @@ static void p_prepare(PSVP_VPD v, PCONTEXT c, uint64_t ncr3) {
     __asm__ volatile("sgdt %0":"=m"(gdtr));
     __asm__ volatile("sidt %0":"=m"(idtr));
 
-    g->control.general1_intercepts  = INTERCEPT_CPUID | INTERCEPT_MSR_PROT;
+    g->control.general1_intercepts  = INTERCEPT_CPUID | INTERCEPT_MSR_PROT |
+                                      INTR_GEN1(SVM_INTERCEPT_SHUTDOWN);
     g->control.general2_intercepts  = INTR_GEN2(SVM_INTERCEPT_VMRUN);
     /* step205h: intercept every exception EXCEPT #PF during the ENTRY window.
      * Lessons across 205c..205g: with NO exception interception (205g) the fatal
@@ -404,6 +423,15 @@ void yghv_sv205_start(ULONG cores);
 void yghv_sv205_start(ULONG cores) {
     SVP_SHARED shared;
     shared.ProcessorsVirtualized = 0; shared.Abort = 0; shared.FaultSeen = 0;
+    /* step205i: record page + log its PA so a failed boot's full dump can be
+     * searched for 'SVPRCD1' deterministically. */
+    g_svp_rec_page = (unsigned char *)MmAllocateContiguousMemory(
+        PAGE_SIZE, (PHYSICAL_ADDRESS){ .QuadPart = -1 });
+    if (g_svp_rec_page) {
+        RtlZeroMemory(g_svp_rec_page, PAGE_SIZE);
+        yghv_trace_u64("s205 rec pa",
+                       MmGetPhysicalAddress(g_svp_rec_page).QuadPart);
+    }
     p_run_on_each(&shared, cores);
     /* step205d: if any core bailed on a guest fault during entry, the record is
      * in memory and we are back in bare-metal context — trace it now (this is
