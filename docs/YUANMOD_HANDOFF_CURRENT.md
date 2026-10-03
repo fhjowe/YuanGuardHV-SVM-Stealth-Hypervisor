@@ -4573,3 +4573,25 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
     `p_prepare` 字段，回到 asm 级逐条 diff x64.asm。
 - 状态：205c 代码已提交（89b746c）；机器未加载 205；稳定版未动。等用户再跑一次 run_c6。
 - 提交：本记录。
+
+### 9.236 2026-09-18 205c 实机=蓝屏（205d 设计生效）→ 根因铁证 + 修复（step205e）：CS 属性缺 L 位，guest 掉出 64 位模式
+
+- 用户跑 205d 版 run_c6：**蓝屏而非静默卡死**——205d 的"消灭静默 shutdown"目标达成，
+  证据链完整拿到：
+  - progress.log 全量 VMCB dump（18 字段，逐行 write-through）；
+  - bugcheck **0x1E (0xC0000005, 0x00000000BF95D7C7, 8, 0xBF95D7C7)**：Param0=8 = DEP
+    执行违例；故障地址 = VMCB 里 guest rip `0xFFFFF804BF95D7C7` 的**高 32 位被截断**。
+- **根因（一行）**：`p_seg_attrib` 只返回低访问字节 `(lo>>40)&0xFF`，**漏掉描述符
+  bit52-55 = AVL/L/D/B/G**（应拼入 VMCB 属性 bit8-11）→ CS 属性 dump 值 0x9B 无 L 位
+  → VMRUN 后 CPU 以 **32 位兼容模式**取指 → RIP 截断 → #PF（拦截）→ 205d 按设计记录+
+  devirt 回裸金属（按 faulting state.rip 恢复，该 rip 已被 VMEXIT 存为截断值）→ 再次
+  NX 执行违例 → 0x1E 蓝屏。**全链路与两个独立证据（截断地址、cs=0x9B）闭环。**
+  对照：SimpleSvm `SvGetSegmentAccessRight` 提取完整 16 位属性（源码已核）；YGHV 自家
+  `yg_read_seg_descriptor` 注释同样写明"bits 8-11 = AVL/L/D/B/G (52-55)"。
+- **修复（step205e）**：`p_seg_attrib` 改为 `((lo>>40)&0xFF) | (((lo>>52)&0xF)<<8)`。
+  205e 镜像 `f2716b0e...` 归档；默认回归通过；已删 1GB+ 全量 MEMORY.DMP。
+- 下一次 run_c6 预期：CS.L 修复后 guest 首取指即 64 位长模式 → installed-check CPUID
+  命中拦截 → `guest-return cpu` 逐核出现 → `DriverEntry returns` + 系统存活 = **进入模型
+  打通**。若仍有异常，205d 机制会给出精确 fault exit/rip 记录，不会再静默。
+- 状态：205e 已提交；机器未加载 205；稳定版 `70888311` 未动。
+- 提交：本记录。
