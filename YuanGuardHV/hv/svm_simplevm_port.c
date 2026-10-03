@@ -72,9 +72,17 @@ static uint16_t p_seg_attrib(uint16_t sel) {
 }
 
 /* ---- VpData layout: MUST match svm_simplevm_port.S (self at HostRsp+0x10) ---- */
+/* step205d: one shared fault record (memory-only writes in the VMEXIT island;
+ * main.c traces it from bare-metal context after the entry loop returns). */
 typedef struct _SVP_SHARED {
     volatile LONG ProcessorsVirtualized;
     volatile LONG Abort;
+    volatile LONG FaultSeen;        /* set by the island on the FIRST bad exit */
+    volatile LONG FaultCpu;
+    volatile ULONG64 FaultExitcode;
+    volatile ULONG64 FaultRip;
+    volatile ULONG64 FaultInfo1;
+    volatile ULONG64 FaultInfo2;
 } SVP_SHARED;
 
 #define SVP_HOST_STACK 0x4000
@@ -123,11 +131,13 @@ void yghv_sv_launch(void *HostRsp);   /* svm_simplevm_port.S */
 
 /* Devirtualize THIS cpu (pure memory + privileged ops; safe inside the GIF=0
  * VMEXIT island — no NT calls). Sets the SvLV20 return contract so the asm
- * resumes bare metal at the instruction after the faulting/backdoor CPUID. */
-static void p_devirt(PSVP_VPD Vpd, GUEST_REGS *Regs) {
+ * resumes bare metal at resume_rip (for the CPUID backdoor that is nRIP; for
+ * fault-like exits nRIP is INVALID, so the caller must pass the faulting
+ * state.rip instead — never trust nRIP on a fault). */
+static void p_devirt(PSVP_VPD Vpd, GUEST_REGS *Regs, uint64_t resume_rip) {
     Regs->Rax = (uint32_t)(UINT_PTR)Vpd;
     Regs->Rdx = (uint64_t)((UINT_PTR)Vpd >> 32);
-    Regs->Rbx = Vpd->GuestVmcb.control.next_rip;
+    Regs->Rbx = resume_rip;
     Regs->Rcx = Vpd->GuestVmcb.state.rsp;
     p_vmload(Vpd->hs.GuestVmcbPa);           /* load guest segs */
     p_write_msr(MSR_EFER, p_read_msr(MSR_EFER) & ~(uint64_t)EFER_SVME);
@@ -139,19 +149,24 @@ static void p_devirt(PSVP_VPD Vpd, GUEST_REGS *Regs) {
 BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs);
 BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
     BOOLEAN exit_vm = FALSE;
+    uint64_t exitcode = Vpd->GuestVmcb.control.exitcode;
     uint64_t leaf;
 
     p_vmload(Vpd->hs.HostVmcbPa);          /* restore host segments/GS (KPCR) */
     Regs->Rax = Vpd->GuestVmcb.state.rax;  /* reflect guest RAX (host overwrote it) */
 
-    switch (Vpd->GuestVmcb.control.exitcode) {
+    switch (exitcode) {
     case SVM_EXIT_CPUID:
         leaf = Regs->Rax;
+        /* step205d: the guest is demonstrably executing — stop intercepting
+         * exceptions so legitimate native page faults flow (VMCB clean bits are
+         * 0, so the control area is re-read on every VMRUN). */
+        Vpd->GuestVmcb.control.exception_intercepts = 0;
         if (leaf == SVP_CPUID_INSTALLED) {
             Regs->Rax = SVP_MAGIC; Regs->Rbx = 0; Regs->Rcx = 0; Regs->Rdx = 0;
         } else if (leaf == SVP_CPUID_UNLOAD) {
             if ((Vpd->GuestVmcb.state.ss_attrib & 0x60u) == 0) {   /* DPL0 */
-                p_devirt(Vpd, Regs);
+                p_devirt(Vpd, Regs, Vpd->GuestVmcb.control.next_rip);
                 exit_vm = TRUE;
                 break;
             }
@@ -171,15 +186,27 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
             (1ULL << 31) | (3ULL << 8) | 13ULL;
         break;
     default:
-        /* step205b bounded fail-safe: an unexpected exit (e.g. #VMEXIT_INVALID from
-         * a bad VMCB) would otherwise spin VMRUN->VMEXIT_INVALID forever and silently
-         * hard-lock the box. After 16 consecutive bad exits, devirtualize THIS cpu
-         * so the machine survives and DriverEntry can return. No in-window trace. */
-        Vpd->GuestVmcb.state.rip = Vpd->GuestVmcb.control.next_rip;
-        if (InterlockedIncrement(&Vpd->BadExits) > 16) {
-            p_devirt(Vpd, Regs);
-            exit_vm = TRUE;
+        /* step205d: ANY guest exception (or unexpected exit) during entry means
+         * broken guest state. Record it memory-only (island-safe — NO file I/O,
+         * see 9.229) and devirtualize THIS cpu at once. A triple fault would
+         * otherwise drop the CPU into shutdown state = the observed silent
+         * hard hang with no dump. NOTE: do NOT touch state.rip here — for
+         * fault-like exits nRIP is invalid, so devirtualizing must resume bare
+         * metal at the FAULTING instruction (state.rip); the OS then raises the
+         * fault observably (bugcheck + dump) instead of jumping to rip 0 and
+         * shutting down silently again. */
+        {
+            SVP_SHARED *sh = Vpd->hs.Shared;
+            if (sh && InterlockedCompareExchange(&sh->FaultSeen, 1, 0) == 0) {
+                sh->FaultCpu = (LONG)Vpd->CpuIndex;
+                sh->FaultExitcode = exitcode;
+                sh->FaultRip = Vpd->GuestVmcb.state.rip;
+                sh->FaultInfo1 = Vpd->GuestVmcb.control.exitinfo1;
+                sh->FaultInfo2 = Vpd->GuestVmcb.control.exitinfo2;
+            }
         }
+        p_devirt(Vpd, Regs, Vpd->GuestVmcb.state.rip);
+        exit_vm = TRUE;
         break;
     }
     return exit_vm;
@@ -193,7 +220,10 @@ static void p_prepare(PSVP_VPD v, PCONTEXT c, uint64_t ncr3) {
 
     g->control.general1_intercepts  = INTERCEPT_CPUID;
     g->control.general2_intercepts  = INTR_GEN2(SVM_INTERCEPT_VMRUN);
-    g->control.exception_intercepts = 0;
+    /* step205d: intercept ALL exceptions during the entry window (a guest fault
+     * here means broken guest state; the handler records + devirtualizes). The
+     * first healthy CPUID exit clears this back to 0 so native page faults flow. */
+    g->control.exception_intercepts = 0xFFFFFFFFu;
     g->control.cr_read_intercepts   = 0;
     g->control.cr_write_intercepts  = 0;
     g->control.guest_asid           = 1;
@@ -258,8 +288,27 @@ static NTSTATUS p_virtualize_one(SVP_SHARED *shared) {
     p_vmsave(v->hs.HostVmcbPa);             /* snapshot host segs for VMLOAD on exit */
     InterlockedIncrement(&shared->ProcessorsVirtualized);
 
-    /* step205b: last safe (bare-metal) milestone before this cpu enters guest. */
+    /* step205d: full VMCB dump (bare-metal context, write-through) for offline
+     * diff against SimpleSvm's known-good values before this cpu's first VMRUN. */
     yghv_trace_u64("s205 pre-vmrun cpu", (uint64_t)cpu);
+    yghv_trace_u64("s205 V g1", v->GuestVmcb.control.general1_intercepts);
+    yghv_trace_u64("s205 V g2", v->GuestVmcb.control.general2_intercepts);
+    yghv_trace_u64("s205 V exc", v->GuestVmcb.control.exception_intercepts);
+    yghv_trace_u64("s205 V asid", v->GuestVmcb.control.guest_asid);
+    yghv_trace_u64("s205 V ncr3", v->GuestVmcb.control.ncr3);
+    yghv_trace_u64("s205 V npen", v->GuestVmcb.control.np_enable);
+    yghv_trace_u64("s205 V cr0", v->GuestVmcb.state.cr0);
+    yghv_trace_u64("s205 V cr3", v->GuestVmcb.state.cr3);
+    yghv_trace_u64("s205 V cr4", v->GuestVmcb.state.cr4);
+    yghv_trace_u64("s205 V efer", v->GuestVmcb.state.efer);
+    yghv_trace_u64("s205 V rip", v->GuestVmcb.state.rip);
+    yghv_trace_u64("s205 V rsp", v->GuestVmcb.state.rsp);
+    yghv_trace_u64("s205 V rflags", v->GuestVmcb.state.rflags);
+    yghv_trace_u64("s205 V cs", v->GuestVmcb.state.cs_attrib);
+    yghv_trace_u64("s205 V ss", v->GuestVmcb.state.ss_attrib);
+    yghv_trace_u64("s205 V gdtb", v->GuestVmcb.state.gdtr_base);
+    yghv_trace_u64("s205 V idtb", v->GuestVmcb.state.idtr_base);
+    yghv_trace_u64("s205 V pat", v->GuestVmcb.state.g_pat);
     yghv_sv_launch(&v->hs.GuestVmcbPa);     /* host loop; returns only after unload */
     /* Unreachable in normal operation (the SvLV20 unload tail jumps back into the
      * guest's flow, not here). Mirror SimpleSvm's fail-loud: */
@@ -284,8 +333,20 @@ static void p_run_on_each(SVP_SHARED *shared, ULONG n) {
 
 void yghv_sv205_start(ULONG cores);
 void yghv_sv205_start(ULONG cores) {
-    SVP_SHARED shared; shared.ProcessorsVirtualized = 0; shared.Abort = 0;
+    SVP_SHARED shared;
+    shared.ProcessorsVirtualized = 0; shared.Abort = 0; shared.FaultSeen = 0;
     p_run_on_each(&shared, cores);
+    /* step205d: if any core bailed on a guest fault during entry, the record is
+     * in memory and we are back in bare-metal context — trace it now (this is
+     * what turns the old silent shutdown into a diagnosable run). */
+    if (shared.FaultSeen) {
+        yghv_trace("s205 FAULT during entry (core devirtualized)");
+        yghv_trace_u64("s205 fault cpu", (uint64_t)(LONG)shared.FaultCpu);
+        yghv_trace_u64("s205 fault exit", shared.FaultExitcode);
+        yghv_trace_u64("s205 fault rip", shared.FaultRip);
+        yghv_trace_u64("s205 fault info1", shared.FaultInfo1);
+        yghv_trace_u64("s205 fault info2", shared.FaultInfo2);
+    }
 }
 
 #else
