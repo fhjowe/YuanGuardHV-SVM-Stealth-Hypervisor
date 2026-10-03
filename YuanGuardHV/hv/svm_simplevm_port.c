@@ -184,10 +184,6 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
     switch (exitcode) {
     case SVM_EXIT_CPUID:
         leaf = Regs->Rax;
-        /* step205d: the guest is demonstrably executing — stop intercepting
-         * exceptions so legitimate native page faults flow (VMCB clean bits are
-         * 0, so the control area is re-read on every VMRUN). */
-        Vpd->GuestVmcb.control.exception_intercepts = 0;
         if (leaf == SVP_CPUID_INSTALLED) {
             Regs->Rax = SVP_MAGIC; Regs->Rbx = 0; Regs->Rcx = 0; Regs->Rdx = 0;
         } else if (leaf == SVP_CPUID_UNLOAD) {
@@ -208,6 +204,13 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
         break;
     case SVM_EXIT_VMRUN:
         /* guest executed VMRUN (would nest) — inject #GP. */
+        Vpd->GuestVmcb.control.event_injection =
+            (1ULL << 31) | (3ULL << 8) | 13ULL;
+        break;
+    case SVM_EXIT_MSR:
+        /* Only the EFER WRITE is intercepted (MSRPM quadrant 0x1800). Inject #GP
+         * so the guest can never clear SVME out from under the hypervisor —
+         * SimpleSvm's exact protection intent. */
         Vpd->GuestVmcb.control.event_injection =
             (1ULL << 31) | (3ULL << 8) | 13ULL;
         break;
@@ -237,6 +240,18 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
             p_devirt(Vpd, Regs, Vpd->GuestVmcb.state.rip);
             exit_vm = TRUE;
         } else {
+            /* Terminal path: best-effort write-through of the fault record
+             * BEFORE parking. The 9.229 no-I/O rule protects the RESUMABLE
+             * dispatch path; here the cpu is being parked forever, so a
+             * blocking write cannot worsen the outcome — and the 205f boot
+             * showed a silent park just 0x101s 15s later with the evidence
+             * stuck in RAM. If this write itself faults, the dump IS the
+             * evidence. */
+            yghv_trace("s205 PARK cpu (unexpected exit)");
+            yghv_trace_u64("s205 park exit", exitcode);
+            yghv_trace_u64("s205 park rip", Vpd->GuestVmcb.state.rip);
+            yghv_trace_u64("s205 park info1", Vpd->GuestVmcb.control.exitinfo1);
+            yghv_trace_u64("s205 park info2", Vpd->GuestVmcb.control.exitinfo2);
             p_park_cpu();   /* noreturn */
         }
         break;
@@ -250,12 +265,16 @@ static void p_prepare(PSVP_VPD v, PCONTEXT c, uint64_t ncr3) {
     __asm__ volatile("sgdt %0":"=m"(gdtr));
     __asm__ volatile("sidt %0":"=m"(idtr));
 
-    g->control.general1_intercepts  = INTERCEPT_CPUID;
+    g->control.general1_intercepts  = INTERCEPT_CPUID | INTERCEPT_MSR_PROT;
     g->control.general2_intercepts  = INTR_GEN2(SVM_INTERCEPT_VMRUN);
-    /* step205d: intercept ALL exceptions during the entry window (a guest fault
-     * here means broken guest state; the handler records + devirtualizes). The
-     * first healthy CPUID exit clears this back to 0 so native page faults flow. */
-    g->control.exception_intercepts = 0xFFFFFFFFu;
+    /* step205g: control area now BYTE-IDENTICAL to upstream SimpleSvm (CPUID +
+     * MSR_PROT + VMRUN; exceptions NOT intercepted — the entry-window all-
+     * exception interception of 205d/205e/205f never produced a useful capture
+     * and is the last remaining control-area delta). MSRPM intercepts only the
+     * EFER write (protect SVME), APM layout: quadrant 0x1800 = writes of
+     * C000_0000-C000_1FFF, 1 bit per MSR: byte 0x1800 + (0x80/8) = 0x1810. */
+    g->control.exception_intercepts = 0;
+    v->Msrpm[0x1810] |= 0x01;
     g->control.cr_read_intercepts   = 0;
     g->control.cr_write_intercepts  = 0;
     g->control.guest_asid           = 1;
