@@ -182,6 +182,34 @@ __declspec(noreturn) static void p_park_cpu(void) {
  * read the fields — deterministic recovery, no needle-in-haystack. Island-safe:
  * pure memory writes. */
 static unsigned char *g_svp_rec_page = NULL;
+/* step205j: pure-memory VMEXIT heartbeat, advanced by the handler on EVERY exit
+ * and by the 2nd-pass return. The bare-metal watchdog (reserved core) bugs
+ * checks 0xE2 when it stalls -> full dump with the record page + counters. */
+volatile LONG64 g_svp_hb = 0;
+
+/* step205j: reserved bare-metal watchdog. One core (the highest index) NEVER
+ * enters guest mode and stays native forever, so it can still bug check the
+ * machine when every guest-mode core wedges silently (the 205f..205i freezes
+ * produced NO dump because nothing bug checked). 10s without a heartbeat
+ * (driven by the stress CPUID storm) -> 0xE2 -> full RAM dump containing the
+ * SVPRCD1 record page and all counters. */
+static VOID yghv_svp_watchdog(PVOID ctx) {
+    LARGE_INTEGER delay;
+    LONG64 last = 0;
+    ULONG stall = 0;
+    (void)ctx;
+    delay.QuadPart = -1LL * 10000000LL;   /* 1s */
+    for (;;) {
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        if (g_svp_hb != last) {
+            last = g_svp_hb;
+            stall = 0;
+        } else if (++stall >= 10) {
+            KeBugCheckEx(0xE2, 0x53565052 /* 'SVPR' */,
+                         (ULONG_PTR)g_svp_hb, (ULONG_PTR)last, 0);
+        }
+    }
+}
 
 static void p_record_fatal(uint64_t exitcode, PSVP_VPD Vpd) {
     volatile ULONG64 *r;
@@ -205,6 +233,7 @@ BOOLEAN NTAPI yghv_sv_handle_vmexit(PSVP_VPD Vpd, GUEST_REGS *Regs) {
 
     p_vmload(Vpd->hs.HostVmcbPa);          /* restore host segments/GS (KPCR) */
     Regs->Rax = Vpd->GuestVmcb.state.rax;  /* reflect guest RAX (host overwrote it) */
+    InterlockedIncrement64(&g_svp_hb);     /* step205j: island heartbeat (pure memory) */
 
     switch (exitcode) {
     case SVM_EXIT_CPUID:
@@ -355,7 +384,12 @@ static NTSTATUS p_virtualize_one(SVP_SHARED *shared) {
 
     __cpuidex(cp, SVP_CPUID_INSTALLED, 0);
     if ((uint32_t)cp[0] == SVP_MAGIC) {     /* already virtualized (guest 2nd pass) */
-        yghv_trace_u64("s205 guest-return cpu", (uint64_t)cpu);  /* normal guest syscall */
+        /* step205j: NO NT call here. 205c..205i never once reached this point's
+         * trace, and the guest-return ZwWriteFile was the ONLY NT call in the
+         * VMRUN->2nd-pass window — the prime freeze suspect. Advance the pure-
+         * memory heartbeat instead; the bare-metal watchdog (below) turns a
+         * stalled heartbeat into a 0xE2 dump. */
+        InterlockedIncrement(&g_svp_hb);
         return STATUS_SUCCESS;
     }
 
@@ -422,6 +456,8 @@ static void p_run_on_each(SVP_SHARED *shared, ULONG n) {
 void yghv_sv205_start(ULONG cores);
 void yghv_sv205_start(ULONG cores) {
     SVP_SHARED shared;
+    HANDLE wd = NULL;
+    ULONG vcores;
     shared.ProcessorsVirtualized = 0; shared.Abort = 0; shared.FaultSeen = 0;
     /* step205i: record page + log its PA so a failed boot's full dump can be
      * searched for 'SVPRCD1' deterministically. */
@@ -432,7 +468,24 @@ void yghv_sv205_start(ULONG cores) {
         yghv_trace_u64("s205 rec pa",
                        MmGetPhysicalAddress(g_svp_rec_page).QuadPart);
     }
-    p_run_on_each(&shared, cores);
+    /* step205j: reserve the HIGHEST core as a bare-metal watchdog that never
+     * enters guest mode; it converts any silent freeze into a 0xE2 dump. */
+    vcores = (cores > 1) ? (cores - 1) : cores;
+    if (cores > 1) {
+        GROUP_AFFINITY wga, wold;
+        PROCESSOR_NUMBER wpn;
+        if (NT_SUCCESS(KeGetProcessorNumberFromIndex(cores - 1, &wpn))) {
+            RtlZeroMemory(&wga, sizeof(wga));
+            wga.Group = wpn.Group; wga.Mask = (KAFFINITY)(1ULL << wpn.Number);
+            RtlZeroMemory(&wold, sizeof(wold));
+            KeSetSystemGroupAffinityThread(&wga, &wold);
+            PsCreateSystemThread(&wd, THREAD_ALL_ACCESS, NULL, NULL, NULL,
+                                 yghv_svp_watchdog, NULL);
+            KeRevertToUserGroupAffinityThread(&wold);
+        }
+    }
+    yghv_trace_u64("s205 vcores", (uint64_t)vcores);
+    p_run_on_each(&shared, vcores);
     /* step205d: if any core bailed on a guest fault during entry, the record is
      * in memory and we are back in bare-metal context — trace it now (this is
      * what turns the old silent shutdown into a diagnosable run). */
