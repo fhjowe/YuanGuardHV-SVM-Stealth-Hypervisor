@@ -4620,3 +4620,27 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   若蓝屏，则 fault 记录 + dump 仍精确。
 - 状态：205f 已提交；镜像归档；机器未加载 205；稳定版未动。
 - 提交：本记录。
+
+### 9.238 2026-09-18 205f 实机判读（用户提供现场）：park 生效但 15s 后 0x101（时钟看门狗杀驻车核）；step205g = 控制区与 SimpleSvm 逐位一致
+
+- 用户自行跑 205f：蓝屏 **0x101 CLOCK_WATCHDOG_TIMEOUT**（Arg3=PRCB）——即某核触发
+  驻车路径（非 CPUID/非异常的意外退出码，最可能 VMEXIT_INVALID），15s 后被时钟看门狗
+  击杀。**park 保活设计部分达成（不再 wild-jump 破坏无关线程、不再是静默 shutdown），
+  但 Windows 不允许一个核永久不服务时钟中断**；且 fault 记录困在内存没进日志。
+- 推论：MSRPM/IOPM 补齐后仍触发意外退出码 → 最后剩余的控制区差异就是：
+  (a) 入口期全异常拦截（205d 引入，SimpleSvm=0），(b) MSR_PROT/EFER 写保护（SimpleSvm 有）。
+- **step205g**（离线，构建/回归全绿，镜像 `0ea299fb...`）：
+  1. `exception_intercepts=0`，`general1 = CPUID|MSR_PROT`，MSRPM 按 APM 正确布局
+     （quadrant 0x1800 = C000_0000-C000_1FFF 写拦截，1 bit/MSR）置 EFER 写位
+     （byte 0x1810 bit0）→ **控制区与上游 SimpleSvm 逐位一致**（NPT 除外）；
+  2. handler 新增 `SVM_EXIT_MSR`：EFER 写 → 注 #GP（保护 SVME，SimpleSvm 同意图）；
+  3. **park 路径驻车前尽力写穿 fault 记录**（终末路径，9.229 的无 I/O 纪律保护的是
+     可恢复路径；此处本就要永久驻车，阻塞写不会更糟，且 0x139 也算证据）——
+     修复"证据困在 RAM"问题；
+  4. 顺带发现并记录：YGHV 旧代码 `svm_prepare_vcpu` 的 VM_CR MSRPM 位计算
+     （`(delta/4)+0x1000, (delta&3)*2`）与 APM 四象限布局不符，v93 结论可能受此影响
+     （待后续复核，不影响本轮）。
+- 下次 run_c6（用户执行）：若仍 park，progress.log 将直接给出 `s205 park exit/rip` ——
+  第一次能在线读到意外退出码与 RIP，据此直击根因；若蓝屏则照旧有 dump+记录。
+- 状态：205g 已提交；镜像归档；机器未加载 205；稳定版未动。
+- 提交：本记录。
