@@ -68,7 +68,12 @@ static uint16_t p_seg_attrib(uint16_t sel) {
     struct { uint16_t l; uint64_t b; } __attribute__((packed)) g;
     __asm__ volatile("sgdt %0":"=m"(g));
     uint64_t lo = ((uint64_t *)(g.b + (sel & ~7u)))[0];
-    return (uint16_t)((lo >> 40) & 0xFFu);   /* access byte (type|S|DPL|P) */
+    /* FULL 16-bit VMCB attribute (SimpleSvm SvGetSegmentAccessRight contract):
+     * byte0 = type/S/DPL/P (desc bits 40-47), bits 8-11 = AVL/L/D/B/G (desc
+     * bits 52-55). Missing the L bit on CS drops the guest out of 64-bit mode
+     * on the first fetch -> RIP truncates to 32 bits (bugcheck 0x1E showed the
+     * fetch at 0x00000000BF95D7C7 = truncated guest rip). */
+    return (uint16_t)(((lo >> 40) & 0xFFu) | (((lo >> 52) & 0xFu) << 8));
 }
 
 /* ---- VpData layout: MUST match svm_simplevm_port.S (self at HostRsp+0x10) ---- */
