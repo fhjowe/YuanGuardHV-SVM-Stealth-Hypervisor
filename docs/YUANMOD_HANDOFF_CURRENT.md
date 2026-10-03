@@ -4690,3 +4690,28 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   → grep 'SVPRCD1' → 精确 exitcode/rip。每 boot 必有产出。
 - 状态：205i 已提交；镜像归档；机器未加载 205；稳定版未动。
 - 提交：本记录。
+
+### 9.241 2026-09-18 205i 实机判读 + step205j（裸金属看门狗 = 冻结必然变 dump）
+
+- 用户自行跑 205i：**又静默冻**。`s205 rec pa=0x4201FF000` 已落日志，但无新 dump
+  （无 bugcheck）→ 记录页随断电丢失。c6 脚本日志 mtime 停在 18:03（旧文件）——但
+  progress.log 证明驱动确实启动，即死亡窗口仍在 "首个 CPUID VMEXIT → handler →
+  二次进入 → guest-return trace" 之间；该窗口里唯一的 NT 调用 = guest-return 的
+  ZwWriteFile（与 9.229 同族：这个驱动在 trace 路径上已经三次踩同一类雷）。
+- **结构性缺口定案**：205i 的证据链依赖"致命路径被触发 + 产生 bugcheck dump"，
+  但 205f..205i 的冻结全部**不经过任何白名单致命路径**（无记录/无 park/无 0x101）→
+  冻结 = 无 dump = 证据归零。只要"全核都在 guest/岛里、没有一个核保持原生"，看门狗
+  0x101 也无法执行。
+- **step205j（离线，构建/回归全绿，镜像 `c40f01d4...`）——冻结必然变 dump**：
+  1. **保留最高编号核为裸金属看门狗**（只虚拟化 N-1 个核；该核永不进 guest，
+     永远能 KeBugCheck）；
+  2. handler **每次退出纯内存递增** `g_svp_hb` 心跳（岛内零 NT）；**删掉 guest-return
+     的 ZwWriteFile**（死亡窗口里唯一 NT 调用，头号嫌疑）；
+  3. 看门狗 1s 采样，心跳停 10s → **0xE2 → 全量 dump**（含 SVPRCD1 记录页 + 心跳计数）；
+  4. run_c6 脚本在 `sc start` 后立即拉起 1 线程 yghv_stress 心跳（持续 VMEXIT 喂狗，
+     消除空闲误触发），测试结束清理进程。
+- 205j 之后：任何冻结形态 ≤10s 内变成 0xE2 dump；dump 里 `grep 'SVPRCD1'` + 心跳
+  计数 = 确定性拿到 exitcode/rip。若心跳没断（机器真活着）而系统仍无响应 → 也是
+  有效判据（区分"核死"与"系统活但调度瘫"）。
+- 状态：205j 已提交；镜像归档；机器未加载 205；稳定版未动。
+- 提交：本记录。
