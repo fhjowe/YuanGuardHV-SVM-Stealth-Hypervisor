@@ -4665,3 +4665,28 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   returns。三种路径全部有输出，不再有盲区。
 - 状态：205h 已提交；镜像归档；机器未加载 205；稳定版未动。
 - 提交：本记录。
+
+### 9.240 2026-09-18 205h 实机判读 + 205f dump 考古 + step205i（魔数记录页 = 确定性证据恢复）
+
+- 用户自行跑 205h：**又静默硬冻**（无 dump、log 停在 cpu0 VMCB dump、无 PARK 行；
+  `ss=0x493` 硬件直读已生效且确定，`exc=0xFFFFBFFF` 如设计）。三轮对照定案：
+  **park 路径里 205g/h 新加的 ZwWriteFile 在 VMEXIT 岛上下文直接锁死全机**（岛线程是
+  唯一跑岛的线程，阻塞它则看门狗同死→无 0x101→静默），而 205f 无 trace 的 park 活到
+  0x101。"终末路径阻塞无所谓"推理被证伪，9.229 纪律第二次应验。
+- **205f 全量 dump（1.2GB，0x101 时落盘）考古（只读）**：按 SVP_SHARED 12 字节前缀
+  扫出 4.5 万假阳性；按 exitcode∈{NPF 0x400, INVALID 全FF, INTR 0x60, SHUTDOWN 0x7F,
+  #PF 0x4E} + FaultCpu 0-11 精扫，全部候选 rip 均非内核 VA → **未找到可信记录**。
+  结合 205f 无 park-trace、0x101 在 15s 出现：最可能是 **triple fault→SHUTDOWN（未拦截）
+  →无 VMEXIT→无记录**。教训：靠 RAM 模式扫 dump = 大海捞针。
+- **step205i（离线，构建/回归全绿，镜像 `141f1560...`）**：
+  1. **魔数记录页**：`yghv_sv205_start` 分配专页并在宿主上下文把 PA 写进 progress.log
+     （`s205 rec pa=0x...`）；岛内任何致命路径（异常 devirt 前与 park 前）**纯内存**写
+     `{magic 'SVPRCD1', exitcode, rip, info1, info2, cpu, exitintinfo}`。失败 boot 后
+     `grep 'SVPRCD1' MEMORY.DMP` 一步定位 → 确定性证据恢复，永不大海捞针；
+  2. **park 恢复静默**（删 205g/h 的 park trace——岛内 ZwWriteFile 锁机实锤）；
+  3. **拦截 SHUTDOWN(0x7F)**：triple fault→shutdown 变成可记录+可驻车的 VMEXIT，
+     静默死通道关闭。
+- 205i 的失败循环（若仍失败）：任意致命路径 → 记录页+park → 15s → 0x101 → 全量 dump
+  → grep 'SVPRCD1' → 精确 exitcode/rip。每 boot 必有产出。
+- 状态：205i 已提交；镜像归档；机器未加载 205；稳定版未动。
+- 提交：本记录。
