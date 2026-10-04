@@ -44,11 +44,24 @@ extern "C" {
 int yghv_protect_on_npf_write_bare(UINT64 guest_cr3, UINT32 cpl,
                                    UINT64 gpa, UINT64 *rearm_gpa, int *flip);
 int yghv_protect_arm_page_bare(UINT64 gpa);
+UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
 // 9.250: the re-arm slot moved INTO the per-VCPU VMCB (ControlArea.GuestPaOfGhcb,
 // repurposed — SEV-ES only, we are not SEV). The old machine-global
 // g_S206RearmGpa raced when two cores had concurrent protected-write cycles.
+
+// 9.250c: fatal-state record, stored per-VCPU in the VPD's Padding1..Reserved1
+// pair is too small; instead we keep a small static record (one crash at a
+// time is enough) AND the caller KeBugCheckEx's with the details, so the full
+// dump carries everything. Pure memory, island-safe.
+static volatile UINT64 g_S206Fatal[4] = { 0 };
+static VOID S206RecordFatal(UINT64 exitcode, UINT64 rip, UINT64 extra) {
+    g_S206Fatal[0] = 0x3156433252505653ULL; /* 'SVPR2CV1' */
+    g_S206Fatal[1] = exitcode;
+    g_S206Fatal[2] = rip;
+    g_S206Fatal[3] = extra;
+}
 
 EXTERN_C DRIVER_INITIALIZE Sv206Entry;
 static DRIVER_UNLOAD SvDriverUnload;
@@ -923,35 +936,65 @@ SvHandleVmExit (
         // flush by intercepting; ASID-flush is the conservative equivalent),
         // RIP = NRip (valid for CR-access exits).
         //
-        // The new CR3 value is NOT in ExitInfo2 (the frozen dump shows 0):
-        // decode the source GPR from the fetched instruction
-        //   [REX] 0F 22 /r  — source = modrm.rm, extended by REX.B,
-        // and read it from the PUSHAQ'd GUEST_REGS (reg n => index 15-n).
+        // The new CR3 value is NOT in ExitInfo2 (the frozen dump shows 0) and
+        // DecodeAssist does NOT fill GuestInstructionBytes for CR exits either
+        // (frozen dump: NumOfBytesFetched=0). Self-fetch the instruction: walk
+        // the guest page tables (current CR3 = Padding1, set by earlier CR3
+        // writes... chicken-and-egg for the FIRST one — prepare seeds Padding1
+        // with the prepare-time CR3, which IS correct for the first window)
+        // via yghv_protect_guest_va_to_pa, then read through the identity NPT.
+        // Decode [REX] 0F 22 /r. Any failure = bugcheck with the state, NEVER a
+        // garbage CR3 (that triple-faults instantly, the 12:34 failure mode).
         //
         {
             UINT64 newCr3 = 0;
-            UINT8 const *ib = VpData->GuestVmcb.ControlArea.GuestInstructionBytes;
-            UINT8 n = VpData->GuestVmcb.ControlArea.NumOfBytesFetched;
             UINT32 rex = 0, rm = 0, ok = 0;
+            UINT64 rip = VpData->GuestVmcb.StateSaveArea.Rip;
+            UINT64 curCr3 = VpData->HostStackLayout.Padding1;
+            UINT8  ib[8] = { 0 };
+            UINT8 *inst = NULL;
 
-            if (n >= 3 && ib[0] == 0x0F && ib[1] == 0x22) {
-                rm = ib[2] & 7;                          /* MOV cr3, rm (no REX) */
+            /* self-fetch: guest VA -> GPA (guest PT walk) -> SPA (identity NPT)
+               -> VA (direct map). Falls back to DecodeAssist bytes if present. */
+            UINT8 n = VpData->GuestVmcb.ControlArea.NumOfBytesFetched;
+            if (n > 0) {
+                for (UINT8 q = 0; q < 8 && q < n; q++)
+                    ib[q] = VpData->GuestVmcb.ControlArea.GuestInstructionBytes[q];
+                inst = ib;
+            } else if (curCr3 != 0) {
+                UINT64 gpa = yghv_protect_guest_va_to_pa(curCr3, rip);
+                if (gpa) {
+                    PHYSICAL_ADDRESS pa;
+                    pa.QuadPart = (LONGLONG)gpa;
+                    PVOID va = MmGetVirtualForPhysical(pa);
+                    if (va) {
+                        for (UINT8 q = 0; q < 8; q++)
+                            ib[q] = ((volatile UINT8 *)va)[q];
+                        inst = ib;
+                    }
+                }
+            }
+
+            if (inst && inst[0] == 0x0F && inst[1] == 0x22) {
+                rm = inst[2] & 7;                        /* MOV cr3, rm */
                 ok = 1;
-            } else if (n >= 4 && (ib[0] & 0xF0) == 0x40 &&
-                       ib[1] == 0x0F && ib[2] == 0x22) {
-                rex = ib[0] & 0xF;
-                rm = (ib[3] & 7) | ((rex & 1) << 3);     /* REX.B extends rm */
+            } else if (inst && (inst[0] & 0xF0) == 0x40 &&
+                       inst[1] == 0x0F && inst[2] == 0x22) {
+                rex = inst[0] & 0xF;
+                rm = (inst[3] & 7) | ((rex & 1) << 3);   /* REX.B extends rm */
                 ok = 1;
             }
-            if (ok && rm != 4 /* RSP never holds a CR3 */) {
+            if (ok && rm == 4) ok = 0;      /* RSP never sources a CR3 write */
+            if (ok) {
                 newCr3 = (&guestContext.VpRegs->R15)[15 - rm];
             }
             if (!ok) {
-                /* decode failed: fall back to EXITINFO1 bits[7:6]
-                   (0=RAX 1=RCX 2=RDX 3=RBX — APM register encoding) */
-                UINT32 reg = (UINT32)((VpData->GuestVmcb.ControlArea.ExitInfo1 >> 6) & 3ULL);
-                static UINT16 const regOff[4] = { 15, 14, 13, 12 }; /* Rax,Rcx,Rdx,Rbx */
-                newCr3 = (&guestContext.VpRegs->R15)[regOff[reg]];
+                /* decode failed (PT walk miss / unknown shape): DO NOT fake a
+                 * CR3 — bugcheck with the state (observable) instead of the
+                 * garbage-CR3 triple fault (instant reset, no evidence). */
+                S206RecordFatal(0x20631, rip, curCr3);
+                KeBugCheckEx(0xE2, 0x20631, rip, curCr3,
+                             VpData->GuestVmcb.ControlArea.ExitInfo1);
             }
             VpData->GuestVmcb.StateSaveArea.Cr3 = newCr3;
             VpData->HostStackLayout.Padding1 = newCr3;
@@ -979,13 +1022,31 @@ SvHandleVmExit (
                 VpData->GuestVmcb.ControlArea.NRip;
         }
         break;
+    case VMEXIT_SHUTDOWN /* 0x7f */:
+        //
+        // 9.250c: the guest triple-faulted (SHUTDOWN state). With SHUTDOWN
+        // intercepted this becomes an OBSERVABLE bug check carrying the last
+        // guest RIP — never the silent instant reset.
+        //
+        S206RecordFatal(VMEXIT_SHUTDOWN,
+                        VpData->GuestVmcb.StateSaveArea.Rip,
+                        VpData->HostStackLayout.Padding1);
+        KeBugCheckEx(0xE2, 0x20601, VMEXIT_SHUTDOWN,
+                     VpData->GuestVmcb.StateSaveArea.Rip,
+                     VpData->HostStackLayout.Padding1);
+        break;
     default:
-        // 9.244: the 205k discriminator's exception-bugcheck block was reverted;
-        // exceptions are not intercepted in the 206-A baseline (see NOTE at the
-        // intercept setup), so this stays the verbatim upstream unrecoverable path.
-        SV_DEBUG_BREAK();
-#pragma prefast(suppress : __WARNING_USE_OTHER_FUNCTION, "Unrecoverble path.")
-        KeBugCheck(MANUALLY_INITIATED_CRASH);
+        // 9.250c: an unhandled exit code must be OBSERVABLE (bugcheck with the
+        // exit info) — a plain KeBugCheck here is indistinguishable from the
+        // silent-reset failure mode. The 12:12 crash (0xE2 zero-params) was
+        // exactly this path with ExitCode=0x13.
+        S206RecordFatal(VpData->GuestVmcb.ControlArea.ExitCode,
+                        VpData->GuestVmcb.StateSaveArea.Rip,
+                        VpData->GuestVmcb.ControlArea.ExitInfo1);
+        KeBugCheckEx(0xE2, 0x20600,
+                     VpData->GuestVmcb.ControlArea.ExitCode,
+                     VpData->GuestVmcb.StateSaveArea.Rip,
+                     VpData->GuestVmcb.ControlArea.ExitInfo1);
     }
 
     //
@@ -1214,6 +1275,10 @@ SvPrepareForVirtualization (
     // removes the native CR3-write TLB flush. Cost: one VMEXIT per context
     // switch. Only in the g_npt mode; 206-A baseline stays verbatim.
     VpData->GuestVmcb.ControlArea.InterceptCrWrite |= 0x0008;
+    // 9.250c: intercept SHUTDOWN (bit 31) — a guest triple fault then becomes
+    // an observable VMEXIT (handler bugchecks with the state) instead of the
+    // CPU dying silently = the instant-reset failure mode.
+    VpData->GuestVmcb.ControlArea.InterceptMisc1 |= (1u << 31);
 #endif
     VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN;
 
@@ -1315,6 +1380,13 @@ SvPrepareForVirtualization (
     VpData->HostStackLayout.Self = VpData;
     VpData->HostStackLayout.HostVmcbPa = hostVmcbPa.QuadPart;
     VpData->HostStackLayout.GuestVmcbPa = guestVmcbPa.QuadPart;
+#if defined(YGHV_206B_GNPT)
+    // 9.250c: seed the per-VCPU current-guest-CR3 slot with the CR3 at
+    // prepare time (correct for the first CR3 self-fetch; the CR3-write
+    // exit keeps it current from then on). Padding1 is an otherwise-unused
+    // alignment field in the HostStackLayout we own.
+    VpData->HostStackLayout.Padding1 = __readcr3();
+#endif
 
     //
     // Set an address of the host state area to VM_HSAVE_PA MSR. The processor
