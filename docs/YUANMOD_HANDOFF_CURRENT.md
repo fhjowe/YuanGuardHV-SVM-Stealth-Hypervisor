@@ -5006,3 +5006,40 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   对 CR4 相同，一套解码通用。
 - 构建全绿，镜像 `9f1e2c19...` 归档；default 回归干净；已提交。
 - 提交：本记录。
+
+### 9.253 2026-10-04 run_c10（40dfde66）卡死判读：运行期持 FastMutex 调 ZwWriteFile = 新雷；addpage 遥测改岛内 ring
+
+- **回补（提交即记录）**：9.251 DENY 环（da975e2d）→ 9.252 NPF-entry 环 + addpage
+  progress.log 遥测（4c9410b6）→ 9.252b addpage trace 206 门控（29ab820）→ 镜像
+  40dfde66。
+- **run_c10 实况（用户执行）**：进入全绿（entry rc=0、coexist dispatch、npt set ok），
+  selftest 启动后**整体挂起**（症状从 AV 变为卡死）：脚本停在
+  `--- yghv_ctl selftest ---` 40+min，系统本身存活。
+- **只读取证（挂起态现场）**：
+  - progress.log 止于 `s206 addpage va=0x24000d7bb90`，**下一行（相邻语句）
+    `s206 addpage gpa` 缺失**——yghv_trace 逐条 write-through（ZwWriteFile+
+    ZwFlushBuffersFile），缺行 = 第二次调用永远没写完 → 卡点唯一：同步盘写内部。
+  - selftest 子进程（powershell PID 13320）存活但 8s 采样 CPU 增量=0，主线程
+    Wait/Executive = 阻塞在内核 I/O 等待，非自旋。
+  - 高 CPU 核（0/2/6 @69%）为 IDE/agent 自身负载（ZCode/Qoder/msedgewebview2），
+    排除；系统 40min 存活 = 全核上下文切换持续流动 = **CR3/CR4 仿真自取指路径首次在
+    coexist+真实桌面负载下验证通过**（银边）。
+  - 事件日志无 storport 129/153 超时。
+- **根因定性**：`yghv_protect_add_page_for_locked` 在 `ExAcquireFastMutex
+  (g_protect_lock)`（APC_LEVEL）持锁下调用两条 `yghv_trace_u64` → 同步 FS 写。
+  9.229 教训（岛内禁 NT API/FS I/O）推广成文：**运行期（全核虚拟化后）驱动内任何
+  Zw*File 都是无限期等待风险**；持锁+APC_LEVEL 变量下首个样本即命中（此前 5 次运行期
+  写均为 PASSIVE 无锁，全部成功）。
+- **修复（本提交）**：addpage 遥测改岛内 `g_s206_addlog` ring（va/gpa 对 16 槽，
+  protect.c static；`yghv_s206_flush_addlog` 由 DriverUnload 在 Sv206CoopUnload
+  **之后**与 deny 环一起落盘——裸金属态 FS 写安全）。运行期唯一残余 FS 写 =
+  control_device.c `ioctl code`（PASSIVE 无锁，5/5 成功）——按单变量原则保留，
+  run_c11 若再卡此条再升级全 ring 化。
+- 构建：default 绿（回归 0）+ STEP=206/COEXIST/GNPT 绿；串标记 `s206 addpage`=0、
+  `s206 addlog va`=1、npf/coexist=2。镜像 SHA256 `f46c7ccc…`（md5 `127073fb`）归档
+  `D:\aaaaaavm\yuanguard_hv_step206c2b_20261004.sys`；脚本
+  `D:\aaaaaavm\run_c11_step206c2b.ps1`（=run_c10 换镜像）。
+- **判读不变**：C2 判据 = npf-entry gpa vs addlog gpa（现两组都走 ring，sc stop
+  落盘后一并可见）；等 = NONE 分支逻辑，不等 = 页迁移/CR3 错，npf 环空 = NPF 未到
+  handler。
+- 提交：本记录。
