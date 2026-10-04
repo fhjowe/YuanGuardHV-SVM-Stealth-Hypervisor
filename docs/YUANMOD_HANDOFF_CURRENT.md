@@ -5383,3 +5383,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   写 → DENY；需先证 APC/异常派发不会以目标 CR3 写用户内存）；②真实产品场景
   （Minecraft/Forge）页选取与目标选择流程化。
 - 提交：本记录。
+
+### 9.265 2026-10-04 run_c16×206c5a 判读：C4 回归三 gate 全绿 + 扩容环实证，**GVA 解码器回退（gva=0）→ 原因码版 206c5b**
+
+- **run_c16 重跑（206c5a/58841e76，用户执行）**：三 gate 全 PASS（BLOCKED/看门狗/
+  LANDED）、126ms 卸载、post sanity 0。扩容环实证：npf 30 条（含恰 1 条攻方
+  cr3=0x1E3EF4000）、vr 30 条 = 29 ALLOW + **恰 1 条 verdict=2（DENY）**、dbg
+  29 条 1:1 对应 ALLOW——单写单 NPF 零自旋再次确认。
+- **GVA 解码器首样本 = 回退**：deny 环 4 槽新步长生效，但 `gva=0x0`——解码器
+  未产出 GVA（递送走 9.261 CR2=0/P=0 兜底，BLOCKED 正常）。同时发现 run_c16 的
+  `First 200` 截断了 deny/addlog 行（npf 90 行 + vr 60 行吃满），已放宽至 500。
+- **原因码版（206c5b/SHA256 9bfed24a，md5 50e39c2a，提交 44918e6）**：解码器改
+  返回原因码（1=无CR3 2=页界 3=走表失败 4=无直接映射 5=16位地址 6=opcode白名单
+  外 7=寄存器操作数 8=截断 9=RIP-rel未知imm 10=非canonical），回退时 deny gva
+  槽记 `0xDEAD0000|reason`；deny 环改 5 槽/条，第 5 槽记**故障 rip**（可反汇编
+  反查指令形态）。run_c16 改部署 206c5b。
+- **候选嫌疑（按先验排序）**：⑥ opcode 白名单外（.NET Framework Marshal.
+  WriteInt64 是 CLR 原生 FCall，MSVC 编译形态未知——可能不是 89/89+REX 简单
+  形态）；③ 自取指走表失败（该链路此前从未独立验证——CR 写路径一直由
+  EXITINFO1 主路径兜底）。一轮 run 即可定位。
+- 提交：本记录。
