@@ -149,11 +149,20 @@ static NTSTATUS yghv_protect_stop_locked(void);
 static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_va);
 static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id);
 
+/* 9.271: PA->VA via the arithmetic direct map (0xFFFF800000000000 + PA).
+ * MmGetVirtualForPhysical is EMPIRICALLY UNRELIABLE on this build: it
+ * consults per-page state and returns NULL for valid in-use RAM pages
+ * (run 206c5f: NULL for the target's live PML4 page while succeeding on
+ * other pages). The kernel direct map is global (G-bit PML4Es) and linear,
+ * so arithmetic translation is deterministic and island-safe. */
+PVOID yghv_pa_to_va(uint64_t pa) {
+    return (PVOID)(0xFFFF800000000000ULL + pa);
+}
+
 static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
     uint64_t *va;
     if (!table_pa) return 0;
-    va = MmGetVirtualForPhysical((PHYSICAL_ADDRESS){ .QuadPart = table_pa });
-    if (!va) return 0;
+    va = (uint64_t *)yghv_pa_to_va(table_pa);
     return va[index];
 }
 
@@ -720,24 +729,19 @@ void yghv_protect_control_walk_diag(uint64_t out[5]) {
     if (!cr3)
         return;
     {
-        PHYSICAL_ADDRESS pa;
         uint64_t *v1;
-        pa.QuadPart = (LONGLONG)(cr3 & M);
-        v1 = (uint64_t *)MmGetVirtualForPhysical(pa);
+        v1 = (uint64_t *)yghv_pa_to_va(cr3 & M);
         out[1] = (uint64_t)v1;
-        if (!v1)
-            return;
         {
             uint64_t pml4e = v1[(va >> 39) & 0x1FF];
             uint64_t *v2;
             out[2] = pml4e;
-            if (!(pml4e & 1))
+            if (!(pml4e & 1)) {
+                out[0] = yghv_protect_guest_va_to_pa(cr3, va);
                 return;
-            pa.QuadPart = (LONGLONG)(pml4e & M);
-            v2 = (uint64_t *)MmGetVirtualForPhysical(pa);
+            }
+            v2 = (uint64_t *)yghv_pa_to_va(pml4e & M);
             out[3] = (uint64_t)v2;
-            if (!v2)
-                return;
             out[4] = v2[(va >> 30) & 0x1FF];
         }
         out[0] = yghv_protect_guest_va_to_pa(cr3, va);

@@ -48,6 +48,7 @@ void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 UINT64 yghv_protect_control_walk_gpa(void);
 void yghv_protect_control_walk_diag(UINT64 out[5]);
+void *yghv_pa_to_va(UINT64 pa);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
 /* 9.258 (206-C3): control-plane read of the last protection verdict hit. */
@@ -866,13 +867,9 @@ SvHandleVmrun (
 static UINT64 S206ReadGuestPt(UINT64 table_pa, UINT64 index)
 {
     UINT64 *va;
-    PHYSICAL_ADDRESS pa;
     if (!table_pa)
         return 0;
-    pa.QuadPart = (LONGLONG)table_pa;
-    va = (UINT64 *)MmGetVirtualForPhysical(pa);
-    if (!va)
-        return 0;
+    va = (UINT64 *)yghv_pa_to_va(table_pa);
     return va[index];
 }
 
@@ -917,18 +914,6 @@ static UINT32 S206DecodeStoreGva(
             yghv_protect_control_walk_diag(ctl);
             static const UINT64 PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
             UINT64 pml4e, pdpte, pde, pte;
-            {
-                /* decisive probe: the PML4 page is mapped RAM by definition;
-                 * if the PA->VA helper returns NULL for it, MmGetVirtualFor
-                 * Physical itself is the broken link (9.250c's unexplained
-                 * self-fetch failure, same shape). aux = the PML4 PA. */
-                PHYSICAL_ADDRESS pml4pa;
-                pml4pa.QuadPart = (LONGLONG)(curCr3 & PT_ADDR_MASK);
-                if (!MmGetVirtualForPhysical(pml4pa)) {
-                    if (auxOut) *auxOut = curCr3 & PT_ADDR_MASK;
-                    return 16;
-                }
-            }
             pml4e = S206ReadGuestPt(curCr3 & PT_ADDR_MASK, (rip >> 39) & 0x1FF);
             if (!(pml4e & 1)) {
                 if (auxOut) *auxOut = pml4e;
@@ -967,18 +952,12 @@ static UINT32 S206DecodeStoreGva(
                 UINT64 pte2 = yghv_protect_guest_va_to_pa(curCr3, rip);
                 if (!pte2)
                     return 3;      /* DG_WALK_FAIL; ctl[] = control evidence */
-                pa.QuadPart = (LONGLONG)pte2;
+                va = yghv_pa_to_va(pte2);
             }
-            va = MmGetVirtualForPhysical(pa);
-            if (!va)
-                return 4;          /* DG_NO_DIRECTMAP */
             for (i = 0; i < 15; i++)
                 ib[i] = ((volatile UINT8 *)va)[i];
         } else {
-            pa.QuadPart = (LONGLONG)gpa;
-            va = MmGetVirtualForPhysical(pa);
-            if (!va)
-                return 4;          /* DG_NO_DIRECTMAP */
+            va = yghv_pa_to_va(gpa);
             for (i = 0; i < 15; i++)
                 ib[i] = ((volatile UINT8 *)va)[i];
         }
@@ -1413,9 +1392,7 @@ SvHandleVmExit (
             } else if (curCr3 != 0) {
                 UINT64 gpa = yghv_protect_guest_va_to_pa(curCr3, rip);
                 if (gpa) {
-                    PHYSICAL_ADDRESS pa;
-                    pa.QuadPart = (LONGLONG)gpa;
-                    PVOID va = MmGetVirtualForPhysical(pa);
+                    PVOID va = yghv_pa_to_va(gpa);
                     if (va) {
                         for (UINT8 q = 0; q < 8; q++)
                             ib[q] = ((volatile UINT8 *)va)[q];
