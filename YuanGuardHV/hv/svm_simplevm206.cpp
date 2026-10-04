@@ -1000,10 +1000,27 @@ SvHandleVmExit (
                 }
                 if (vr == 2 /* YGHV_NPF_DENY */)
                 {
-                    UINT64 ec = 0;
-                    if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x1ULL) ec |= 1;
-                    if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x2ULL) ec |= 2;
-                    if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x4ULL) ec |= 4;
+                    UINT64 ec;
+                    // 9.261 (206-C4a run): an NPF is a VMEXIT, not an
+                    // exception — the CPU never writes CR2 on the way out, so
+                    // the #PF injected below used to carry whatever stale CR2
+                    // this core's last REAL #PF left (per-core, drifting).
+                    // Windows resolves the fault at the CR2 VA, not at the
+                    // store: a resolvable stale VA = soft-fault + IRET =
+                    // RETRY of the foreign store (the c12 spurious-retry
+                    // mechanism, DENY branch this time). c16 measured it: one
+                    // attacker store -> 8+ DENYs (ring saturated) -> the retry
+                    // slipped through an ALLOW reopen window and LANDED
+                    // instead of taking the AV. c10/c11's clean AVs were luck
+                    // (stale CR2 happened to point at an unresolvable VA).
+                    // Force a deterministic user AV: CR2 = the never-mapped
+                    // null page with a self-consistent ec (P=0, W=1, U=1) —
+                    // no resolve path can succeed there, so Windows delivers
+                    // STATUS_ACCESS_VIOLATION at the faulting RIP every time.
+                    // (Accurate GVA reconstruction via DecodeAssist is a
+                    // later refinement; the catch semantics do not need it.)
+                    VpData->GuestVmcb.StateSaveArea.Cr2 = 0;
+                    ec = 0x2 | 0x4;   /* P=0, W=1, U=1 */
                     VpData->GuestVmcb.ControlArea.EventInj =
                         (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
                         0x0EULL | (ec << 32);

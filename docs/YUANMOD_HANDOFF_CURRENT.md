@@ -5254,3 +5254,38 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `faa4cbda`）归档 `D:\aaaaaavm\yuanguard_hv_step206c4a_20261004.sys`；脚本
   `D:\aaaaaavm\run_c16_step206c4.ps1`。机器未加载 206；稳定版未动。
 - 提交：本记录。
+
+### 9.261 2026-10-04 run_c16 首跑（206c4a/faa4cbda）判读：跨进程 arm/ALLOW/看门狗全实证 + **DENY #PF 从未设置 CR2 = 攻击者写自旋落地**；206c4b 修复（md5 7b4c52d4）
+
+- **9.260b 修复先行**：yghv_ctl.ps1 param 块补 `$Arg3`（Position 3）——mmf-loop 的
+  info 文件实参绑定失败致目标发布超时（06e8f58）。
+- **run_c16 实况（用户执行，全程零蓝屏）**：进入全绿；mmf-open probe OK；
+  目标 mmf-loop（pid=10592）发布 va=0x1F602900000；set-target→protect-page(0x810)
+  OK→start；list-pages `gpa=0x166524000 armed=1`——**外部控制器对另一进程的页
+  完成 arm，206-C4 驱动面首次实机工作**。
+- **gate2 PASS（看门狗）**：杀目标 3s 后 list-targets 槽全零；gate3 PASS：攻击者
+  第二次写 LANDED（无目标=无保护）；压测×2 存活；sc stop 81ms；post sanity 0。
+- **gate1 FAIL（本轮核心发现）**：攻击者（pid=2876）一次写 **LANDED**，且 deny 环
+  **8 条饱和**（cr3=0x1CB0DB000 ≠ 目标 0x28FB3D000，cpl=3，gpa=0x166524000）。
+  攻守双方是仅有的两个映射该 section 的进程，攻击者只写一次——**1 次写 ≥8 次
+  DENY 只能是注入 #PF 后 guest 内 spurious-retry 自旋**，自旋第 9 次重试撞进目标
+  ALLOW 的重开窗（目标每 400ms 写一次，ALLOW=重开可写+#DB 前窗口）→ 写入落地。
+  vr 环 16 条全 ALLOW（目标）；ATT2 读值 0xC4C4…29 = 目标写覆盖了攻击者落地的
+  0xDEADBEEF（时间线自洽）。
+- **根因（vendored NPF DENY 分支）**：**NPF 是 VMEXIT 不是异常，CPU 不写 CR2**；
+  注入 #PF 时从未设置 `SSA.Cr2` → guest #PF handler 拿到的是本核上一次真 #PF 的
+  陈旧 CR2（per-core 漂移）。Windows 按 CR2 的 VA 解析 fault：解析得动 → IRET →
+  重试 store → NPF → DENY → 自旋。**c10/c11 的"DENY→干净 AV"是运气**（陈旧 CR2
+  恰好指向不可解析 VA → Windows 直接递 AV）；c12 的 1414 风暴即同一机制
+  （9.258 只修了 NONE 分支的注入，DENY 分支的 CR2 缺陷一直在）。
+- **修复（206c4b）**：DENY 分支注入前 `SSA.Cr2 = 0` + ec 强制 `0x2|0x4`（P=0,
+  W=1, U=1）——CR2=永不映射的空页且 ec 与 PTE 状态自洽（not-present），Windows
+  走标准 demand-fault→未提交→**确定性递 STATUS_ACCESS_VIOLATION**（异常地址=
+  store 的 RIP，TryWrite 必捕获 BLOCKED）。准确 GVA 重建（DecodeAssist+modrm
+  解码）记为后续精化，捕获语义不需要它。NONE/reflect 分支按单变量原则本轮不动。
+- 构建：default + 206 双绿；镜像 SHA256 `285a8035…`（md5 `7b4c52d4`）归档
+  `D:\aaaaaavm\yuanguard_hv_step206c4b_20261004.sys`；run_c16 改部署 206c4b。
+- **run_c16 重跑判据（206-C4 PASS）**：gate1 变为确定性 BLOCKED（deny 环恰 1–2 条
+  即攻击者单写，不再饱和自旋）+ gate2/gate3 维持 + 遥测同 9.260 判读。gate1 仍
+  LANDED 才需要下钻（DecodeAssist GVA / KPTI 变体）。
+- 提交：本记录。
