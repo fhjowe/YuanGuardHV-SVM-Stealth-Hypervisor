@@ -281,7 +281,7 @@ public static class YghvMem
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr h);
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern IntPtr VirtualQueryEx(IntPtr hProcess, IntPtr addr,
+    public static extern bool VirtualQueryEx(IntPtr hProcess, IntPtr addr,
         out MEMORY_BASIC_INFORMATION mbi, uint len);
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr,
