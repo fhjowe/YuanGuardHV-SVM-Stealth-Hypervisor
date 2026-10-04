@@ -306,9 +306,9 @@ public static class YghvMem
         IntPtr addr)
     {
         MEMORY_BASIC_INFORMATION mbi;
-        uint r = VirtualQueryEx(h, addr, out mbi,
+        bool r = VirtualQueryEx(h, addr, out mbi,
             (uint)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION)));
-        if (r == 0)
+        if (!r)
         {
             mbi = new MEMORY_BASIC_INFORMATION();
             mbi.BaseAddress = IntPtr.Zero;
