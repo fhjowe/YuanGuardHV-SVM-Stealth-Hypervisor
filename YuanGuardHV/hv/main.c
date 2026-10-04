@@ -5142,6 +5142,24 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         extern NTSTATUS Sv206Entry(struct _DRIVER_OBJECT *, PUNICODE_STRING);
         npt_identity_map_range(&g_npt, 0, 0x8000000000ULL);
         yghv_trace_u64("s206b ncr3", g_npt.pml4_pa);
+        /* 206-C1: create the control device BEFORE virtualizing (PASSIVE_LEVEL
+         * IoCreateDevice/SymbolicLink). Once the OS runs as guest, the client
+         * still reaches \\.\YuanGuardHV — the IRP path is ordinary Windows
+         * execution in guest mode (no VMEXIT), and set-target/add-page IOCTLs
+         * only touch g_protect + g_npt (pure, no VMRUN). DriverUnload already
+         * runs yghv_control_device_cleanup. */
+        sv = yghv_control_device_init(d);
+        if (sv) {
+            LOG_ERROR("s206b: control device init failed 0x%x", sv);
+            yghv_protect_cleanup();
+            npt_cleanup(&g_npt);
+            svm_core_cleanup();
+            if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+            g_guest_code_page = NULL;
+            yghv_trace_close();
+            KeRevertToUserAffinityThread();
+            return (NTSTATUS)sv;
+        }
         yghv_trace("s206b coexist dispatch");
         sv = Sv206Entry(d, r);
         yghv_trace_u64("s206b entry rc", (uint64_t)(NTSTATUS)sv);
