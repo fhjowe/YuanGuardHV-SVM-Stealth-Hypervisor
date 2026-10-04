@@ -5289,3 +5289,29 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   即攻击者单写，不再饱和自旋）+ gate2/gate3 维持 + 遥测同 9.260 判读。gate1 仍
   LANDED 才需要下钻（DecodeAssist GVA / KPTI 变体）。
 - 提交：本记录。
+
+### 9.262 2026-10-04 run_c16 重跑（206c4b/7b4c52d4）：**206-C4 正式 PASS** —— 跨进程保护产品语义端到端闭环
+
+- **三 gate 全 PASS**：gate1 攻击者（pid=5016）单写 `BLOCKED (value still
+  0xC4C40000000025)`；gate2 杀目标后看门狗释放槽（active=0 pid=0 pages=0）；
+  gate3 攻击者第二次写 `LANDED`（无目标=无保护）。
+- **CR2 修复判定性证据**：deny count=0x3（3 槽 = **恰 1 条 DENY**，攻击者
+  cr3=0x1F0521000 / gpa=0x1D12F8000 / cpl=3）——对比 206c4a 的 0x18（8 条饱和
+  自旋）。攻击者单写 → 1 次 NPF → DENY → 注入 #PF（CR2=0, ec P=0|W=1|U=1）→
+  AV 确定性递送 → CSE 捕获。**9.261 根因分析完全兑现，零自旋零风暴。**
+- **遥测终判**：npf 8 条全目标 cr3=0x2794FA000（cap 8 饱和，真实次数 ≥8）；vr
+  16 条全 ALLOW；dbg 8 条 #DB 重武装（rip=0x7ff87ee51b95 恒定=目标 store，
+  rflags=0x346=TF，DR6=0xFFFF4FF0 纯 TF 单步）；addlog va/gpa 对齐（
+  0x1B8458A0000 → 0x1D12F8000）；deny 唯一攻击者条目，**无任何无辜 CR3**。
+  lasthit=0x1D12F8000（0x80F 链通）。
+- 基础设施：mmf-open probe OK、目标发布/protect-page(0x810)/start 全 OK、
+  压测×2 存活、**sc stop 73ms 在线卸载**、post-unload sanity 0。全程零蓝屏。
+- **206-C4 关闭**：产品语义（目标自己的写 ALLOW + 外部进程写 DENY）在
+  OS-as-guest 下端到端硬件实证：外部控制器 → set-target → protect-page(0x810
+  按pid) → arm → 目标 ALLOW+#DB 重武装循环 → 攻击者 DENY→AV(BLOCKED) →
+  目标死亡 → 看门狗释放 → 攻击者写落地 → 在线卸载。
+  （遗留小项：npf/deny/dbg 环 cap 小无回绕，长跑会静默截断——按需扩容；DENY
+  的 AV 报告地址是 VA 0 而非真实 GVA，DecodeAssist 精确重建记为后续精化。）
+- **下一步（按用户优先级）**：实进程保护试点（把管线指向真实目标进程：
+  目标选择 + 页选取走现有控制面，MMF 介质已证），或 206-C5 控制面继续加固。
+- 提交：本记录。
