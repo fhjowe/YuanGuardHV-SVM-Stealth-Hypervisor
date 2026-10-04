@@ -4839,6 +4839,12 @@ static void yghv_join_system_thread(HANDLE h) {
 }
 
 void DriverUnload(struct _DRIVER_OBJECT *d) {
+#if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
+    /* 9.246: devirtualize all cores (upstream CPUID-backdoor loop) + unregister
+     * the vendored power callback BEFORE any yghv teardown frees the NPT the
+     * host loops still translate through. */
+    { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
+#endif
 #if YGHV_HOOK_RENDEZVOUS_TEST
     yghv_hook_rendezvous_join();
 #endif
@@ -4917,15 +4923,13 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     ULONG i;
     ULONG online;
 
-#if YGHV_BAREMETAL_STEP == 206
-    /* step206-A (9.244): run the VERBATIM vendored upstream SimpleSvm entry body
-     * (svm_simplevm206.cpp/.hpp/.asm; only renamed DriverEntry->Sv206Entry) as
-     * the OS-as-guest entry vehicle. 205k proved this exact upstream code + our
-     * control-area deltas enters real Windows fine; hand-copied variants (205x)
-     * all froze at first VMRUN, so we stop re-writing and compile the original.
-     * Its own NPT (SvBuildNestedPageTables) stays in place for 206-A to keep the
-     * only changed variable vs C0 = "coexists with yuanguard in one image";
-     * switching NCr3 to g_npt is the 206-B follow-up once entry is proven. */
+#if YGHV_BAREMETAL_STEP == 206 && !defined(YGHV_206B_COEXIST)
+    /* step206-A (9.244) baseline: run the VERBATIM vendored upstream SimpleSvm
+     * entry body as the OS-as-guest vehicle, dispatched BEFORE yghv's own init
+     * (so it is behavior-equivalent to loading C0's SimpleSvm.sys standalone;
+     * uses upstream's own NPT). Proven on HW 2026-10-04 (9.245): entered +
+     * survived 4x100s stress. The COEXIST variant (9.246, dispatched after the
+     * full yghv init further below) instead shares g_npt. */
     {
         extern NTSTATUS Sv206Entry(struct _DRIVER_OBJECT *, PUNICODE_STRING);
         return Sv206Entry(d, r);
@@ -5109,7 +5113,7 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     return STATUS_SUCCESS;
 #endif
 
-#if YGHV_BAREMETAL_STEP >= 1
+#if YGHV_BAREMETAL_STEP >= 1 && YGHV_BAREMETAL_STEP != 206
     {
         NTSTATUS st2 = yghv_baremetal_step_test(YGHV_BAREMETAL_STEP);
         yghv_trace("bm done");
@@ -5455,8 +5459,45 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         }
     }
     sv = yghv_control_device_init(d);
+#if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
+    /* 9.246 step206-B coexist dispatch: yghv's FULL init ran (svm_core_init +
+     * g_npt built + control device live). Extend g_npt to upstream-parity
+     * identity 0-512GB (2MB pages, RWX — same coverage as C0's private NPT,
+     * MMIO included; g_npt's RAM-only map would NPF on guest APIC/IOAPIC/PCIe
+     * accesses), then run the verbatim vendored upstream entry with NCr3 =
+     * g_npt.pml4_pa (YGHV_206B_GNPT). yghv persistent residents are skipped:
+     * the OS itself is now the guest, nested synthetic residents are not the
+     * point. DriverUnload (registered at entry top) calls Sv206CoopUnload to
+     * devirtualize all cores before yghv teardown. */
+    if (!sv) {
+        extern NTSTATUS Sv206Entry(struct _DRIVER_OBJECT *, PUNICODE_STRING);
+        npt_identity_map_range(&g_npt, 0, 0x8000000000ULL);
+        yghv_trace_u64("s206b ncr3", g_npt.pml4_pa);
+        yghv_trace("s206b coexist dispatch");
+        sv = Sv206Entry(d, r);
+        yghv_trace_u64("s206b entry rc", (uint64_t)(NTSTATUS)sv);
+        if (sv) {
+            yghv_control_device_cleanup(d);
+            yghv_protect_cleanup();
+            npt_cleanup(&g_npt);
+            svm_core_cleanup();
+            if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+            g_guest_code_page = NULL;
+            yghv_trace_close();
+            KeRevertToUserAffinityThread();
+            return (NTSTATUS)sv;
+        }
+        /* Sv206Entry overwrote d->DriverUnload with upstream's SvDriverUnload;
+         * re-register yghv's so sc stop runs CoopUnload (devirt) + FULL yghv
+         * teardown (control device, NPT, SVM state) — not just upstream's half. */
+        d->DriverUnload = DriverUnload;
+        KeRevertToUserAffinityThread();
+        return STATUS_SUCCESS;
+    }
+#else
     if (!sv)
         sv = svm_core_start_persistent_residents(online);
+#endif
     if (sv) {
         LOG_ERROR("persistent residents/control device start failed 0x%x", sv);
         svm_core_wait_remote_ready(online);

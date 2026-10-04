@@ -14,6 +14,24 @@
 #include <ntifs.h>
 #include <stdarg.h>
 
+//
+// 9.246 step206-B seams (both gated; with the gates OFF this file is the
+// 206-A baseline verbatim). YGHV_206B_GNPT: take the nested page table root
+// from YuanGuardHV's own NPT manager (g_npt) instead of building SimpleSvm's
+// private 1TB identity map, so protection semantics (NPF perm/split/exclude)
+// apply to the guest. YGHV_206B_COEXIST: main.c dispatches us AFTER its full
+// init sequence, so yghv's svm_core/npt state exists when we virtualize.
+//
+#if defined(YGHV_206B_GNPT)
+extern "C" {
+typedef struct { UINT64 pml4_pa; void *pml4_va; UINT64 total_mapped_pages; UINT64 total_mapped_2mb_pages; } yghv_npt_mgr_t;
+extern yghv_npt_mgr_t g_npt;
+}
+#if !defined(YGHV_206B_COEXIST)
+#error "YGHV_206B_GNPT requires YGHV_206B_COEXIST: g_npt is only initialized after yghv's init sequence; the early-dispatch (206-A) path would run with NCr3=0"
+#endif
+#endif
+
 EXTERN_C DRIVER_INITIALIZE Sv206Entry;
 static DRIVER_UNLOAD SvDriverUnload;
 static CALLBACK_FUNCTION SvPowerCallbackRoutine;
@@ -1010,7 +1028,13 @@ SvPrepareForVirtualization (
     guestVmcbPa = MmGetPhysicalAddress(&VpData->GuestVmcb);
     hostVmcbPa = MmGetPhysicalAddress(&VpData->HostVmcb);
     hostStateAreaPa = MmGetPhysicalAddress(&VpData->HostStateArea);
+#if defined(YGHV_206B_GNPT)
+    // 9.246: nested paging root = YuanGuardHV's g_npt (mapped to max-physical,
+    // identity). SharedVpData->Pml4Entries stays allocated but unused.
+    pml4BasePa.QuadPart = g_npt.pml4_pa;
+#else
     pml4BasePa = MmGetPhysicalAddress(&SharedVpData->Pml4Entries);
+#endif
     msrpmPa = MmGetPhysicalAddress(SharedVpData->MsrPermissionsMap);
 
     //
@@ -1783,7 +1807,9 @@ SvVirtualizeAllProcessors (
     //
     // Build nested page table and MSRPM.
     //
+#if !defined(YGHV_206B_GNPT)
     SvBuildNestedPageTables(sharedVpData);
+#endif
     SvBuildMsrPermissionsMap(sharedVpData->MsrPermissionsMap);
 
     //
@@ -1965,6 +1991,30 @@ SvDriverUnload (
     //
     // De-virtualize all processors on the system.
     //
+    SvDevirtualizeAllProcessors();
+}
+
+/*!
+    @brief      9.246 step206-B coexist unload hook.
+
+    @details    Called from YuanGuardHV's own DriverUnload when
+                YGHV_206B_COEXIST is built (main.c re-registers ITS DriverUnload
+                after Sv206Entry, so SvDriverUnload above is never reached by
+                the SCM). Performs upstream's unload sequence — unregister the
+                power callback, then devirtualize every processor via the
+                ring-0 CPUID backdoor — after which yghv's DriverUnload
+                continues with its own teardown (control device, NPT, SVM).
+ */
+extern "C"
+VOID
+Sv206CoopUnload (
+    VOID
+    )
+{
+    if (g_PowerCallbackRegistration != nullptr) {
+        ExUnregisterCallback(g_PowerCallbackRegistration);
+        g_PowerCallbackRegistration = nullptr;
+    }
     SvDevirtualizeAllProcessors();
 }
 

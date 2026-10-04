@@ -70,6 +70,8 @@ if "%YGHV_NO_CR3_INTERCEPT%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_NO_CR3_INTERCEPT=1
 if "%YGHV_HOST_ISR%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_HOST_ISR=1"
 if "%YGHV_SINGLECORE%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_SINGLECORE=1"
 if "%YGHV_203Q%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_203Q=1"
+if "%YGHV_206B_COEXIST%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_206B_COEXIST=1"
+if "%YGHV_206B_GNPT%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_206B_GNPT=1"
 if "%YGHV_CATCHALL%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_CATCHALL=1"
 if "%YGHV_V101_4VEC%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_V101_4VEC=1"
 
@@ -102,7 +104,10 @@ echo   svm_simplevm206_x64.asm (ml64)...
 if errorlevel 1 goto :error
 echo   svm_simplevm206.cpp (cl)...
 set "INCLUDE=%SS_INC%"
-"%MSVC_DIR%\bin\Hostx64\x64\cl.exe" /nologo /c /kernel /O2 /GS- /GR- /EHs-c- /Zl /std:c++17 /utf-8 /D_AMD64_ /DNDEBUG /DNTDDI_VERSION=0x0A000005 /D_WIN32_WINNT=0x0A00 /DYGHV_BAREMETAL_STEP=%YGHV_BAREMETAL_STEP% /Fo"%BIN_DIR%\svm_simplevm206.obj" "%HV_DIR%\svm_simplevm206.cpp"
+set "SS206_DEFS=/D_AMD64_ /DNDEBUG /DNTDDI_VERSION=0x0A000005 /D_WIN32_WINNT=0x0A00 /DYGHV_BAREMETAL_STEP=%YGHV_BAREMETAL_STEP%"
+if "%YGHV_206B_COEXIST%"=="1" set "SS206_DEFS=%SS206_DEFS% /DYGHV_206B_COEXIST=1"
+if "%YGHV_206B_GNPT%"=="1" set "SS206_DEFS=%SS206_DEFS% /DYGHV_206B_GNPT=1"
+"%MSVC_DIR%\bin\Hostx64\x64\cl.exe" /nologo /c /kernel /O2 /GS- /GR- /EHs-c- /Zl /std:c++17 /utf-8 %SS206_DEFS% /Fo"%BIN_DIR%\svm_simplevm206.obj" "%HV_DIR%\svm_simplevm206.cpp"
 if errorlevel 1 goto :error
 set "SVP206_OBJS="%BIN_DIR%\svm_simplevm206.obj" "%BIN_DIR%\svm_simplevm206_asm.obj""
 :no206
