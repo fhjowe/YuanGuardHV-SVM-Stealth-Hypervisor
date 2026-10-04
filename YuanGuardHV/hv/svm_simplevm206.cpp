@@ -989,12 +989,25 @@ SvHandleVmExit (
                 newCr3 = (&guestContext.VpRegs->R15)[15 - rm];
             }
             if (!ok) {
-                /* decode failed (PT walk miss / unknown shape): DO NOT fake a
-                 * CR3 — bugcheck with the state (observable) instead of the
-                 * garbage-CR3 triple fault (instant reset, no evidence). */
-                S206RecordFatal(0x20631, rip, curCr3);
-                KeBugCheckEx(0xE2, 0x20631, rip, curCr3,
-                             VpData->GuestVmcb.ControlArea.ExitInfo1);
+                /* PRIMARY path (13:28 crash fix): EXITINFO1 bits[7:6] ALWAYS
+                 * carry the source GPR number for a CR write (hardware-filled,
+                 * APM "LMSW and MOV to/from CR"). The 0x20631 bugcheck proved
+                 * DecodeAssist/self-fetch can both miss (bit63=1: the task-gate
+                 * / extended form zeroes bit4 and keeps bits[7:6]=0 = RAX), so
+                 * trust the hardware field. bit63 additionally means "GPR is
+                 * one of R8-R15" — adjust the PUSHAQ index (R8..R15 sit
+                 * FIRST in GUEST_REGS). */
+                UINT64 e1 = VpData->GuestVmcb.ControlArea.ExitInfo1;
+                UINT32 gpr = (UINT32)((e1 >> 6) & 3ULL);
+                if (e1 & 0x8000000000000000ULL) {
+                    /* extended register: bits[9:8] give R8..R15 */
+                    gpr = 8 + (UINT32)((e1 >> 8) & 3ULL);
+                    newCr3 = (&guestContext.VpRegs->R15)[15 - gpr];
+                } else {
+                    /* gpr: 0=RAX 1=RCX 2=RDX 3=RBX (RSP/RBP are illegal here) */
+                    static UINT8 const regIdx[4] = { 15, 14, 13, 12 };
+                    newCr3 = (&guestContext.VpRegs->R15)[regIdx[gpr]];
+                }
             }
             VpData->GuestVmcb.StateSaveArea.Cr3 = newCr3;
             VpData->HostStackLayout.Padding1 = newCr3;
