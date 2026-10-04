@@ -5420,3 +5420,30 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   标记串判定构建变体**（延续 9.253 的串标记实践）。
 - GVA 原因码版内容不变（44918e6 代码即本镜像）。run_c16 仍部署 206c5b 文件名。
 - 提交：本记录。
+
+### 9.271–9.272 2026-10-05 GVA 走表断链根因闭环 + 0xD1 蓝屏判读与修复（镜像 3ba4a461/206c5h）
+
+- **走表断链根因（9.250c 老谜团闭环）**：206c5f 对照实验（ctl0..3 全 0）实证
+  `MmGetVirtualForPhysical` 在本机**选择性失效**——攻击者 PML4 页返回有效指针、
+  目标 PML4 页返回 NULL、PDPTE 读 0。9.250c 自取指失败、GVA 解码器全部走表
+  失败都是它。
+- **206c5g 首修引入 0xD1 蓝屏（责任：把 fail-safe 换成 fail-deadly）**：换
+  算术直接映射 `0xFFFF800000000000+PA` 后，CR 写路径自取指在**每次上下文切换**
+  真的开始读内存——垃圾/陈旧 Padding1 CR3 走表链读出 PA 0x1AD000（恰为 System
+  DTB 值），其直接映射 VA `0xFFFF8000001ADF80` **在本机未映射**（dump
+  100526-7984-01：bugcheck 0xD1，IRQL=2，读，指令在驱动内）→ GIF=0 宿主缺页
+  = 三重故障。**教科书直接映射基址在本机对部分 RAM 不可读。**
+- **206c5h 修复（三重 fail-safe）**：①直接映射基址 boot 时从
+  `MmGetVirtualForPhysical` 对自身代码页推导（16 字节内容比对验证），推导失败
+  = 基址 0 = 全走表退回 NULL 失败（等于 206c5f 前的安全状态）；②RAM 天花板
+  （`MmGetPhysicalMemoryRanges` 求最大端）→ 垃圾 PA → NULL；③全调用方 NULL
+  检查；④**删除 CR 写路径自取指**（EXITINFO1 是 proven 主路径，自取指风险面
+  每次上下文切换、收益为零）。剩余自取指仅在 DENY 解码器（单次、有兜底）。
+- 构建：206 + default 双绿，marker 验证。镜像 SHA256 `9d02371c…`（md5
+  `3ba4a461`）归档 `D:\aaaaaavm\yuanguard_hv_step206c5h_20261005.sys`。
+- **预期（run_c16 重跑）**：gate1-3 照旧 + `deny ctl0`=已知 gpa（对照走表成功
+  = 基址推导成功）+ `deny gva`=非 0 真实 GVA（解码全链通）→ C5 收官。若 ctl0=0
+  但 gva=0xDEAD0004（无直接映射）= 基址推导失败退回安全态，GVA 记为不可实现项。
+- 教训入 ritual：**改共享走表通道必须考虑每上下文切换热路径 + fail-safe；
+  任何"教科书内核布局"先验证再用**。
+- 提交：本记录。
