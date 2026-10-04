@@ -4945,3 +4945,33 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   dump + c10 日志定位于 bare 桥接或 #DB 时序。
 - 状态：C2 代码+文档已提交；机器未加载 206；稳定版未动。
 - 提交：本记录。
+
+### 9.250 2026-10-04 run_c10 首跑判读 + 206-C2b：StateSaveArea.Cr3 陈旧 = ALLOW 永不触发真因；CR3 写拦截 + 每核 current-cr3 槽
+
+- 用户跑 run_c10（f4a7782e）：**DENY 路径实机成功**——selftest 写武装页 → AV（#PF 注入
+  到用户态）→ 机器零冻零蓝屏跑完全程。控制面（C1）在 guest 态完全可用。但 selftest
+  期望的 ALLOW 流未触发，PCID 修复后仍 DENY。
+- **第二线索**：round 2 的 state 探测在 PowerShell **编译器自身内存**（ILGen.EmitConstant）
+  AV——与被保护页无关的随机进程 AV。解释：round 1 的 selftest AV 死亡后 armed 页未清理，
+  物理页被 Windows 回收 → 任何进程摸到该物理页 → NPF → stale target 命中 → 非目标
+  CR3 → DENY → #PF 注入 → 随机 AV。（脚本卫生问题，driver 侧 sc stop 后 NPT 拆除即清；
+  C3 用 target-exit 看门狗根治。）
+- **ALLOW 永不触发的真因（本轮根因）**：**VMEXIT 不保存 CR3 到 VMCB state area**
+  （保存集 = RIP/RSP/RFLAGS/RAX/CR2/DR6/DR7/段状态；CR3 只在 VMRUN 从 VMCB 装载）。
+  NPF 时读 `StateSaveArea.Cr3` = prepare 时刻的陈旧值 → is_target_cr3 对任何用户进程
+  必败 → DENY。HSAVE 里是 host CR3（System 进程），同样不可用。PCID 修复是对的但不够。
+- **修复（206-C2b）**：
+  1. **拦截 CR3 写**（InterceptCrWrite bit3，GNPT 门控；206-A 基线保持逐字）：
+     每次 guest 上下文切换一次 VMEXIT，emulate = SSA.Cr3=ExitInfo2（VMRUN 恢复时
+     装载）+ RIP=NRip + **TlbControl=1**（拦截移除了原生 CR3 写的 TLB flush，ASID
+     全刷是保守等价；代价 = 每次切换一次 VMEXIT，可接受）；
+  2. **当前 guest CR3 存 per-VCPU 槽** `HostStackLayout.Padding1`（我们拥有的字段，
+     每核独立无竞争；Reserved1 是 canary 不能动）；NPF verdict 改读 Padding1；
+  3. **rearm 槽从全局变量改 per-VCPU** `ControlArea.GuestPaOfGhcb`（复用；SEV-ES 专用
+     字段我们不用）——修掉双核并发保护写 + #DB 的 rearm 竞争；
+  4. 构建全绿，镜像 `e8819876...` 归档。
+- **遗留（206-C3 清单）**：armed 页在目标进程死亡后无人 disarm（本轮脚本级 `clear`
+  缓解；根治 = target-exit 看门狗进 206 模式）；IOCTL 批变更 quiesce；
+  `g_S206LastProtectHit` 挂控制面查询。
+- 状态：C2b 已提交；镜像归档；机器未加载 206；稳定版未动。
+- 提交：本记录。
