@@ -695,16 +695,53 @@ static NTSTATUS yghv_protect_stop_locked(void) {
  * control plane already knows. Lock-free read of the same tables the NPF
  * verdict scans; pure arithmetic; no telemetry. 0 = no armed target. */
 uint64_t yghv_protect_control_walk_gpa(void) {
+    uint64_t diag[5];
+    yghv_protect_control_walk_diag(diag);
+    return diag[0];
+}
+
+/* 9.270: full-trace variant -- out[0]=final gpa, out[1]=direct-map VA of the
+ * PML4 page (0 = MmGetVirtualForPhysical returned NULL), out[2]=PML4E raw,
+ * out[3]=direct-map VA of the PDP page, out[4]=PDPTE raw. Island-safe pure
+ * reads; classifies walk-fail as helper-NULL vs wrong-content. */
+void yghv_protect_control_walk_diag(uint64_t out[5]) {
     uint32_t t;
+    uint64_t cr3 = 0, va = 0;
+    static const uint64_t M = 0x000FFFFFFFFFF000ULL;
+    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0; out[4] = 0;
     for (t = 0; t < g_protect.target_count; t++) {
         if (g_protect.targets[t].cr3 != 0 &&
             g_protect.targets[t].page_count > 0) {
-            return yghv_protect_guest_va_to_pa(
-                g_protect.targets[t].cr3,
-                g_protect.targets[t].pages[0].target_va);
+            cr3 = g_protect.targets[t].cr3;
+            va = g_protect.targets[t].pages[0].target_va;
+            break;
         }
     }
-    return 0;
+    if (!cr3)
+        return;
+    {
+        PHYSICAL_ADDRESS pa;
+        uint64_t *v1;
+        pa.QuadPart = (LONGLONG)(cr3 & M);
+        v1 = (uint64_t *)MmGetVirtualForPhysical(pa);
+        out[1] = (uint64_t)v1;
+        if (!v1)
+            return;
+        {
+            uint64_t pml4e = v1[(va >> 39) & 0x1FF];
+            uint64_t *v2;
+            out[2] = pml4e;
+            if (!(pml4e & 1))
+                return;
+            pa.QuadPart = (LONGLONG)(pml4e & M);
+            v2 = (uint64_t *)MmGetVirtualForPhysical(pa);
+            out[3] = (uint64_t)v2;
+            if (!v2)
+                return;
+            out[4] = v2[(va >> 30) & 0x1FF];
+        }
+        out[0] = yghv_protect_guest_va_to_pa(cr3, va);
+    }
 }
 
 yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,

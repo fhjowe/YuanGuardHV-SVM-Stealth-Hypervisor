@@ -47,6 +47,7 @@ int yghv_protect_arm_page_bare(UINT64 gpa);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 UINT64 yghv_protect_control_walk_gpa(void);
+void yghv_protect_control_walk_diag(UINT64 out[5]);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
 /* 9.258 (206-C3): control-plane read of the last protection verdict hit. */
@@ -56,7 +57,7 @@ extern "C" UINT64 yghv_s206_last_hit(void) { return g_S206LastProtectHit; }
 // (bare-metal context, file I/O safe).
 extern "C" void yghv_trace(const char *msg);
 extern "C" void yghv_trace_u64(const char *label, UINT64 v);
-static volatile UINT64 g_S206DenyLog[192] = { 0 };
+static volatile UINT64 g_S206DenyLog[288] = { 0 };
 static volatile ULONG g_S206DenyIdx = 0;
 /* 9.252: NPF-entry telemetry (write-fault NPFs reaching the handler) */
 static volatile UINT64 g_S206NpfLog[96] = { 0 };
@@ -113,13 +114,16 @@ extern "C" void yghv_s206_flush_deny_log(void) {
         return;
     }
     yghv_trace_u64("s206 deny count", (UINT64)g_S206DenyIdx);
-    for (ULONG q = 0; q * 6 < g_S206DenyIdx && q < 32; q++) {
-        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 6]);
-        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 6 + 1]);
-        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 6 + 2]);
-        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 6 + 3]);
-        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 6 + 4]);
-        yghv_trace_u64("s206 deny aux", g_S206DenyLog[q * 6 + 5]);
+    for (ULONG q = 0; q * 9 < g_S206DenyIdx && q < 32; q++) {
+        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 9]);
+        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 9 + 1]);
+        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 9 + 2]);
+        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 9 + 3]);
+        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 9 + 4]);
+        yghv_trace_u64("s206 deny ctl0", g_S206DenyLog[q * 9 + 5]);
+        yghv_trace_u64("s206 deny ctl1", g_S206DenyLog[q * 9 + 6]);
+        yghv_trace_u64("s206 deny ctl2", g_S206DenyLog[q * 9 + 7]);
+        yghv_trace_u64("s206 deny ctl3", g_S206DenyLog[q * 9 + 8]);
     }
     g_S206DenyIdx = 0;
 }
@@ -909,6 +913,8 @@ static UINT32 S206DecodeStoreGva(
              * control fails => the machinery itself is broken. aux carries
              * the control-walk gpa (0 = control walk failed too). */
             UINT64 *auxOut = aux;
+            UINT64 ctl[5] = { 0, 0, 0, 0, 0 };
+            yghv_protect_control_walk_diag(ctl);
             static const UINT64 PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
             UINT64 pml4e, pdpte, pde, pte;
             {
@@ -958,11 +964,9 @@ static UINT32 S206DecodeStoreGva(
              * CONTROL walk against the target's known-good (cr3, va) pair;
              * its result decides machinery-vs-state. */
             {
-                UINT64 ctrl = yghv_protect_control_walk_gpa();
-                if (auxOut) *auxOut = ctrl;   /* == known gpa => curCr3 wrong */
                 UINT64 pte2 = yghv_protect_guest_va_to_pa(curCr3, rip);
                 if (!pte2)
-                    return 3;      /* DG_WALK_FAIL with control evidence */
+                    return 3;      /* DG_WALK_FAIL; ctl[] = control evidence */
                 pa.QuadPart = (LONGLONG)pte2;
             }
             va = MmGetVirtualForPhysical(pa);
@@ -1296,10 +1300,10 @@ SvHandleVmExit (
                      * (0 = decode fell back) so one run validates both the
                      * decoder and the delivery pairing. */
                     UINT64 gva = 0;
-                    UINT64 dAux = 0;
+                    UINT64 dAux[4] = { 0, 0, 0, 0 };
                     UINT32 dReason =
                         S206DecodeStoreGva(VpData, GuestRegisters, &gva,
-                                           &dAux);
+                                           dAux);
                     BOOLEAN haveGva = (dReason == 0);
                     UINT64 e1 = VpData->GuestVmcb.ControlArea.ExitInfo1;
                     VpData->GuestVmcb.StateSaveArea.Cr2 = haveGva ? gva : 0;
@@ -1324,7 +1328,7 @@ SvHandleVmExit (
                      * 0xDEAD0000|reason on fallback (11-14 = walk failed at
                      * PML4E/PDPTE/PDE/PTE); rip = faulting instruction;
                      * aux = raw failing PT entry (or large-page tag). */
-                    if (g_S206DenyIdx + 6 <= 192) {
+                    if (g_S206DenyIdx + 9 <= 288) {
                         g_S206DenyLog[g_S206DenyIdx] = curCr3;
                         g_S206DenyLog[g_S206DenyIdx + 1] = gpa;
                         g_S206DenyLog[g_S206DenyIdx + 2] =
@@ -1333,8 +1337,11 @@ SvHandleVmExit (
                             haveGva ? gva : (0xDEAD0000ULL | dReason);
                         g_S206DenyLog[g_S206DenyIdx + 4] =
                             VpData->GuestVmcb.StateSaveArea.Rip;
-                        g_S206DenyLog[g_S206DenyIdx + 5] = dAux;
-                        g_S206DenyIdx += 6;
+                        g_S206DenyLog[g_S206DenyIdx + 5] = dAux[0];
+                        g_S206DenyLog[g_S206DenyIdx + 6] = dAux[1];
+                        g_S206DenyLog[g_S206DenyIdx + 7] = dAux[2];
+                        g_S206DenyLog[g_S206DenyIdx + 8] = dAux[3];
+                        g_S206DenyIdx += 9;
                     }
                     break;
                 }

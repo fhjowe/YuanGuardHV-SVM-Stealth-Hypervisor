@@ -139,6 +139,7 @@ yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3, uint32_t cp
 int yghv_protect_arm_page_bare(uint64_t gpa);
 void yghv_protect_reopen_page_bare(uint64_t gpa);
 uint64_t yghv_protect_control_walk_gpa(void);
+void yghv_protect_control_walk_diag(uint64_t out[5]);
 void yghv_protect_on_process_exit(uint32_t pid);
 void yghv_protect_rearm(svm_vcpu_t *vcpu);
 void yghv_protect_get_state(ULONG *active, ULONG *pid, ULONG *page_count);
