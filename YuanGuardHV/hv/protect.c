@@ -539,6 +539,85 @@ static NTSTATUS yghv_protect_stop_locked(void) {
     return STATUS_SUCCESS;
 }
 
+/* ------------------------------------------------------------------ */
+/* 9.249 step206-C2: LOCK-FREE in-island NPF verdict for the vendored    */
+/* upstream handler (svm_simplevm206.cpp). Constraints of that context:  */
+/* IRQL = DISPATCH (SvHandleVmExit raises), GIF=0, and NO blocking —     */
+/* ExAcquireFastMutex would bugcheck (DISPATCH) / deadlock (island,      */
+/* 9.229 lesson twice). So this path must be pure memory + NPT           */
+/* arithmetic (direct-map writes), no locks, no LOG/trace, no allocs.    */
+/*                                                                       */
+/* Lock-free correctness: the protected-page table (g_protect.targets)   */
+/* is nonpaged and only mutated at PASSIVE under g_protect_lock by       */
+/* IOCTLs. The island reads it WITHOUT the lock, so an IOCTL racing an   */
+/* NPF verdict may see a torn view. Mitigations: (a) mutations are       */
+/* small fixed-struct writes (single u64 gpa / u8 flags — naturally      */
+/* atomic on x64 for aligned u64); (b) a wrong verdict's worst case is   */
+/* one spurious #PF or one missed protection hit, self-correcting on     */
+/* the next write; (c) the add/remove IOCTL paths will set               */
+/* g_protect.active=0 (quiesce) around batch mutations in 206-C3.        */
+/* TLB: npt_set_page_perm flips the NPT PTE; the handler sets            */
+/* TlbControl=1 (flush-all on next VMRUN) when a flip happened — no      */
+/* INVLPGA needed since we do not tag per-ASID in the vendored VMCB.     */
+/* ------------------------------------------------------------------ */
+yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,
+                                                 uint32_t cpl,
+                                                 uint64_t gpa,
+                                                 uint64_t *rearm_gpa_out,
+                                                 int *flip_out) {
+    yghv_protect_page_t *pp;
+    yghv_npf_result_t result = YGHV_NPF_NONE;
+    int st;
+
+    *flip_out = 0;
+    if (!g_protect.active) {
+        /* REV-045: protection off — no disarm/re-arm from stray writes. */
+        return YGHV_NPF_NONE;
+    }
+    pp = yghv_protect_find_page_locked(gpa);   /* lock-free read */
+    if (pp) {
+        if (yghv_protect_is_target_cr3_locked(guest_cr3) || cpl == 0) {
+            if (g_protect.config.auto_disarm) {
+                st = npt_set_page_perm(&g_npt, pp->gpa,
+                    NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+                if (st) {
+                    result = YGHV_NPF_DENY;   /* could not reopen: deny */
+                } else {
+                    pp->armed = 0;
+                    *rearm_gpa_out = pp->gpa;
+                    *flip_out = 1;
+                    result = YGHV_NPF_ALLOW;
+                }
+            } else {
+                result = YGHV_NPF_DENY;       /* deny = inject #PF, stay armed */
+            }
+        } else {
+            result = YGHV_NPF_DENY;           /* foreign write: deny */
+        }
+    }
+    return result;
+}
+
+/* 9.249: re-arm (flip back to read-only) for the vendored handler's #DB path.
+ * Same discipline as above: no locks. gpa comes from the vcpu's rearm slot. */
+int yghv_protect_arm_page_bare(uint64_t gpa) {
+    yghv_protect_page_t *pp;
+    int st;
+
+    if (!g_protect.active)
+        return 0;
+    pp = yghv_protect_find_page_locked(gpa);
+    if (!pp || pp->armed)
+        return 0;
+    st = npt_split_2mb_to_4kb(&g_npt, pp->gpa);
+    if (st)
+        return st;
+    st = npt_set_page_perm(&g_npt, pp->gpa, NPT_PERM_PRESENT);
+    if (!st)
+        pp->armed = 1;
+    return st;
+}
+
 yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa) {
     yghv_protect_page_t *pp;
     yghv_npf_result_t result = YGHV_NPF_NONE;

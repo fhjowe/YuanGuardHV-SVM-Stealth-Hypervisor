@@ -32,6 +32,22 @@ extern yghv_npt_mgr_t g_npt;
 #endif
 #endif
 
+//
+// 9.249 step206-C2: YuanGuardHV protection bridge (lock-free in-island NPF
+// verdict + page re-arm), plus a last-hit record for the control plane to
+// query. These are YGHV functions (protect.c); the vendored file keeps its
+// own include set, so re-declare the two entry points here with C linkage.
+// Ordinals match protect.h's yghv_npf_result_t: 0=NONE, 1=ALLOW, 2=DENY.
+//
+extern "C" {
+// ordinals match protect.h's yghv_npf_result_t: 0=NONE, 1=ALLOW, 2=DENY
+int yghv_protect_on_npf_write_bare(UINT64 guest_cr3, UINT32 cpl,
+                                   UINT64 gpa, UINT64 *rearm_gpa, int *flip);
+int yghv_protect_arm_page_bare(UINT64 gpa);
+}
+static volatile UINT64 g_S206LastProtectHit = 0;
+static volatile UINT64 g_S206RearmGpa = 0;
+
 EXTERN_C DRIVER_INITIALIZE Sv206Entry;
 static DRIVER_UNLOAD SvDriverUnload;
 static CALLBACK_FUNCTION SvPowerCallbackRoutine;
@@ -822,6 +838,88 @@ SvHandleVmExit (
         break;
     case VMEXIT_VMRUN:
         SvHandleVmrun(VpData, &guestContext);
+        break;
+    case VMEXIT_NPF:
+        //
+        // 9.249 step206-C2: nested page fault. With NCr3 = YuanGuardHV's
+        // g_npt, a protected page (armed: W cleared) write lands here. The
+        // verdict MUST be the lock-free bare path — we are at DISPATCH with
+        // GIF=0; ExAcquireFastMutex would bugcheck/deadlock (9.229). Verdicts:
+        //   ALLOW (target/ring0 write, auto-disarm) -> reopen page W,
+        //     set TF so the #DB after the retried write re-arms (NX-back),
+        //     advance RIP to NRip (the write retries with W now open);
+        //   DENY  (foreign write) -> inject #PF with the NPT error code;
+        //   NONE  (protection off / unknown GPA) -> inject #PF too (the page
+        //     really is not writable in the NPT; the guest must see the fault).
+        // TLB: after flipping a NPT PTE, set TlbControl=1 so the next VMRUN
+        // flushes (the vendored VMCB has no per-ASID INVLPGA path of ours).
+        //
+        {
+            UINT64 gpa = VpData->GuestVmcb.ControlArea.ExitInfo2;
+            UINT64 rearmGpa = 0;
+            int flip = 0;
+            BOOLEAN writeFault =
+                (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x2ULL) != 0;
+
+            if (writeFault)
+            {
+                int vr = yghv_protect_on_npf_write_bare(
+                    VpData->GuestVmcb.StateSaveArea.Cr3,
+                    VpData->GuestVmcb.StateSaveArea.Cpl,
+                    gpa, &rearmGpa, &flip);
+
+                if (vr == 1 /* YGHV_NPF_ALLOW */)
+                {
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
+                    VpData->GuestVmcb.StateSaveArea.Rip =
+                        VpData->GuestVmcb.ControlArea.NRip;
+                    g_S206RearmGpa = rearmGpa;   /* re-armed on the #DB */
+                    g_S206LastProtectHit = gpa;
+                    break;
+                }
+                if (vr == 2 /* YGHV_NPF_DENY */)
+                {
+                    UINT64 ec = 0;
+                    if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x1ULL) ec |= 1;
+                    if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x2ULL) ec |= 2;
+                    if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x4ULL) ec |= 4;
+                    VpData->GuestVmcb.ControlArea.EventInj =
+                        (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
+                        0x0EULL | (ec << 32);
+                    g_S206LastProtectHit = gpa;
+                    break;
+                }
+            }
+            // protection off / read fault / unknown page: reflect as #PF
+            {
+                UINT64 ec = 0;
+                if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x1ULL) ec |= 1;
+                if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x2ULL) ec |= 2;
+                if (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x4ULL) ec |= 4;
+                VpData->GuestVmcb.ControlArea.EventInj =
+                    (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
+                    0x0EULL | (ec << 32);
+            }
+        }
+        break;
+    case VMEXIT_EXCEPTION_DB:
+        //
+        // 9.249: after an ALLOWed protected write, we set TF; the #DB fires on
+        // the instruction AFTER the write — re-arm the page (W->NX) here, clear
+        // TF, and resume at NRip (the #DB is a trap: it already advanced).
+        // Lock-free: same bare discipline as the NPF path.
+        //
+        {
+            VpData->GuestVmcb.ControlArea.TlbControl = 1;
+            if (g_S206RearmGpa != 0) {
+                yghv_protect_arm_page_bare(g_S206RearmGpa);
+                g_S206RearmGpa = 0;
+            }
+            VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */
+            VpData->GuestVmcb.StateSaveArea.Rip =
+                VpData->GuestVmcb.ControlArea.NRip;
+        }
         break;
     default:
         // 9.244: the 205k discriminator's exception-bugcheck block was reverted;

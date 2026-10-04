@@ -4908,3 +4908,40 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   vendored handler 在 VMEXIT_NPF/EXCEPTION_DB case 调用。
 - 状态：C1 代码已提交；机器未加载 206；稳定版未动。
 - 提交：本记录。
+
+### 9.249 2026-10-04 step206-C2 离线实现完成：无锁岛内 NPF 桥接 + #DB rearm——页写保护在 OS-as-guest 下可验证（待用户一次 boot）
+
+- C2 实现（岛内纪律优先）：
+  1. **protect.c 无锁 bare 路径**（新增两函数，岛内 DISPATCH+GIF=0 安全：无锁、无
+     LOG/trace、无分配；NPT 翻转 = direct map 纯算术写）：
+     `yghv_protect_on_npf_write_bare(cr3,cpl,gpa,&rearm,&flip)`——复刻
+     `_locked` verdict（active 读/find_page/is_target_cr3/cpl==0/auto_disarm 分支，
+     REV-045 保留），DISARM 用 `npt_set_page_perm` 直写（不再走 disarm_locked 的
+     vcpu 广播——vendored VMCB 用 `TlbControl=1` 下次 VMRUN 全刷替代）；
+     `yghv_protect_arm_page_bare(gpa)`——split+清 W+armed=1。锁free 正确性论证：
+     表为非分页、IOCTL 侧 PASSIVE+锁变更 vs 岛内无锁读，撕裂最坏=一次误判（自愈于
+     下次写）；206-C3 将在批量变更时 quiesce。
+  2. **vendored handler 桥接**（svm_simplevm206.cpp SvHandleVmExit 新增两 case）：
+     `VMEXIT_NPF`——写故障时调 bare verdict：ALLOW（auto-disarm 开）→ 翻回 W +
+     `TlbControl=1` + 置 TF + RIP=NRip（写重试，写完 #DB 触发）+
+     `g_S206RearmGpa` 记录；DENY（外来写/auto_disarm 关）→ 注入 #PF（NPT 错误码
+     精确重组）；NONE（保护关/未知页/读故障）→ 注入 #PF。`VMEXIT_EXCEPTION_DB`——
+     `arm_page_bare` 翻回 NX + 清 TF + RIP=NRip（trap 类 NRip 有效）。
+     `extern "C"` 桥（snake 命名对齐 protect.c； ordinal 0/1/2 注释）。后续可经
+     `g_S206LastProtectHit` 挂控制面查询。
+  3. **还原语义差异说明**：原引擎的 ALLOW 是" disarm→单步重放→#DB rearm"，#DB 由
+     yghv 自己的 IDT（合成 guest）；206-C2 中 #DB 是 guest 真实 IDT 的 int1 处理，
+     vendored handler 在它 VMEXIT 时 rearm——语义等价（TF 由 handler 管理，guest
+     应用程序看不到 TF 泄漏）。
+- **构建**：206-B 门控下全绿（首败=符号名不匹配 Yghv*/yghv_*，已统一 snake）；
+  镜像 `f4a7782e...` 归档 `yuanguard_hv_step206c2_20260918.sys`；default/206-A
+  回归全绿（s206b/bare 串 0/0）。
+- **runbook `run_c10_step206c2.ps1`**：启动 → **yghv_ctl selftest ×2 轮在
+  OS-as-guest 下跑**（set-target/add-page/start→真实写武装页→NPF→bare verdict→
+  ALLOW+TF+#DB rearm→读回校验→stop/remove——完整的页写保护生命周期）→ state
+  探测 → 2 轮压测 → sc stop → 卸载后健全性。带防呆（检测残留 VMM）。
+- 判读：selftest PASS ×2 = **页写保护在整机隐形状态下端到端工作** = 最初产品目标
+  （"保护逻辑下沉到虚拟化层、宿主内核看不见"）的可观测达成；失败模式（蓝屏/冻）按
+  dump + c10 日志定位于 bare 桥接或 #DB 时序。
+- 状态：C2 代码+文档已提交；机器未加载 206；稳定版未动。
+- 提交：本记录。
