@@ -5103,3 +5103,26 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   dbg 的 rip/rflags 定位死因；vr=1 但 dbg 空 → #DB 从未触发（TF/中断窗口问题）；
   vr=0 → verdict=NONE（cr3 链问题回归）；vr=2 → DENY（KPTI/PCID 变体）。
 - 提交：本记录。
+
+### 9.256 2026-10-04 run_c13（bb4fa894）判读：vr 环证 ALLOW + dbg 环空 → #DB 从未拦截 = 死代码洞；补 InterceptException bit1
+
+- **c2d 遥测一击命中**：verdict 环 = 两轮 selftest 写 **vr=1（ALLOW）**；victim 风暴
+  = vr=2（DENY，round-1 泄漏页再次被无辜进程循环写）。deny 环（修复后）干净三元组
+  可读（cr3=1D28A1000 / gpa=2CB2F000 / cpl=3 ×N）。
+- **dbg 环 = EMPTY**：整个运行零次 #DB VMEXIT。结合 ALLOW 已执行（页重开+TF 置位
+  +rearm 装载+写重执行成功，npf 无第二次），唯一解释 = **#DB 没被拦截，原生递交
+  KiTrap01** → STATUS_SINGLE_STEP 给用户线程 → .NET 无 handler → WER 弹窗即死
+  （fast death + 弹窗 + dbg 空三点全吻合）。
+- **根因**：vendored prepare 从不写 `InterceptException`（9.244 为 206-A 基线撤销了
+  205k 块），VMCB 该字段保持 0 → **ALLOW→TF→#DB→重武装整条设计从未上过硬件**。
+  9.254 的 RIP 修复必要但不充分。
+- **修复（本提交）**：prepare 中 `InterceptException |= (1u<<1)`（仅 #DB，GNPT 门控
+  内，与 InterceptCrWrite 同块）。9.244 的 #GP 探针关切不受影响（vector 13 未触碰）。
+  stray #DB（真调试器）会进 handler 被吞——测试环境无调试器，可接受，206-C3 再收紧。
+- 构建：default + 206c2 双绿。镜像 md5 `552dd681` 归档
+  `D:\aaaaaavm\yuanguard_hv_step206c2e_20261004.sys`；脚本 `run_c14_step206c2e.ps1`。
+- **run_c14 预期（206-C2 PASS 判据）**：selftest 双轮打出 `user write/read OK` +
+  `selftest: PASS`（写重执行落内存 → #DB VMEXIT 进 handler（dbg 环应有记录，
+  rflags TF 位=1）→ 重武装 → 读回一致 → stop/remove 全链）；vr 环继续
+  ALLOW；victim 风暴仍在（C3 看门狗根治）。全绿 = **206-C2 PASS**。
+- 提交：本记录。
