@@ -29,6 +29,8 @@ Commands:
   mmf-open <path>                  (map a file-backed MMF, print VA)
   mmf-loop <path> <sec> [info]     (target: write loop on the MMF view)
   mmf-write <path>                 (attacker: one write; BLOCKED or LANDED)
+  scan-pid <pid> [count]           (206-C5: enumerate target's private RW pages)
+  wpm-write <pid> <hex_va> <hex_val> (cross-process write via kernel API)
 #>
 param(
     [Parameter(Position = 0)][string]$Command = 'state',
@@ -259,6 +261,60 @@ public static class YghvMmf
         {
             return "BLOCKED";
         }
+    }
+}
+'@
+
+# 206-C5: cross-process memory inspection helpers for the real-process pilot
+# (scan-pid / wpm-write). Kernel-mediated reads/writes never hit the NPT write
+# protection as cpl=3 user stores — wpm-write deliberately demonstrates that
+# trust gap.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class YghvMem
+{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint access, bool inherit,
+        uint pid);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr VirtualQueryEx(IntPtr hProcess, IntPtr addr,
+        out MEMORY_BASIC_INFORMATION mbi, uint len);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr,
+        byte[] buf, uint size, out uint read);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteProcessMemory(IntPtr h, IntPtr addr,
+        byte[] buf, uint size, out uint written);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MEMORY_BASIC_INFORMATION
+    {
+        public IntPtr BaseAddress;
+        public IntPtr AllocationBase;
+        public uint AllocationProtect;
+        public IntPtr RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+
+    public static MEMORY_BASIC_INFORMATION VirtualQueryEx(IntPtr h,
+        IntPtr addr)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        uint r = VirtualQueryEx(h, addr, out mbi,
+            (uint)Marshal.SizeOf(typeof(MEMORY_BASIC_INFORMATION)));
+        if (r == 0)
+        {
+            mbi = new MEMORY_BASIC_INFORMATION();
+            mbi.BaseAddress = IntPtr.Zero;
+            mbi.RegionSize = IntPtr.Zero;
+        }
+        return mbi;
     }
 }
 '@
@@ -824,6 +880,92 @@ try {
                 }
             } finally {
                 [YghvMmf]::UnmapFile($map)
+            }
+        }
+        'scan-pid' {
+            # 206-C5 pilot helper: enumerate a foreign process's committed
+            # PRIVATE read-write pages (VirtualQueryEx; kernel-mediated read,
+            # never hits the NPT write protection). Pure userland — the ctl
+            # device handle is opened only because this tool always requires
+            # the driver service to be present.
+            if ($null -eq $Arg1) { throw 'scan-pid: usage: scan-pid <pid> [count]' }
+            $pidVal = [uint32]::Parse($Arg1)
+            $max = if ($null -ne $Arg2) { [int]$Arg2 } else { 16 }
+            $h = [YghvMem]::OpenProcess(0x0438, 0, $pidVal)  # QUERY|VM_READ|VM_OP
+            if ($h -eq [IntPtr]::Zero) {
+                throw ("scan-pid: OpenProcess {0} failed, err {1}" -f
+                    $pidVal, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+            }
+            try {
+                $addr = [UInt64]0
+                $found = 0
+                $scanned = 0
+                while ($found -lt $max -and $scanned -lt 100000) {
+                    $scanned++
+                    $mbi = [YghvMem]::VirtualQueryEx($h, [IntPtr]$addr)
+                    $rsize = $mbi.RegionSize.ToUInt64()
+                    if ($rsize -eq 0) { break }
+                    $state = $mbi.State
+                    $prot = $mbi.Protect
+                    $type = $mbi.Type
+                    $base = [UInt64]$mbi.BaseAddress.ToInt64()
+                    if ($state -eq 0x1000 -and $type -eq 0x20000 -and
+                        ($prot -eq 0x04 -or $prot -eq 0x40) -and
+                        $base -ge 0x10000) {
+                        # MEM_COMMIT + MEM_PRIVATE + PAGE_READWRITE(4) or
+                        # PAGE_READWRITE+GUARD-adjacent RWX(40); skip low VAs
+                        Write-Host ("scan-pid: va=0x{0:X} size=0x{1:X}" -f
+                            $base, $rsize)
+                        $found++
+                    }
+                    $addr = $base + $rsize
+                    if ($addr -ge 0x800000000000) { break }
+                }
+                Write-Host ("scan-pid: pid={0} regions={1}" -f $pidVal, $found)
+            } finally {
+                [YghvMem]::CloseHandle($h) | Out-Null
+            }
+        }
+        'wpm-write' {
+            # 206-C5 pilot: cross-process write via the kernel API
+            # (WriteProcessMemory). Under the current verdict semantics this
+            # is a cpl=0 write with the TARGET's CR3 attached (MmCopyVirtual
+            # Memory), so it takes the cpl==0/own-CR3 ALLOW branch and LANDS
+            # by design — run_c17 documents this as the known kernel-mediated
+            # trust gap, not as a failure.
+            if ($null -eq $Arg1 -or $null -eq $Arg2 -or $null -eq $Arg3) {
+                throw 'wpm-write: usage: wpm-write <pid> <hex_va> <hex_val>'
+            }
+            $pidVal = [uint32]::Parse($Arg1)
+            $va = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]', ''), 16)
+            $val = [Convert]::ToUInt64(($Arg3 -replace '^0[xX]', ''), 16)
+            $h = [YghvMem]::OpenProcess(0x0438, 0, $pidVal)
+            if ($h -eq [IntPtr]::Zero) {
+                throw ("wpm-write: OpenProcess {0} failed, err {1}" -f
+                    $pidVal, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+            }
+            try {
+                $bytes = [BitConverter]::GetBytes([UInt64]$val)
+                $written = [UInt32]0
+                $ok = [YghvMem]::WriteProcessMemory($h, [IntPtr][Int64]$va,
+                    $bytes, [UInt32]8, [ref]$written)
+                if ($ok) {
+                    Write-Host ("wpm-write: pid={0} va=0x{1:X} WROTE {2} bytes" -f
+                        $pidVal, $va, $written)
+                } else {
+                    Write-Host ("wpm-write: pid={0} va=0x{1:X} FAILED err=0x{2:X}" -f
+                        $pidVal, $va,
+                        [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+                }
+                $rb = New-Object byte[] 8
+                $read = [UInt32]0
+                if ([YghvMem]::ReadProcessMemory($h, [IntPtr][Int64]$va, $rb,
+                        [UInt32]8, [ref]$read)) {
+                    Write-Host ("wpm-write: readback=0x{0:X}" -f
+                        [BitConverter]::ToUInt64($rb, 0))
+                }
+            } finally {
+                [YghvMem]::CloseHandle($h) | Out-Null
             }
         }
         default {

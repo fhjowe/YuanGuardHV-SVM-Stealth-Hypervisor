@@ -59,6 +59,8 @@ yghv_ctl.ps1 unprotect-page <pid> <hex_va>
 yghv_ctl.ps1 mmf-open <path>
 yghv_ctl.ps1 mmf-loop <path> <sec> [info]
 yghv_ctl.ps1 mmf-write <path>
+yghv_ctl.ps1 scan-pid <pid> [count]
+yghv_ctl.ps1 wpm-write <pid> <hex_va> <hex_val>
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,
