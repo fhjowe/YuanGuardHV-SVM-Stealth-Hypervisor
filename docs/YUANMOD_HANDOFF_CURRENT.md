@@ -5403,3 +5403,20 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   形态）；③ 自取指走表失败（该链路此前从未独立验证——CR 写路径一直由
   EXITINFO1 主路径兜底）。一轮 run 即可定位。
 - 提交：本记录。
+
+### 9.266 2026-10-04 run_c16×"206c5b" 判读：实为 default 构建误归档（本记录修正）+ 正确 206c5b（md5 2f74d018）
+
+- **上轮 run_c16 跑的是 default 构建**：驱动日志为 default 合成 guest 测试套件
+  （hook test/resident/heartbeat）、list-targets 含 pid=4（System）2 个内核页、
+  lasthit(0x80F) 返回 Win32 error 1（206 门控 case 不存在于 default）。机器无恙
+  （default 全套自测通过 + 3273ms 卸载 + post sanity 0）。
+- **根因（我的流程失误）**：先 206 构建后 default 回归，default 覆盖
+  `bin/yuanguard_hv.sys`，随后误把 default 归档为
+  `yuanguard_hv_step206c5b_20261004.sys`（md5 50e39c2a 作废）。9.265 记录的
+  镜像哈希作废。
+- **修复 + 流程加固**：重建 206/COEXIST/GNPT 并**归档前标记串验证**（206 构建含
+  `s206b coexist`，不含 default 的 `hook test start`）。正确 206c5b：SHA256
+  `af4d609e…`（md5 `2f74d018`）。此教训并入归档 ritual：**每次归档前必须 grep
+  标记串判定构建变体**（延续 9.253 的串标记实践）。
+- GVA 原因码版内容不变（44918e6 代码即本镜像）。run_c16 仍部署 206c5b 文件名。
+- 提交：本记录。
