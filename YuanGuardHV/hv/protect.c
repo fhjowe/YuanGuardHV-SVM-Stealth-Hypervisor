@@ -373,10 +373,13 @@ static NTSTATUS yghv_protect_add_page_for_locked(yghv_protect_target_t *t,
     p->target_va = target_va;
     p->flags = YGHV_PROTECT_MEM;
     p->armed = 0;
-    /* 9.252: progress.log copy (DbgPrint needs a debugger) — the NPF-entry
+#if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
+    /* 9.252 (206-gated; keep default build clean): progress.log copy of the
+       armed page identity (DbgPrint needs a debugger) — the vendored NPF-entry
        telemetry compares against this. */
     yghv_trace_u64("s206 addpage va", target_va);
     yghv_trace_u64("s206 addpage gpa", gpa);
+#endif
     return STATUS_SUCCESS;
 }
 
