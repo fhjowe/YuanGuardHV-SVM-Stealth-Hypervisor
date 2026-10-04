@@ -392,11 +392,16 @@ static NTSTATUS yghv_protect_add_page_for_locked(yghv_protect_target_t *t,
         LOG_ERROR("protect add_page: va 0x%llx not mapped", target_va);
         return STATUS_INVALID_ADDRESS;
     }
-    p = &t->pages[t->page_count++];
+    /* 9.258 (206-C3): fill the entry BEFORE publishing page_count — the
+     * island's lock-free readers scan by page_count, so incrementing first
+     * exposed a garbage entry window (batch-change quiesce, store-order
+     * release on x86). */
+    p = &t->pages[t->page_count];
     p->gpa = gpa;
     p->target_va = target_va;
     p->flags = YGHV_PROTECT_MEM;
     p->armed = 0;
+    t->page_count++;
 #if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
     /* 9.253: island ring only (was 9.252 progress.log traces — file I/O under
        FastMutex during live virtualization wedged run_c10 for 40min). */
@@ -499,6 +504,47 @@ static int yghv_protect_disarm_page_locked(yghv_protect_page_t *p) {
         }
     }
     return st;
+}
+
+/* 9.258 (206-C3): island-safe silent reopen for the vendored NPF handler's
+ * NONE-on-write path (unknown/removed armed page). Lock-free, no telemetry:
+ * the guest PTE is writable, so the right move is to restore the NPT to
+ * writable and let the write re-execute — an injected #PF there loops
+ * forever (spurious-fault retry, the c12 victim storm). TLB propagation is
+ * free: this core gets TlbControl=1 from the caller, and every CR3-write
+ * exit already flushes. */
+void yghv_protect_reopen_page_bare(uint64_t gpa) {
+    if (!g_protect.active)
+        return;
+    (void)npt_set_page_perm(&g_npt, gpa & ~(uint64_t)0xFFFULL,
+        NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+}
+
+/* 9.258 (206-C3): target-exit watchdog. Registered via
+ * PsSetCreateProcessNotifyRoutine (main.c); fires on process teardown.
+ * Without this, a dead target's armed pages leak write-protected NPT state
+ * onto freed physical pages — the next owner's writes hit stale NPT
+ * entries (the c12 victim storm amplifier). PASSIVE_LEVEL callback context,
+ * mutex-protected, memory + NPT bit ops only. */
+void yghv_protect_on_process_exit(uint32_t pid) {
+    yghv_protect_target_t *t;
+    uint32_t i;
+
+    if (pid == 0)
+        return;
+    ExAcquireFastMutex(&g_protect_lock);
+    t = yghv_protect_find_target_by_pid_locked(pid);
+    if (t) {
+        for (i = 0; i < t->page_count; i++) {
+            if (t->pages[i].armed)
+                (void)yghv_protect_disarm_page_locked(&t->pages[i]);
+        }
+        if (t->process)
+            ObDereferenceObject(t->process);
+        RtlZeroMemory(t, sizeof(*t));
+        yghv_protect_refresh_cr3_list_locked();
+    }
+    ExReleaseFastMutex(&g_protect_lock);
 }
 
 NTSTATUS yghv_protect_start(void) {

@@ -44,9 +44,12 @@ extern "C" {
 int yghv_protect_on_npf_write_bare(UINT64 guest_cr3, UINT32 cpl,
                                    UINT64 gpa, UINT64 *rearm_gpa, int *flip);
 int yghv_protect_arm_page_bare(UINT64 gpa);
+void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
+/* 9.258 (206-C3): control-plane read of the last protection verdict hit. */
+extern "C" UINT64 yghv_s206_last_hit(void) { return g_S206LastProtectHit; }
 // 9.251: DENY telemetry ring (cr3/gpa/cpl triplets, island-memory only).
 // Flushed to progress.log by the yghv DriverUnload path AFTER Sv206CoopUnload
 // (bare-metal context, file I/O safe).
@@ -62,8 +65,9 @@ static volatile ULONG g_S206NpfIdx = 0;
  * records EVERY verdict so the ALLOW/#DB window becomes observable. */
 static volatile UINT64 g_S206VrLog[32] = { 0 };
 static volatile ULONG g_S206VrIdx = 0;
-/* 9.255: #DB ring — (rip, rearmSlot, rflags) per #DB-handler hit. */
-static volatile UINT64 g_S206DbgLog[24] = { 0 };
+/* 9.255: #DB ring — (rip, rearmSlot, rflags); 9.258: + DR6 (4-tuple, cap 8)
+ * to identify WHY the c14 run saw 3 #DBs per round (BS vs breakpoint bits). */
+static volatile UINT64 g_S206DbgLog[32] = { 0 };
 static volatile ULONG g_S206DbgIdx = 0;
 extern "C" void yghv_s206_flush_deny_log(void) {
     /* 9.252: NPF-entry records (write faults reaching the handler) — dumps
@@ -90,15 +94,16 @@ extern "C" void yghv_s206_flush_deny_log(void) {
         }
         g_S206VrIdx = 0;
     }
-    /* 9.255: #DB handler hits */
+    /* 9.255: #DB handler hits; 9.258: +DR6 */
     if (g_S206DbgIdx == 0)
         yghv_trace("s206 dbg-log empty");
     else {
         yghv_trace_u64("s206 dbg count", (UINT64)g_S206DbgIdx);
-        for (ULONG q = 0; q * 3 < g_S206DbgIdx; q++) {
-            yghv_trace_u64("s206 dbg rip", g_S206DbgLog[q * 3]);
-            yghv_trace_u64("s206 dbg rearm", g_S206DbgLog[q * 3 + 1]);
-            yghv_trace_u64("s206 dbg rflags", g_S206DbgLog[q * 3 + 2]);
+        for (ULONG q = 0; q * 4 < g_S206DbgIdx; q++) {
+            yghv_trace_u64("s206 dbg rip", g_S206DbgLog[q * 4]);
+            yghv_trace_u64("s206 dbg rearm", g_S206DbgLog[q * 4 + 1]);
+            yghv_trace_u64("s206 dbg rflags", g_S206DbgLog[q * 4 + 2]);
+            yghv_trace_u64("s206 dbg dr6", g_S206DbgLog[q * 4 + 3]);
         }
         g_S206DbgIdx = 0;
     }
@@ -1016,6 +1021,17 @@ SvHandleVmExit (
                     }
                     break;
                 }
+                /* 9.258 (206-C3): NONE + write = unknown/removed armed page
+                 * (stale TLB after watchdog disarm, or a benign race). Do NOT
+                 * inject #PF here — the guest PTE is writable, so Windows sees
+                 * a spurious fault, retries, and loops forever (the c12 victim
+                 * storm: DENY->#PF->retry->NPF->...). Silently reopen the page
+                 * writable and let the write re-execute (RIP kept); TlbControl
+                 * heals this core immediately and every CR3-write exit (which
+                 * already sets TlbControl=1) propagates to the others. */
+                yghv_protect_reopen_page_bare(gpa);
+                VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                break;
             }
             // protection off / read fault / unknown page: reflect as #PF
             {
@@ -1148,17 +1164,20 @@ SvHandleVmExit (
         // Lock-free: same bare discipline as the NPF path.
         //
         {
-            /* 9.255: #DB telemetry — (rip, rearmSlot, rflags) BEFORE anything
-             * consumes the slot; proves whether the ALLOW aftermath reached
-             * here and with which RIP/TF state. */
-            if (g_S206DbgIdx + 3 <= 24) {
+            /* 9.255: #DB telemetry — (rip, rearmSlot, rflags, DR6) BEFORE
+             * anything consumes the slot; proves whether the ALLOW aftermath
+             * reached here and with which RIP/TF state. 9.258: DR6 added
+             * (BS vs B0-B3 bits identify the #DB source). */
+            if (g_S206DbgIdx + 4 <= 32) {
                 g_S206DbgLog[g_S206DbgIdx] =
                     VpData->GuestVmcb.StateSaveArea.Rip;
                 g_S206DbgLog[g_S206DbgIdx + 1] =
                     VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
                 g_S206DbgLog[g_S206DbgIdx + 2] =
                     VpData->GuestVmcb.StateSaveArea.Rflags;
-                g_S206DbgIdx += 3;
+                g_S206DbgLog[g_S206DbgIdx + 3] =
+                    VpData->GuestVmcb.StateSaveArea.Dr6;
+                g_S206DbgIdx += 4;
             }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
             if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {

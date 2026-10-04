@@ -25,6 +25,7 @@ public class YghvCtl {
     private static final int FN_INSTALL_HOOK = 0x80C;
     private static final int FN_REMOVE_HOOK = 0x80D;
     private static final int FN_GET_TARGETS = 0x80E;
+    private static final int FN_GET_LASTHIT = 0x80F;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

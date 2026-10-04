@@ -349,6 +349,12 @@ try {
             Write-Host ("state: active={0} pid={1} page_count={2}" -f
                 $st.active, $st.pid, $st.pageCount)
         }
+        'lasthit' {
+            # 9.258 (206-C3): last protection verdict hit (exact faulting gpa)
+            $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80F)) -OutputLength 8
+            $hit = [BitConverter]::ToUInt64($out, 0)
+            Write-Host ("lasthit: 0x{0:X}" -f $hit)
+        }
         'set-target' {
             $pidVal = [uint32]::Parse($Arg1)
             Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x800)) `
@@ -506,6 +512,12 @@ try {
                 if ($readback -ne 0x1122334455667788) {
                     throw 'selftest: write/read mismatch on protected page'
                 }
+                # 9.258 (206-C3): the verdict must have recorded a hit
+                $hitOut = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80F)) -OutputLength 8
+                $lastHit = [BitConverter]::ToUInt64($hitOut, 0)
+                if ($lastHit -eq 0) {
+                    throw 'selftest: no protection hit recorded (last-hit==0)'
+                }
                 Write-Host 'selftest: user write/read OK (page armed in NPT)'
 
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x804)) | Out-Null
@@ -525,6 +537,33 @@ try {
             } finally {
                 $gc.Free()
             }
+        }
+        'selftest-abort' {
+            # 9.258 (206-C3): watchdog test — arm a page then die WITHOUT any
+            # cleanup (the deliberate c12 leak scenario). The driver's process
+            # -exit watchdog must disarm + free the slot; a state probe right
+            # after this process exits must show page_count=0 for this pid.
+            $bytes = New-Object byte[] 4096
+            $gc = [Runtime.InteropServices.GCHandle]::Alloc(
+                $bytes, [Runtime.InteropServices.GCHandleType]::Pinned)
+            try {
+                $addr = $gc.AddrOfPinnedObject().ToInt64()
+                $pidVal = [YghvCtlNative]::GetCurrentProcessId()
+                Write-Host ("selftest-abort: pid={0} buf_va=0x{1:X}" -f
+                    $pidVal, $addr)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x800)) `
+                    -InBytes ([BitConverter]::GetBytes([uint32]$pidVal)) | Out-Null
+                Write-Host 'selftest-abort: set-target OK'
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x801)) `
+                    -InBytes ([BitConverter]::GetBytes([uint64]$addr)) | Out-Null
+                Write-Host 'selftest-abort: add-page OK'
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x803)) | Out-Null
+                Write-Host 'selftest-abort: start OK — dying WITHOUT cleanup'
+            } finally {
+                $gc.Free()
+            }
+            # process exits here with the page still armed; the driver's
+            # watchdog does the disarm+free during teardown
         }
         'exit-test' {
             $child = Start-Process -FilePath 'cmd.exe' `

@@ -33,6 +33,7 @@ PowerShell client usage:
 
 ```
 yghv_ctl.ps1 state
+yghv_ctl.ps1 lasthit
 yghv_ctl.ps1 set-target <pid>
 yghv_ctl.ps1 add-page <hex_va>
 yghv_ctl.ps1 remove-page <hex_va>
@@ -51,6 +52,7 @@ yghv_ctl.ps1 unset-auto-start
 yghv_ctl.ps1 harden-service
 yghv_ctl.ps1 unharden-service
 yghv_ctl.ps1 selftest
+yghv_ctl.ps1 selftest-abort
 yghv_ctl.ps1 exit-test
 ```
 

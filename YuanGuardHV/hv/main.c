@@ -4629,6 +4629,16 @@ static void yghv_init_auth_cookie(void) {
         g_vmmcall_auth_cookie = 0x59484756ULL;
 }
 
+/* 9.258 (206-C3): process-create/destroy notification. Create=FALSE fires on
+ * process teardown — forward to the protect-engine watchdog (disarm + free
+ * the dead target's pages). Non-Ex variant: (ParentId, ProcessId, Create). */
+static void yghv_s206_process_notify(HANDLE parent_id, HANDLE process_id,
+                                     BOOLEAN create) {
+    (void)parent_id;
+    if (!create)
+        yghv_protect_on_process_exit((uint32_t)(ULONG_PTR)process_id);
+}
+
 /* Write one diagnostic line to \SystemRoot\yghv_watchdog.log (append).  Uses its
    own handle so it works after yghv_trace_close() has NULLed g_trace_file
    (yghv_trace would silently drop the line). */
@@ -4840,6 +4850,9 @@ static void yghv_join_system_thread(HANDLE h) {
 
 void DriverUnload(struct _DRIVER_OBJECT *d) {
 #if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
+    /* 9.258: unregister the target-exit watchdog BEFORE any teardown so no
+     * callback fires into a half-dismantled protect engine. */
+    (void)PsSetCreateProcessNotifyRoutine(yghv_s206_process_notify, TRUE);
     /* 9.246: devirtualize all cores (upstream CPUID-backdoor loop) + unregister
      * the vendored power callback BEFORE any yghv teardown frees the NPT the
      * host loops still translate through. */
@@ -5167,6 +5180,16 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
             return (NTSTATUS)sv;
         }
         yghv_trace("s206b coexist dispatch");
+        /* 9.258 (206-C3): target-exit watchdog — on process teardown, disarm +
+         * remove its protected pages (a dead target otherwise leaks armed NPT
+         * state onto freed physical pages = the c12 victim-storm amplifier).
+         * The callback runs at PASSIVE in normal thread context (never in the
+         * island), mutex-protected, memory/NPT ops only. Non-fatal on failure:
+         * reopen_page_bare self-heal still bounds the leak damage. */
+        sv = PsSetCreateProcessNotifyRoutine(yghv_s206_process_notify, FALSE);
+        yghv_trace_u64("s206b notify reg rc", (uint64_t)(NTSTATUS)sv);
+        if (sv)
+            sv = 0;
         sv = Sv206Entry(d, r);
         yghv_trace_u64("s206b entry rc", (uint64_t)(NTSTATUS)sv);
         if (sv) {

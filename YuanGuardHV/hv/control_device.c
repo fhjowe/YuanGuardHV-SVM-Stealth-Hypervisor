@@ -250,6 +250,22 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         info = sizeof(*out);
         break;
     }
+#if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
+    case IOCTL_YGHV_GET_LASTHIT: {
+        /* 9.258 (206-C3): control-plane read of the last protection hit
+         * (exact faulting gpa recorded at ALLOW/DENY verdict time). The
+         * getter lives in the vendored 206 TU — default builds have no
+         * case here (unknown-code path). */
+        UINT64 *out = (UINT64 *)buf;
+        if (out_len < sizeof(*out)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        { extern UINT64 yghv_s206_last_hit(void); *out = yghv_s206_last_hit(); }
+        info = sizeof(*out);
+        break;
+    }
+#endif
     case IOCTL_YGHV_CLEAR:
         status = yghv_protect_clear();
         break;
