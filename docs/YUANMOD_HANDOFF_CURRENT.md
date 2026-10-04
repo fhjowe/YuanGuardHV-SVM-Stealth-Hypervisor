@@ -4975,3 +4975,17 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   `g_S206LastProtectHit` 挂控制面查询。
 - 状态：C2b 已提交；镜像归档；机器未加载 206；稳定版未动。
 - 提交：本记录。
+
+### 9.250d 2026-10-04 0x20631 蓝屏判读：EXITINFO1 bits[7:6] 才是 CR3 源寄存器的硬件答案；升级为 PRIMARY 路径
+
+- 用户跑 C2c（349c0458）：蓝屏但**带参可观测**——`0xE2 (0x20631, rip=0xFFFFF80777E24DDC,
+  curCr3=0x1EF80E000, exitinfo1=0x8000000000000000)`。这正是 C2c 的"拒绝喂假 CR3"设计
+  出口（自取指+DecodeAssist 都拿不到指令字节 → 拒绝 → 带参蓝屏，秒级定位）。
+- **解码**：curCr3=0x1EF80E000 = 真实进程 CR3（PCID 位=0，prepare 种子正确工作）；
+  EXITINFO1=0x8000_0000_0000_0000 → **bit63=1**（APM：MOV-CR 扩展寄存器形式）+
+  bits[7:6]=0（=RAX 或扩展位）。即 Windows 该处用的是 `mov cr3, rXX`，**EXITINFO1 的
+  bits[7:6] 本来就可靠地携带源 GPR 号**——把它升为主路径（自取指/DecodeAssist 降为
+  尝试性补充），bit63 时用 bits[9:8] 定位 R8-R15（PUSHAQ 索引 15-gpr）。0x20631
+  bugcheck 仅保留给真正未知的形态。
+- 构建全绿，镜像 `153b4c21...` 归档；default 回归干净；已提交。
+- 提交：本记录。
