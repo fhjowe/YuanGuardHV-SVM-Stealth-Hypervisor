@@ -5075,3 +5075,31 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   继续对齐、压测 + sc stop 干净。全绿 → **206-C2 正式 PASS** → 206-C3（控制面加固：
   IOCTL 批变更多样静止、last-hit 查询、目标退出看门狗）。
 - 提交：本记录。
+
+### 9.255 2026-10-04 run_c12（bee02158）判读：写步仍未完成（ioctl 序列证实）+ DENY 风暴 1414 + deny 环步进 bug；c2d 遥测包
+
+- **run_c12 基础设施全绿**（stress×2、sc stop 69ms、post sanity 0），但 selftest
+  两轮仍死在写入步——**ioctl 序列（write-through 逐条）精确证实**：
+  `14(state),00(set-target),38(pages),04(add),38(pages),1C(fn7),0C(start)` 后
+  post-start 的 state(0x14) 从未到达 driver → 死亡锁定在 WriteInt64/ReadInt64。
+- **DENY 风暴（count=1414）**：npf 环 #3–#8 = 无辜进程（cr3=0x24EACE000）对
+  round-1 死后泄漏的武装页（0x320615FC0）反复写 → foreign-write DENY → 注入
+  #PF(ec.P=1) → guest 见可写 PTE → spurious-retry 死循环。**两个弹窗 = 被误杀的
+  无辜进程**。这就是 206-C3 目标退出看门狗要根治的场景。
+- **deny 环步进 bug**：写入 `[idx%8]`+3 槽重叠 + 读取按 q*3 → 三元组互相覆盖成
+  糊状（cr3=gpa=cpl 同值）。修复：3 槽 no-wrap、idx+=3、cap 8 组。
+- **软件链全验证**：set_target 的 CR3 捕获（KPROCESS+0x28）✓、find_page（受害者
+  路径反证）✓、npt_set_page_perm（按位 P/RW/NX）✓、npt_split 重入 no-op（line 87
+  非 large page 直接 SUCCESS）✓、verdict 分支逻辑 ✓。c11 已证 verdict=ALLOW
+  （deny 环空），c12 只改 RIP → verdict 仍应为 ALLOW，但 ALLOW 后窗口
+  （写重执行→#DB→重武装→恢复）不可见 → 死因仍藏在这段。
+- **c2d 遥测包（本提交）**：verdict 环 `g_S206VrLog`（gpa, vr|TF<<3 对，cap 16）+
+  #DB 环 `g_S206DbgLog`（rip/rearmSlot/rflags 三元组，cap 8）+ deny 环修复；全部
+  岛内内存、DriverUnload 落盘。verdict 环把每次 write-NPF 的裁决（0=NONE 1=ALLOW
+  2=DENY + TF 状态）变成可观测；#DB 环证明 ALLOW 后窗口是否到达 #DB、RIP/TF 形态。
+- 构建：default + 206c2 双绿；串标记 vr/dbg 全部入链。镜像 md5 `bb4fa894` 归档
+  `D:\aaaaaavm\yuanguard_hv_step206c2d_20261004.sys`；脚本 `run_c13_step206c2d.ps1`。
+- **run_c13 判读表**：vr=1(TF置位) 且 dbg 环有对应 rip → ALLOW 窗口走到 #DB，看
+  dbg 的 rip/rflags 定位死因；vr=1 但 dbg 空 → #DB 从未触发（TF/中断窗口问题）；
+  vr=0 → verdict=NONE（cr3 链问题回归）；vr=2 → DENY（KPTI/PCID 变体）。
+- 提交：本记录。
