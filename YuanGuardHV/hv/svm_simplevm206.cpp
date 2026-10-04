@@ -55,7 +55,7 @@ extern "C" UINT64 yghv_s206_last_hit(void) { return g_S206LastProtectHit; }
 // (bare-metal context, file I/O safe).
 extern "C" void yghv_trace(const char *msg);
 extern "C" void yghv_trace_u64(const char *label, UINT64 v);
-static volatile UINT64 g_S206DenyLog[128] = { 0 };
+static volatile UINT64 g_S206DenyLog[160] = { 0 };
 static volatile ULONG g_S206DenyIdx = 0;
 /* 9.252: NPF-entry telemetry (write-fault NPFs reaching the handler) */
 static volatile UINT64 g_S206NpfLog[96] = { 0 };
@@ -112,11 +112,12 @@ extern "C" void yghv_s206_flush_deny_log(void) {
         return;
     }
     yghv_trace_u64("s206 deny count", (UINT64)g_S206DenyIdx);
-    for (ULONG q = 0; q * 4 < g_S206DenyIdx && q < 32; q++) {
-        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 4]);
-        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 4 + 1]);
-        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 4 + 2]);
-        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 4 + 3]);
+    for (ULONG q = 0; q * 5 < g_S206DenyIdx && q < 32; q++) {
+        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 5]);
+        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 5 + 1]);
+        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 5 + 2]);
+        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 5 + 3]);
+        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 5 + 4]);
     }
     g_S206DenyIdx = 0;
 }
@@ -853,11 +854,13 @@ SvHandleVmrun (
  * (CR2=0 + ec P=0), hardware-proven deterministic. A WRONG GVA here would be
  * worse than a fallback: it decides WHICH VA Windows resolves the fault at.
  * Island-safe: pure memory arithmetic + the non-paging PT walk. */
-static int S206DecodeStoreGva(
+static UINT32 S206DecodeStoreGva(
     _In_ PVIRTUAL_PROCESSOR_DATA VpData,
     _In_ PGUEST_REGISTERS Regs,
     _Out_ UINT64 *gva)
 {
+    /* returns 0 on success, else a reason code (recorded in the deny ring's
+     * gva slot as 0xDEAD0000|reason so one run localizes the failure). */
     UINT8 ib[15];
     UINT64 rip = VpData->GuestVmcb.StateSaveArea.Rip;
     UINT64 curCr3 = VpData->HostStackLayout.Padding1;
@@ -869,19 +872,21 @@ static int S206DecodeStoreGva(
     UINT64 baseV = 0, idxV = 0;
 
     *gva = 0;
-    if (curCr3 == 0 || (rip & 0xFFFULL) > 0xFF0ULL)
-        return 0;   /* no CR3 / instruction would cross the page end */
+    if (curCr3 == 0)
+        return 1;                  /* DG_NO_CR3 */
+    if ((rip & 0xFFFULL) > 0xFF0ULL)
+        return 2;                  /* DG_PAGE_BOUNDARY: would cross page end */
 
     {
         UINT64 gpa = yghv_protect_guest_va_to_pa(curCr3, rip);
         PHYSICAL_ADDRESS pa;
         PVOID va;
         if (!gpa)
-            return 0;
+            return 3;              /* DG_WALK_FAIL */
         pa.QuadPart = (LONGLONG)gpa;
         va = MmGetVirtualForPhysical(pa);
         if (!va)
-            return 0;
+            return 4;              /* DG_NO_DIRECTMAP */
         for (i = 0; i < 15; i++)
             ib[i] = ((volatile UINT8 *)va)[i];
     }
@@ -891,52 +896,52 @@ static int S206DecodeStoreGva(
         UINT8 b = ib[pos];
         if (b == 0x66 || b == 0xF0 || b == 0xF2 || b == 0xF3 ||
             b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26) {
-            if (++pos >= 15) return 0;
+            if (++pos >= 15) return 8;   /* DG_TRUNCATED */
             continue;
         }
         if (b == 0x67)
-            return 0;               /* 16-bit addressing: not worth decoding */
+            return 5;              /* DG_ADDR16: not worth decoding */
         if (b == 0x64 || b == 0x65) {
             segFsGs = (b == 0x64) ? 4 : 5;
-            if (++pos >= 15) return 0;
+            if (++pos >= 15) return 8;   /* DG_TRUNCATED */
             continue;
         }
         break;
     }
     if (ib[pos] >= 0x40 && ib[pos] <= 0x4F) {
         rex = ib[pos];
-        if (++pos >= 15) return 0;
+        if (++pos >= 15) return 8; /* DG_TRUNCATED */
     }
     op = ib[pos++];
-    if (pos >= 15) return 0;
+    if (pos >= 15) return 8;       /* DG_TRUNCATED */
 
     if (op == 0x0F) {
         op2 = ib[pos++];
-        if (pos >= 15) return 0;
+        if (pos >= 15) return 8;   /* DG_TRUNCATED */
         /* TIGHT allowlist of store-capable 0F forms; everything else bails.
            (0F 38/3A take a third opcode byte before modrm -- both kept.) */
         if (op2 == 0x38 || op2 == 0x3A)
-            pos++;                  /* movdiri etc: modrm follows */
+            pos++;                 /* movdiri etc: modrm follows */
         else if (op2 != 0xB0 && op2 != 0xB1 && op2 != 0xC0 && op2 != 0xC1 &&
                  op2 != 0xAB && op2 != 0xB3 && op2 != 0xBB && op2 != 0xBA &&
                  op2 != 0xA4 && op2 != 0xA5 && op2 != 0xAC && op2 != 0xAD &&
                  op2 != 0x11 && op2 != 0x7F && op2 != 0x2B && op2 != 0xE7)
-            return 0;
+            return 6;              /* DG_OPCODE */
     } else if (op != 0x88 && op != 0x89 && op != 0x86 && op != 0x87 &&
                op != 0xC6 && op != 0xC7 && op != 0x80 && op != 0x81 &&
                op != 0x83 && op != 0xF6 && op != 0xF7) {
-        return 0;
+        return 6;                  /* DG_OPCODE */
     }
 
     modrm = ib[pos++];
     mod = (modrm >> 6) & 3;
     rm = modrm & 7;
     if (mod == 3)
-        return 0;                   /* register operand: no store to decode */
+        return 7;                  /* DG_REG_OPERAND: no store to decode */
 
     if (rm == 4) {
         /* SIB byte */
-        if (pos >= 15) return 0;
+        if (pos >= 15) return 8;   /* DG_TRUNCATED */
         sib = ib[pos++];
         scale = (UINT8)(1 << ((sib >> 6) & 3));
         idx = (sib >> 3) & 7;
@@ -944,7 +949,7 @@ static int S206DecodeStoreGva(
         if (idx != 4)
             idxV = (&Regs->R15)[15 - (idx | ((rex & 0x2) ? 8 : 0))] * scale;
         if (base == 5 && mod == 0) {
-            if (pos + 4 > 15) return 0;
+            if (pos + 4 > 15) return 8;   /* DG_TRUNCATED */
             disp = (INT64)(INT32)(ib[pos] | (ib[pos + 1] << 8) |
                                   (ib[pos + 2] << 16) |
                                   ((UINT32)ib[pos + 3] << 24));
@@ -952,10 +957,10 @@ static int S206DecodeStoreGva(
         } else {
             baseV = (&Regs->R15)[15 - (base | ((rex & 0x1) ? 8 : 0))];
             if (mod == 1) {
-                if (pos >= 15) return 0;
+                if (pos >= 15) return 8;   /* DG_TRUNCATED */
                 disp = (INT64)(INT8)ib[pos++];
             } else if (mod == 2) {
-                if (pos + 4 > 15) return 0;
+                if (pos + 4 > 15) return 8;   /* DG_TRUNCATED */
                 disp = (INT64)(INT32)(ib[pos] | (ib[pos + 1] << 8) |
                                       (ib[pos + 2] << 16) |
                                       ((UINT32)ib[pos + 3] << 24));
@@ -967,7 +972,7 @@ static int S206DecodeStoreGva(
         /* 64-bit RIP-relative: EA = next-RIP + disp32. next-RIP needs the
            trailing immediate size, so only known forms pass. */
         UINT32 imm;
-        if (pos + 4 > 15) return 0;
+        if (pos + 4 > 15) return 8;   /* DG_TRUNCATED */
         disp = (INT64)(INT32)(ib[pos] | (ib[pos + 1] << 8) |
                               (ib[pos + 2] << 16) |
                               ((UINT32)ib[pos + 3] << 24));
@@ -980,16 +985,16 @@ static int S206DecodeStoreGva(
         else if (op == 0xF6) imm = 1;
         else if (op == 0xF7) imm = (rex & 0x8) ? 4 : 0;
         else if (op == 0x0F && op2 == 0xBA) imm = 1;
-        else imm = 0;               /* no trailing immediate forms */
+        else return 9;             /* DG_RIPREL_IMM: unknown imm shape */
         ea = rip + pos + imm + (UINT64)disp;
     } else {
         UINT64 breg = rm | ((rex & 0x1) ? 8 : 0);
         baseV = (&Regs->R15)[15 - breg];
         if (mod == 1) {
-            if (pos >= 15) return 0;
+            if (pos >= 15) return 8;   /* DG_TRUNCATED */
             disp = (INT64)(INT8)ib[pos++];
         } else if (mod == 2) {
-            if (pos + 4 > 15) return 0;
+            if (pos + 4 > 15) return 8;   /* DG_TRUNCATED */
             disp = (INT64)(INT32)(ib[pos] | (ib[pos + 1] << 8) |
                                   (ib[pos + 2] << 16) |
                                   ((UINT32)ib[pos + 3] << 24));
@@ -1006,10 +1011,10 @@ static int S206DecodeStoreGva(
     {
         UINT64 top = ea >> 48;
         if (top != 0 && top != 0xFFFF)
-            return 0;
+            return 10;             /* DG_NONCANONICAL */
     }
     *gva = ea;
-    return 1;
+    return 0;
 }
 
 /*!
@@ -1202,8 +1207,9 @@ SvHandleVmExit (
                      * (0 = decode fell back) so one run validates both the
                      * decoder and the delivery pairing. */
                     UINT64 gva = 0;
-                    int haveGva =
+                    UINT32 dReason =
                         S206DecodeStoreGva(VpData, GuestRegisters, &gva);
+                    BOOLEAN haveGva = (dReason == 0);
                     UINT64 e1 = VpData->GuestVmcb.ControlArea.ExitInfo1;
                     VpData->GuestVmcb.StateSaveArea.Cr2 = haveGva ? gva : 0;
                     ec = 0;
@@ -1223,13 +1229,19 @@ SvHandleVmExit (
                      * Sv206CoopUnload brings the cores back to bare metal).
                      * 9.255: stride fix, no-wrap records. 9.263: 4 slots per
                      * entry, +GVA (0 = decode fell back). */
-                    if (g_S206DenyIdx + 4 <= 128) {
+                    /* 9.265: 5 slots/entry. gva slot = decoded GVA, or
+                     * 0xDEAD0000|reason when the decoder fell back; rip slot
+                     * records the faulting instruction for the record. */
+                    if (g_S206DenyIdx + 5 <= 160) {
                         g_S206DenyLog[g_S206DenyIdx] = curCr3;
                         g_S206DenyLog[g_S206DenyIdx + 1] = gpa;
                         g_S206DenyLog[g_S206DenyIdx + 2] =
                             VpData->GuestVmcb.StateSaveArea.Cpl;
-                        g_S206DenyLog[g_S206DenyIdx + 3] = gva;
-                        g_S206DenyIdx += 4;
+                        g_S206DenyLog[g_S206DenyIdx + 3] =
+                            haveGva ? gva : (0xDEAD0000ULL | dReason);
+                        g_S206DenyLog[g_S206DenyIdx + 4] =
+                            VpData->GuestVmcb.StateSaveArea.Rip;
+                        g_S206DenyIdx += 5;
                     }
                     break;
                 }
