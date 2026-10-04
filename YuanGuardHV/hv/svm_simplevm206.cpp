@@ -55,7 +55,7 @@ extern "C" UINT64 yghv_s206_last_hit(void) { return g_S206LastProtectHit; }
 // (bare-metal context, file I/O safe).
 extern "C" void yghv_trace(const char *msg);
 extern "C" void yghv_trace_u64(const char *label, UINT64 v);
-static volatile UINT64 g_S206DenyLog[160] = { 0 };
+static volatile UINT64 g_S206DenyLog[192] = { 0 };
 static volatile ULONG g_S206DenyIdx = 0;
 /* 9.252: NPF-entry telemetry (write-fault NPFs reaching the handler) */
 static volatile UINT64 g_S206NpfLog[96] = { 0 };
@@ -112,12 +112,13 @@ extern "C" void yghv_s206_flush_deny_log(void) {
         return;
     }
     yghv_trace_u64("s206 deny count", (UINT64)g_S206DenyIdx);
-    for (ULONG q = 0; q * 5 < g_S206DenyIdx && q < 32; q++) {
-        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 5]);
-        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 5 + 1]);
-        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 5 + 2]);
-        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 5 + 3]);
-        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 5 + 4]);
+    for (ULONG q = 0; q * 6 < g_S206DenyIdx && q < 32; q++) {
+        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 6]);
+        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 6 + 1]);
+        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 6 + 2]);
+        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 6 + 3]);
+        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 6 + 4]);
+        yghv_trace_u64("s206 deny aux", g_S206DenyLog[q * 6 + 5]);
     }
     g_S206DenyIdx = 0;
 }
@@ -854,10 +855,27 @@ SvHandleVmrun (
  * (CR2=0 + ec P=0), hardware-proven deterministic. A WRONG GVA here would be
  * worse than a fallback: it decides WHICH VA Windows resolves the fault at.
  * Island-safe: pure memory arithmetic + the non-paging PT walk. */
+/* single guest page-table slot read via the direct map (same as
+ * yghv_protect_guest_va_to_pa's yghv_pt_read; duplicated here so the
+ * decoder can instrument each level without touching shared code). */
+static UINT64 S206ReadGuestPt(UINT64 table_pa, UINT64 index)
+{
+    UINT64 *va;
+    PHYSICAL_ADDRESS pa;
+    if (!table_pa)
+        return 0;
+    pa.QuadPart = (LONGLONG)table_pa;
+    va = (UINT64 *)MmGetVirtualForPhysical(pa);
+    if (!va)
+        return 0;
+    return va[index];
+}
+
 static UINT32 S206DecodeStoreGva(
     _In_ PVIRTUAL_PROCESSOR_DATA VpData,
     _In_ PGUEST_REGISTERS Regs,
-    _Out_ UINT64 *gva)
+    _Out_ UINT64 *gva,
+    _Out_ UINT64 *aux)
 {
     /* returns 0 on success, else a reason code (recorded in the deny ring's
      * gva slot as 0xDEAD0000|reason so one run localizes the failure). */
@@ -881,14 +899,72 @@ static UINT32 S206DecodeStoreGva(
         UINT64 gpa = yghv_protect_guest_va_to_pa(curCr3, rip);
         PHYSICAL_ADDRESS pa;
         PVOID va;
-        if (!gpa)
-            return 3;              /* DG_WALK_FAIL */
-        pa.QuadPart = (LONGLONG)gpa;
-        va = MmGetVirtualForPhysical(pa);
-        if (!va)
-            return 4;              /* DG_NO_DIRECTMAP */
-        for (i = 0; i < 15; i++)
-            ib[i] = ((volatile UINT8 *)va)[i];
+        if (!gpa) {
+            /* 9.267: walk failed — classify WHICH level and capture the raw
+             * failing entry (9.250c's self-fetch missed the same way and was
+             * never root-caused; EXITINFO1 masked it). */
+            UINT64 *auxOut = aux;
+            static const UINT64 PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
+            UINT64 pml4e, pdpte, pde, pte;
+            pml4e = S206ReadGuestPt(curCr3 & PT_ADDR_MASK, (rip >> 39) & 0x1FF);
+            if (!(pml4e & 1)) {
+                *gva = 11;
+                if (auxOut) *auxOut = pml4e;
+                return 3;
+            }
+            pdpte = S206ReadGuestPt(pml4e & PT_ADDR_MASK, (rip >> 30) & 0x1FF);
+            if (!(pdpte & 1)) {
+                *gva = 12;
+                if (auxOut) *auxOut = pdpte;
+                return 3;
+            }
+            if (pdpte & (1ULL << 7)) {
+                *gva = 0;
+                if (auxOut) *auxOut = 0x1B;   /* 1GB page: fetch below */
+                (void)0;
+            } else {
+                pde = S206ReadGuestPt(pdpte & PT_ADDR_MASK, (rip >> 21) & 0x1FF);
+                if (!(pde & 1)) {
+                    *gva = 13;
+                    if (auxOut) *auxOut = pde;
+                    return 3;
+                }
+                if (pde & (1ULL << 7)) {
+                    *gva = 0;
+                    if (auxOut) *auxOut = 0x2B;   /* 2MB page: fetch below */
+                } else {
+                    pte = S206ReadGuestPt(pde & PT_ADDR_MASK, (rip >> 12) & 0x1FF);
+                    if (!(pte & 1)) {
+                        *gva = 14;
+                        if (auxOut) *auxOut = pte;
+                        return 3;
+                    }
+                }
+            }
+            /* entry says present but the shared helper returned 0 — fall
+             * through and let the direct-map fetch try anyway (the helper's
+             * arithmetic may be subtly off; the fetch itself is the truth). */
+            {
+                UINT64 pte2 = yghv_protect_guest_va_to_pa(curCr3, rip);
+                if (!pte2) {
+                    if (auxOut) *auxOut = pte;
+                    return 3;      /* keep DG_WALK_FAIL with aux evidence */
+                }
+                pa.QuadPart = (LONGLONG)pte2;
+            }
+            va = MmGetVirtualForPhysical(pa);
+            if (!va)
+                return 4;          /* DG_NO_DIRECTMAP */
+            for (i = 0; i < 15; i++)
+                ib[i] = ((volatile UINT8 *)va)[i];
+        } else {
+            pa.QuadPart = (LONGLONG)gpa;
+            va = MmGetVirtualForPhysical(pa);
+            if (!va)
+                return 4;          /* DG_NO_DIRECTMAP */
+            for (i = 0; i < 15; i++)
+                ib[i] = ((volatile UINT8 *)va)[i];
+        }
     }
 
     /* legacy prefixes; FS/GS overrides add the segment base from the SSA */
@@ -1207,8 +1283,10 @@ SvHandleVmExit (
                      * (0 = decode fell back) so one run validates both the
                      * decoder and the delivery pairing. */
                     UINT64 gva = 0;
+                    UINT64 dAux = 0;
                     UINT32 dReason =
-                        S206DecodeStoreGva(VpData, GuestRegisters, &gva);
+                        S206DecodeStoreGva(VpData, GuestRegisters, &gva,
+                                           &dAux);
                     BOOLEAN haveGva = (dReason == 0);
                     UINT64 e1 = VpData->GuestVmcb.ControlArea.ExitInfo1;
                     VpData->GuestVmcb.StateSaveArea.Cr2 = haveGva ? gva : 0;
@@ -1229,10 +1307,11 @@ SvHandleVmExit (
                      * Sv206CoopUnload brings the cores back to bare metal).
                      * 9.255: stride fix, no-wrap records. 9.263: 4 slots per
                      * entry, +GVA (0 = decode fell back). */
-                    /* 9.265: 5 slots/entry. gva slot = decoded GVA, or
-                     * 0xDEAD0000|reason when the decoder fell back; rip slot
-                     * records the faulting instruction for the record. */
-                    if (g_S206DenyIdx + 5 <= 160) {
+                    /* 9.267: 6 slots/entry. gva = decoded GVA, or
+                     * 0xDEAD0000|reason on fallback (11-14 = walk failed at
+                     * PML4E/PDPTE/PDE/PTE); rip = faulting instruction;
+                     * aux = raw failing PT entry (or large-page tag). */
+                    if (g_S206DenyIdx + 6 <= 192) {
                         g_S206DenyLog[g_S206DenyIdx] = curCr3;
                         g_S206DenyLog[g_S206DenyIdx + 1] = gpa;
                         g_S206DenyLog[g_S206DenyIdx + 2] =
@@ -1241,7 +1320,8 @@ SvHandleVmExit (
                             haveGva ? gva : (0xDEAD0000ULL | dReason);
                         g_S206DenyLog[g_S206DenyIdx + 4] =
                             VpData->GuestVmcb.StateSaveArea.Rip;
-                        g_S206DenyIdx += 5;
+                        g_S206DenyLog[g_S206DenyIdx + 5] = dAux;
+                        g_S206DenyIdx += 6;
                     }
                     break;
                 }
