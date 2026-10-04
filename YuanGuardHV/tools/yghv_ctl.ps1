@@ -33,7 +33,8 @@ Commands:
 param(
     [Parameter(Position = 0)][string]$Command = 'state',
     [Parameter(Position = 1)]$Arg1 = $null,
-    [Parameter(Position = 2)]$Arg2 = $null
+    [Parameter(Position = 2)]$Arg2 = $null,
+    [Parameter(Position = 3)]$Arg3 = $null
 )
 
 $ErrorActionPreference = 'Stop'
