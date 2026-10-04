@@ -5204,3 +5204,53 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   用——arm→NPF→岛内裸判（ALLOW/DENY）→重武装→读回→看门狗→last-hit 查询→
   在线卸载，全链硬件实证。
 - 提交：本记录。
+
+### 9.260 2026-10-04 206-C4 实现：跨进程保护（add_page_for_pid + 0x810/0x811 + ctl MMF 命令族 + run_c16；镜像 faa4cbda，**未实机验证**）
+
+- **驱动（通用代码，无 206 门控——default 构建 LNK2019 教训，protect.c 恒编译）**：
+  1. `yghv_protect_add_page_for_pid(pid, va)` / `yghv_protect_remove_page_for_pid`
+     （protect.c）：`find_target_by_pid_locked → *_for_locked` 复用，目标槽必须已由
+     set-target 注册（NOT_FOUND 拒绝）；`resolve_va_for` 本就走目标页表
+     （KeStackAttachProcess），无需再改；
+  2. **add_page_for_locked 去重守卫**：同 (target, va) 幂等 SUCCESS——两槽别名同一
+     gpa 会毁掉 armed/disarm 记账（find_page 只见第一条）；
+  3. control_ioctl.h：IOCTL_YGHV_ADD_PAGE_FOR_PID=0x810 / REMOVE_PAGE_FOR_PID=0x811
+     + `yghv_ioctl_va_pid_t {ULONG pid; ULONG_PTR target_va}`（x64 对齐后 16 字节，
+     ps1 侧手排 [0..3]=pid [8..15]=va）；control_device.c 两个 case 直调。
+- **门禁 ritual（0x810/0x811 三端同步）**：ps1 `IoCtl(0x810/0x811)`（protect-page/
+  unprotect-page case 内实调）+ Java `FN_ADD_PAGE_FOR_PID/FN_REMOVE_PAGE_FOR_PID`
+  常量 + client README 5 行 `yghv_ctl.ps1` 命令 → ioctl_parity PASS（C=PS=Java=18）
+  + command_parity PASS（PS=27/Java=18）。Java 不加 case（其 parity 只对 README
+  run.bat 行），REV-019 注记补 206-C4 出口说明。
+- **ctl 新命令**：`protect-page <pid> <hex_va>`（pid+va 16B 缓冲→0x810；
+  hex 解析剥 0x 前缀——.NET Framework `Convert.ToUInt64(s,16)` 拒收 0x）/
+  `unprotect-page`（0x811）/ `mmf-open`（Win32 CreateFileMappingW+MapViewOfFile，
+  打印原生基 VA——MMF view accessor 藏指针，protect-page 需要真 VA）/ `mmf-loop
+  <path> <sec> [info]`（目标：映射→打印 pid+va→写 [0]=0x00C4C4…+i 循环 400ms，
+  info 文件发布 pid/va 供控制器解析）/ `mmf-write <path>`（攻击者：一次
+  Marshal.WriteInt64 → `TryWrite` 内 `[HandleProcessCorruptedStateExceptions]+
+  [SecurityCritical]` 捕获 DENY 注入的 AV → 确定性 BLOCKED / LANDED）。
+  **YghvMmf C# 只在 powershell.exe（.NET Framework）下 CSE 可捕获；pwsh7 fail-fast，
+  run_c16 全部子进程显式 powershell**。介质 = 真 file-backed section（PAGE_READWRITE
+  + FILE_SHARE_READWRITE），两进程同 PFN，脏页不被搬移（MPW 回写是 cpl=0 → ALLOW
+  路径，不产生 DENY）。
+- **run_c16_step206c4.ps1**（D:\aaaaaavm，部署 206c4a 镜像→yuang206c2 服务）：
+  mmf-open sanity → 目标 mmf-loop（90s，info 文件轮询 20s 取 pid/va）→ set-target
+  → protect-page（失败即中止）→ start → 4s 目标写窗（ALLOW+#DB 重武装 ×N）→
+  攻击者 mmf-write **gate1=BLOCKED** → lasthit → 杀目标 → 看门狗轮询
+  **gate2=槽释放**（判据要求 ctl 输出含 `list-targets: returned=` 才有效，空输出
+  不算释放）→ 攻击者第二次 mmf-write **gate3=LANDED**（无目标=无保护）→ 压测×2
+  → sc stop 计时 → post sanity → 卸载后 s206 遥测环全量落盘判读。
+- **run_c16 判据（206-C4 PASS）**：三 gate 全 PASS + 遥测交叉：vr 环 ALLOW×N
+  （目标 CR3 写）、deny 环恰含攻击者 gpa（cpl=3、CR3≠目标，1–2 条——mmf-write 单
+  写单 NPF，无风暴）、dbg 环 #DB 对应目标页 re-arm、addlog va/gpa 对齐、npf 环
+  无无辜 CR3 条目。fall-out 风险：gate3 若仍 BLOCKED = 看门狗未 disarm（查
+  PsSetCreateProcessNotifyRoutine 回调 + on_process_exit 对 pid 槽的清理）；
+  gate1 若 LANDED = arm 未生效（查 split/PERSENT-only/set-target CR3 捕获时序）。
+- 构建：default 绿（SHA256 43c8b4d8…）+ STEP=206/COEXIST/GNPT 绿；静态检查全过
+  （ioctl parity 18/18、command parity PS=27/Java=18、safety PASS）；两 C# 内联块
+  Add-Type 编译 OK；Java client 编译 OK；两 ps1 Parser 零错。镜像 SHA256
+  `460027e912999b942d2e9c6c28fb2891344a473168060b6e0c73a2178cead3f7`（md5
+  `faa4cbda`）归档 `D:\aaaaaavm\yuanguard_hv_step206c4a_20261004.sys`；脚本
+  `D:\aaaaaavm\run_c16_step206c4.ps1`。机器未加载 206；稳定版未动。
+- 提交：本记录。

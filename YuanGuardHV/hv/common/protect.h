@@ -121,6 +121,8 @@ NTSTATUS yghv_protect_add_page(uint64_t target_va);
 NTSTATUS yghv_protect_remove_page(uint64_t target_va);
 NTSTATUS yghv_protect_add_page_for(uint64_t cr3, uint64_t target_va);
 NTSTATUS yghv_protect_remove_page_for(uint64_t cr3, uint64_t target_va);
+NTSTATUS yghv_protect_add_page_for_pid(uint32_t pid, uint64_t target_va);
+NTSTATUS yghv_protect_remove_page_for_pid(uint32_t pid, uint64_t target_va);
 yghv_protect_page_t *yghv_protect_find_page(uint64_t gpa);
 int yghv_protect_arm_page(yghv_protect_page_t *p);
 int yghv_protect_disarm_page(yghv_protect_page_t *p);

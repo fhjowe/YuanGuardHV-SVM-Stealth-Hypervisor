@@ -42,6 +42,10 @@
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x80E, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define IOCTL_YGHV_GET_LASTHIT \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x80F, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_ADD_PAGE_FOR_PID \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x810, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_REMOVE_PAGE_FOR_PID \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x811, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
@@ -53,6 +57,13 @@ typedef struct {
 typedef struct {
     ULONG_PTR target_va;
 } yghv_ioctl_va_t;
+
+/* 206-C4: cross-process add/remove page — resolve the target slot by pid
+   (the caller is the external controller, not the target process). */
+typedef struct {
+    ULONG pid;
+    ULONG_PTR target_va;
+} yghv_ioctl_va_pid_t;
 
 typedef struct {
     ULONG active;

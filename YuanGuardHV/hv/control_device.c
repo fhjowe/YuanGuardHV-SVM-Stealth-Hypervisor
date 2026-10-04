@@ -352,6 +352,28 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = yghv_protect_remove_hook((uint8_t)in->hook_id);
         break;
     }
+    case IOCTL_YGHV_ADD_PAGE_FOR_PID: {
+        /* 206-C4: cross-process arm — the caller is the external controller;
+         * the target slot is resolved by pid, not by the caller's CR3. Both
+         * handlers live in protect.c (always compiled) — no 206 gating here,
+         * a default-build LNK2019 is the failure mode gating avoids. */
+        yghv_ioctl_va_pid_t *in = (yghv_ioctl_va_pid_t *)buf;
+        if (in_len < sizeof(*in)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        status = yghv_protect_add_page_for_pid(in->pid, in->target_va);
+        break;
+    }
+    case IOCTL_YGHV_REMOVE_PAGE_FOR_PID: {
+        yghv_ioctl_va_pid_t *in = (yghv_ioctl_va_pid_t *)buf;
+        if (in_len < sizeof(*in)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        status = yghv_protect_remove_page_for_pid(in->pid, in->target_va);
+        break;
+    }
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;

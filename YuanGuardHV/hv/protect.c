@@ -382,10 +382,18 @@ static NTSTATUS yghv_protect_add_page_for_locked(yghv_protect_target_t *t,
     uint64_t target_va) {
     uint64_t gpa;
     yghv_protect_page_t *p;
+    uint32_t i;
     if (!t || t->page_count >= YGHV_PROTECT_MAX_PAGES)
         return STATUS_INSUFFICIENT_RESOURCES;
     if (!t->cr3)
         return STATUS_INVALID_PARAMETER;
+    /* Duplicate (target, va) entries would alias the same gpa in two slots
+       and corrupt the armed/disarm accounting (find_page only ever sees the
+       first). Idempotent no-op keeps a repeated protect-page call safe. */
+    for (i = 0; i < t->page_count; i++) {
+        if (t->pages[i].target_va == target_va)
+            return STATUS_SUCCESS;
+    }
     gpa = yghv_protect_resolve_va_for(t, target_va);
     gpa &= ~(uint64_t)0xFFFULL;
     if (!gpa) {
@@ -426,6 +434,47 @@ NTSTATUS yghv_protect_remove_page_for(uint64_t cr3, uint64_t target_va) {
     if (!t) {
         ExReleaseFastMutex(&g_protect_lock);
         return STATUS_ACCESS_DENIED;
+    }
+    st = yghv_protect_remove_page_for_locked(t, target_va);
+    ExReleaseFastMutex(&g_protect_lock);
+    return st;
+}
+
+/* 206-C4: cross-process protection. The 0x801/0x802 variants resolve the
+ * target slot by the CALLER's CR3, which only works when the controlling
+ * process IS the target (selftest). Product semantics need an external
+ * controller to arm a page inside another process, so these resolve the
+ * slot by pid instead; the target itself must already be registered via
+ * set-target. resolve_va_for already walks the TARGET's page tables
+ * (KeStackAttachProcess), so no further changes are needed. General code,
+ * deliberately not 206-gated: protect.c compiles in the default build too
+ * and an unmatched-symbol default link (LNK2019) is worse than dead code. */
+NTSTATUS yghv_protect_add_page_for_pid(uint32_t pid, uint64_t target_va) {
+    NTSTATUS st;
+    yghv_protect_target_t *t;
+    if (pid == 0)
+        return STATUS_INVALID_PARAMETER;
+    ExAcquireFastMutex(&g_protect_lock);
+    t = yghv_protect_find_target_by_pid_locked(pid);
+    if (!t) {
+        ExReleaseFastMutex(&g_protect_lock);
+        return STATUS_NOT_FOUND;
+    }
+    st = yghv_protect_add_page_for_locked(t, target_va);
+    ExReleaseFastMutex(&g_protect_lock);
+    return st;
+}
+
+NTSTATUS yghv_protect_remove_page_for_pid(uint32_t pid, uint64_t target_va) {
+    NTSTATUS st;
+    yghv_protect_target_t *t;
+    if (pid == 0)
+        return STATUS_INVALID_PARAMETER;
+    ExAcquireFastMutex(&g_protect_lock);
+    t = yghv_protect_find_target_by_pid_locked(pid);
+    if (!t) {
+        ExReleaseFastMutex(&g_protect_lock);
+        return STATUS_NOT_FOUND;
     }
     st = yghv_protect_remove_page_for_locked(t, target_va);
     ExReleaseFastMutex(&g_protect_lock);

@@ -54,6 +54,11 @@ yghv_ctl.ps1 unharden-service
 yghv_ctl.ps1 selftest
 yghv_ctl.ps1 selftest-abort
 yghv_ctl.ps1 exit-test
+yghv_ctl.ps1 protect-page <pid> <hex_va>
+yghv_ctl.ps1 unprotect-page <pid> <hex_va>
+yghv_ctl.ps1 mmf-open <path>
+yghv_ctl.ps1 mmf-loop <path> <sec> [info]
+yghv_ctl.ps1 mmf-write <path>
 ```
 
 `protect` sets the target, enumerates committed pages of the real Java process,
@@ -66,7 +71,9 @@ it does not arm or protect anything.
 > PID — the driver binds ADD_PAGE to the *caller's* CR3 (P0 self-targeting), so
 > protecting an arbitrary enumerated PID returns ACCESS_DENIED on every page.
 > Use `list-java` to find this process's PID, or `scan <pid>` (read-only) for
-> other processes.
+> other processes. 206-C4 supersedes this for the PowerShell client:
+> `protect-page <pid> <hex_va>` (fn 0x810) resolves the target slot by pid,
+> so an external controller can arm a page inside another registered target.
 
 Boundary: the current hypervisor runs a synthetic resident guest; real process
 code still executes natively, so NPT/vmmcall interception of the real process

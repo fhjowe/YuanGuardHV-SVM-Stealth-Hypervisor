@@ -22,7 +22,13 @@ Commands:
   harden-service
   unharden-service
   selftest
+  selftest-abort
   exit-test
+  protect-page <pid> <hex_va>      (206-C4: cross-process arm by pid)
+  unprotect-page <pid> <hex_va>
+  mmf-open <path>                  (map a file-backed MMF, print VA)
+  mmf-loop <path> <sec> [info]     (target: write loop on the MMF view)
+  mmf-write <path>                 (attacker: one write; BLOCKED or LANDED)
 #>
 param(
     [Parameter(Position = 0)][string]$Command = 'state',
@@ -152,6 +158,109 @@ public static class YghvPrivilege
 if (-not [YghvPrivilege]::EnableSeDebugPrivilege()) {
     throw 'Unable to enable SeDebugPrivilege. Run this script from an elevated PowerShell session.'
 }
+
+# 206-C4: file-backed MMF helper. Two processes mapping the same file section
+# share the physical pages (GC cannot move a mapped view), so the controller
+# can arm the target's mapped VA via protect-page and the attacker's write to
+# the same content hits the DENY path. MapViewOfFile returns the native base
+# VA directly (MemoryMappedFile views hide it), which protect-page needs.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public sealed class YghvMapView
+{
+    public IntPtr View;
+    public IntPtr Map;
+    public IntPtr File;
+}
+
+public static class YghvMmf
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFileW(string name, uint access,
+        uint share, IntPtr sa, uint disp, uint flags, IntPtr tmpl);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateFileMappingW(IntPtr hFile, IntPtr sa,
+        uint protect, uint sizeHigh, uint sizeLow, IntPtr name);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr MapViewOfFile(IntPtr hMap, uint access,
+        uint offHigh, uint offLow, UIntPtr bytes);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool UnmapViewOfFile(IntPtr baseAddr);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr h);
+
+    public static YghvMapView MapFile(string path, uint size)
+    {
+        IntPtr f = CreateFileW(path, 0x80000000u | 0x40000000u,
+            0x1u | 0x2u, IntPtr.Zero, 4 /* OPEN_ALWAYS */, 0, IntPtr.Zero);
+        if (f == (IntPtr)(-1))
+            throw new Exception("CreateFile failed, Win32 error " +
+                Marshal.GetLastWin32Error());
+        IntPtr m = CreateFileMappingW(f, IntPtr.Zero, 0x4 /* PAGE_READWRITE */,
+            0, size, IntPtr.Zero);
+        if (m == IntPtr.Zero)
+        {
+            CloseHandle(f);
+            throw new Exception("CreateFileMapping failed, Win32 error " +
+                Marshal.GetLastWin32Error());
+        }
+        IntPtr v = MapViewOfFile(m, 0x2u | 0x4u /* FILE_MAP_WRITE|READ */,
+            0, 0, (UIntPtr)size);
+        if (v == IntPtr.Zero)
+        {
+            CloseHandle(m);
+            CloseHandle(f);
+            throw new Exception("MapViewOfFile failed, Win32 error " +
+                Marshal.GetLastWin32Error());
+        }
+        YghvMapView r = new YghvMapView();
+        r.View = v; r.Map = m; r.File = f;
+        return r;
+    }
+
+    public static void UnmapFile(YghvMapView v)
+    {
+        if (v == null) return;
+        if (v.View != IntPtr.Zero) UnmapViewOfFile(v.View);
+        if (v.Map != IntPtr.Zero) CloseHandle(v.Map);
+        if (v.File != IntPtr.Zero) CloseHandle(v.File);
+        v.View = v.Map = v.File = IntPtr.Zero;
+    }
+
+    public static long ReadVal(IntPtr view)
+    {
+        return Marshal.ReadInt64(view);
+    }
+
+    public static void WriteVal(IntPtr view, long value)
+    {
+        Marshal.WriteInt64(view, value);
+    }
+
+    /* One machine store, then report. The DENY verdict arrives as an injected
+     * #PF (present, write, user) on this store; .NET raises it as an
+     * AccessViolationException, which is a corrupted-state exception — only
+     * catchable from a method marked HandleProcessCorruptedStateExceptions.
+     * Windows PowerShell 5.1 (.NET Framework) honours the attribute; pwsh 7
+     * fail-fasts instead, so this must run under powershell.exe. */
+    [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
+    [System.Security.SecurityCritical]
+    public static string TryWrite(IntPtr view, long value)
+    {
+        try
+        {
+            Marshal.WriteInt64(view, value);
+            return "WROTE";
+        }
+        catch (AccessViolationException)
+        {
+            return "BLOCKED";
+        }
+    }
+}
+'@
 
 $sysCommands = @('set-auto-start', 'unset-auto-start', 'harden-service', 'unharden-service')
 if ($sysCommands -contains $Command.ToLower()) {
@@ -612,6 +721,108 @@ try {
                     Stop-Process -Id $child.Id -Force -ErrorAction SilentlyContinue
                 }
                 $child.Dispose()
+            }
+        }
+        'protect-page' {
+            # 206-C4: cross-process arm. The target slot must already exist
+            # (set-target <pid>); the page VA is resolved in the TARGET's
+            # address space by the driver (KeStackAttachProcess), so the
+            # controller never needs the target's CR3 itself.
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'protect-page: usage: protect-page <pid> <hex_va>'
+            }
+            $pidVal = [uint32]::Parse($Arg1)
+            # .NET Framework Convert.ToUInt64(s,16) rejects the 0x prefix
+            $va = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]', ''), 16)
+            $buf = New-Object byte[] 16
+            [BitConverter]::GetBytes($pidVal).CopyTo($buf, 0)
+            [BitConverter]::GetBytes([uint64]$va).CopyTo($buf, 8)
+            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x810)) `
+                -InBytes $buf | Out-Null
+            Write-Host ("protect-page: pid={0} va=0x{1:X} OK" -f $pidVal, $va)
+        }
+        'unprotect-page' {
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'unprotect-page: usage: unprotect-page <pid> <hex_va>'
+            }
+            $pidVal = [uint32]::Parse($Arg1)
+            $va = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]', ''), 16)
+            $buf = New-Object byte[] 16
+            [BitConverter]::GetBytes($pidVal).CopyTo($buf, 0)
+            [BitConverter]::GetBytes([uint64]$va).CopyTo($buf, 8)
+            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x811)) `
+                -InBytes $buf | Out-Null
+            Write-Host ("unprotect-page: pid={0} va=0x{1:X} OK" -f $pidVal, $va)
+        }
+        'mmf-open' {
+            if ($null -eq $Arg1) { throw 'mmf-open: usage: mmf-open <path>' }
+            $size = [uint32]4096
+            $map = [YghvMmf]::MapFile($Arg1, $size)
+            try {
+                $probe = [long]0x59474856   # 'YGHV'
+                [YghvMmf]::WriteVal($map.View, $probe)
+                $back = [YghvMmf]::ReadVal($map.View)
+                Write-Host ("mmf-open: pid={0} va=0x{1:X} probe=0x{2:X} file={3}" -f
+                    [YghvCtlNative]::GetCurrentProcessId(),
+                    $map.View.ToInt64(), $back, $Arg1)
+            } finally {
+                [YghvMmf]::UnmapFile($map)
+            }
+        }
+        'mmf-loop' {
+            # Target side: map the section, report pid + mapped VA (the
+            # controller feeds both to set-target/protect-page), then write
+            # the slot on a cadence so the armed page exercises the full
+            # ALLOW -> reopen -> TF -> #DB -> re-arm cycle per store.
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'mmf-loop: usage: mmf-loop <path> <seconds> [info_path]'
+            }
+            $path = $Arg1
+            $secs = [int]$Arg2
+            $map = [YghvMmf]::MapFile($path, [uint32]4096)
+            $pidVal = [YghvCtlNative]::GetCurrentProcessId()
+            $line = ("mmf-loop: pid={0} va=0x{1:X}" -f $pidVal, $map.View.ToInt64())
+            Write-Host $line
+            if ($null -ne $Arg3) {
+                Set-Content -LiteralPath $Arg3 -Value $line -Encoding ASCII
+            }
+            try {
+                $deadline = (Get-Date).AddSeconds($secs)
+                $i = 0
+                while ((Get-Date) -lt $deadline) {
+                    $i++
+                    $val = [long]0x00C4C40000000000 + $i
+                    [YghvMmf]::WriteVal($map.View, $val)
+                    Write-Host ("mmf-loop: wrote i={0} val=0x{1:X}" -f $i, $val)
+                    Start-Sleep -Milliseconds 400
+                }
+            } finally {
+                [YghvMmf]::UnmapFile($map)
+            }
+            Write-Host 'mmf-loop: done'
+        }
+        'mmf-write' {
+            # Attacker side: same section, foreign CR3. One store; while the
+            # page is armed this must come back BLOCKED (DENY -> injected #PF
+            # -> AccessViolationException caught in TryWrite). After the
+            # target dies and the watchdog disarms, the same command must
+            # report LANDED.
+            if ($null -eq $Arg1) { throw 'mmf-write: usage: mmf-write <path>' }
+            $map = [YghvMmf]::MapFile($Arg1, [uint32]4096)
+            try {
+                $before = [YghvMmf]::ReadVal($map.View)
+                Write-Host ("mmf-write: pid={0} va=0x{1:X} current=0x{2:X}" -f
+                    [YghvCtlNative]::GetCurrentProcessId(),
+                    $map.View.ToInt64(), $before)
+                $r = [YghvMmf]::TryWrite($map.View, [long]0xDEADBEEF00000001)
+                if ($r -eq 'BLOCKED') {
+                    $after = [YghvMmf]::ReadVal($map.View)
+                    Write-Host ("mmf-write: BLOCKED (value still 0x{0:X})" -f $after)
+                } else {
+                    Write-Host 'mmf-write: LANDED'
+                }
+            } finally {
+                [YghvMmf]::UnmapFile($map)
             }
         }
         default {
