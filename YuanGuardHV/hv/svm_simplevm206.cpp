@@ -1441,6 +1441,15 @@ SvPrepareForVirtualization (
     // bit63 extended GPR), so one emulator serves both. Cost: +2 VMEXITs per
     // KiSwapContext. 206-A baseline stays verbatim.
     VpData->GuestVmcb.ControlArea.InterceptCrWrite |= 0x0018;
+    // 9.256: intercept #DB (InterceptException UINT16 bit 1). The VMCB's
+    // InterceptException is never initialized elsewhere (9.244 reverted the
+    // 205k block), so it stayed 0 — the ALLOW->TF->#DB->re-arm cycle was DEAD
+    // CODE: TF was set in the guest but the single-step #DB went NATIVE to
+    // KiTrap01 -> STATUS_SINGLE_STEP to the user thread -> unhandled -> WER
+    // crash (the c12/c13 fast dialog deaths; dbg ring empty proved zero #DB
+    // VMEXITs). Only bit 1 is set: Windows' benign #GP/#PF probes stay native
+    // (the 9.244 concern targets #GP, vector 13 — untouched).
+    VpData->GuestVmcb.ControlArea.InterceptException |= (1u << 1);
     // 9.250c: intercept SHUTDOWN (bit 31) — a guest triple fault then becomes
     // an observable VMEXIT (handler bugchecks with the state) instead of the
     // CPU dying silently = the instant-reset failure mode.
