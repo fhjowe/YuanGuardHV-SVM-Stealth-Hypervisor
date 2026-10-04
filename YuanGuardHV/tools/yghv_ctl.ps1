@@ -903,7 +903,7 @@ try {
                 while ($found -lt $max -and $scanned -lt 100000) {
                     $scanned++
                     $mbi = [YghvMem]::VirtualQueryEx($h, [IntPtr][Int64]$addr)
-                    $rsize = $mbi.RegionSize.ToUInt64()
+                    $rsize = [UInt64]$mbi.RegionSize.ToInt64()
                     if ($rsize -eq 0) { break }
                     $state = $mbi.State
                     $prot = $mbi.Protect
