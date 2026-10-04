@@ -46,7 +46,9 @@ int yghv_protect_on_npf_write_bare(UINT64 guest_cr3, UINT32 cpl,
 int yghv_protect_arm_page_bare(UINT64 gpa);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
-static volatile UINT64 g_S206RearmGpa = 0;
+// 9.250: the re-arm slot moved INTO the per-VCPU VMCB (ControlArea.GuestPaOfGhcb,
+// repurposed — SEV-ES only, we are not SEV). The old machine-global
+// g_S206RearmGpa raced when two cores had concurrent protected-write cycles.
 
 EXTERN_C DRIVER_INITIALIZE Sv206Entry;
 static DRIVER_UNLOAD SvDriverUnload;
@@ -860,11 +862,16 @@ SvHandleVmExit (
             int flip = 0;
             BOOLEAN writeFault =
                 (VpData->GuestVmcb.ControlArea.ExitInfo1 & 0x2ULL) != 0;
+            // 9.250: current guest CR3 = per-VCPU slot maintained by the
+            // CR3-write exit (Padding1). StateSaveArea.Cr3 is the STALE
+            // prepare-time value (VMEXIT does not save CR3) — using it made
+            // every target match fail -> DENY.
+            UINT64 curCr3 = VpData->HostStackLayout.Padding1;
 
             if (writeFault)
             {
                 int vr = yghv_protect_on_npf_write_bare(
-                    VpData->GuestVmcb.StateSaveArea.Cr3,
+                    curCr3,
                     VpData->GuestVmcb.StateSaveArea.Cpl,
                     gpa, &rearmGpa, &flip);
 
@@ -874,7 +881,8 @@ SvHandleVmExit (
                     VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
                     VpData->GuestVmcb.StateSaveArea.Rip =
                         VpData->GuestVmcb.ControlArea.NRip;
-                    g_S206RearmGpa = rearmGpa;   /* re-armed on the #DB */
+                    // per-VCPU re-arm slot (repurposed GHCB GPA field):
+                    VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = rearmGpa;
                     g_S206LastProtectHit = gpa;
                     break;
                 }
@@ -903,6 +911,23 @@ SvHandleVmExit (
             }
         }
         break;
+    case 0x0003 /* VMEXIT_CR3_WRITE (upstream hpp mislabels 0-0xF as READS) */:
+        //
+        // 9.250: intercept CR3 writes so the protection verdict knows the
+        // CURRENT guest address space. The write did not execute (intercepted):
+        // emulate it — StateSaveArea.Cr3 = new value (VMRUN loads it on resume),
+        // per-VCPU current-cr3 slot, TLB flush (we break the native CR3-write
+        // flush by intercepting; ASID-flush is the conservative equivalent),
+        // RIP = NRip. Also lets us see context switches in the future.
+        //
+        VpData->GuestVmcb.StateSaveArea.Cr3 =
+            VpData->GuestVmcb.ControlArea.ExitInfo2;
+        VpData->HostStackLayout.Padding1 =
+            VpData->GuestVmcb.ControlArea.ExitInfo2;
+        VpData->GuestVmcb.ControlArea.TlbControl = 1;
+        VpData->GuestVmcb.StateSaveArea.Rip =
+            VpData->GuestVmcb.ControlArea.NRip;
+        break;
     case VMEXIT_EXCEPTION_DB:
         //
         // 9.249: after an ALLOWed protected write, we set TF; the #DB fires on
@@ -912,9 +937,10 @@ SvHandleVmExit (
         //
         {
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
-            if (g_S206RearmGpa != 0) {
-                yghv_protect_arm_page_bare(g_S206RearmGpa);
-                g_S206RearmGpa = 0;
+            if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {
+                yghv_protect_arm_page_bare(
+                    VpData->GuestVmcb.ControlArea.GuestPaOfGhcb);
+                VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
             }
             VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */
             VpData->GuestVmcb.StateSaveArea.Rip =
@@ -1146,6 +1172,17 @@ SvPrepareForVirtualization (
     // Consistency Checks" on "VMRUN Instruction".
     //
     VpData->GuestVmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_CPUID;
+#if defined(YGHV_206B_GNPT)
+    // 9.250: intercept CR3 writes (UINT16 bit 3 of the write half at +0x002).
+    // Two reasons: (a) the protection verdict needs the CURRENT guest CR3 —
+    // VMEXIT does not save CR3 into the VMCB state area (it is stale from
+    // prepare), and the HSAVE area holds the host CR3, so interception is the
+    // only clean source; (b) the emulated write (RIP=NRip, StateSaveArea.Cr3
+    // = new value) must be paired with TlbControl=1 since intercepting
+    // removes the native CR3-write TLB flush. Cost: one VMEXIT per context
+    // switch. Only in the g_npt mode; 206-A baseline stays verbatim.
+    VpData->GuestVmcb.ControlArea.InterceptCrWrite |= 0x0008;
+#endif
     VpData->GuestVmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN;
 
     //
