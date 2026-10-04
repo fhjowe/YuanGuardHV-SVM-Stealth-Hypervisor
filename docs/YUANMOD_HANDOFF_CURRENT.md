@@ -5315,3 +5315,42 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **下一步（按用户优先级）**：实进程保护试点（把管线指向真实目标进程：
   目标选择 + 页选取走现有控制面，MMF 介质已证），或 206-C5 控制面继续加固。
 - 提交：本记录。
+
+### 9.263 2026-10-04 206-C5 实现：遥测环扩容 + DENY GVA 解码器 + 实进程试点（run_c17；镜像 58841e76，未实机验证）
+
+- **206-C5a 遥测环扩容**（no-wrap 语义保留，cap 扩为条目数）：npf 8→32 条（24→96
+  槽）、deny 8→32 组、vr 16→32 条（32→64 槽）、dbg 8→32 条（32→128 槽）；
+  npf flush 的陈旧 `%24` 取模一并去除。长跑不再静默截断前 8 条。
+- **206-C5b DENY GVA 解码器**（svm_simplevm206.cpp `S206DecodeStoreGva`）：
+  自取指（`yghv_protect_guest_va_to_pa(Padding1, rip)` + `MmGetVirtualForPhysical`
+  直接映射读，CR 写路径同款）+ **紧 store-opcode 白名单**（88/89/86/87/C6/C7/
+  80/81/83/F6/F7 + 0F B0/B1/C0/C1/AB/B3/BB/BA/A4/A5/AC/AD/11/7F/2B/E7/38/3A，
+  白名单外一律回退）+ GPR 从 PUSHAQ 影像取（VMEXIT 不存 R8–R15 进 SSA，
+  `(&R15)[15-reg]` 索引法与 CR 路径同款）。支持 SIB/RIP-rel（RIP-rel 需已知尾
+  imm 形态）/mod1/2 disp/FS/GS 段基（SSA.FsBase/GsBase）/canonical 校验；
+  rip 页尾 <0xFF0 界卫。成功 → `SSA.Cr2=真实GVA + ec=P|W|U`（标准 EPT-protector
+  形态：guest PTE 认为可写的用户写在硬件层失败 = AV；c4a 证明只有 CR2 错误才
+  自旋）；失败 → 9.261 兜底 `CR2=0 + ec P=0`（9.262 硬件实证确定性）。
+  **deny 环改 4 槽/条，第 4 槽记录 GVA（0=回退）——一次 run 同时验证解码器与
+  递送配对**；若 gate1 意外 LANDED 且 gva 非零 = P=1 配对在该 Windows 上不可靠，
+  回退开关 = CR2 恒 0（单行）。
+- **实进程试点准备（ctl 新命令，纯用户态不加 IOCTL）**：`scan-pid <pid> [count]`
+  （VirtualQueryEx 枚举目标 committed MEM_PRIVATE RW/RWX 页，跳 <0x10000）+
+  `wpm-write <pid> <hex_va> <hex_val>`（WriteProcessMemory+ReadProcessMemory
+  回读）。`YghvMem` Add-Type。README 两行同步（command_parity PS=29/Java=18）。
+- **run_c17_step206c5.ps1**（部署 206c5a）：启动真实未修改 notepad.exe →
+  scan-pid 选私有 RW 页 → set-target/protect-page/start → **gate1 = 8s soak
+  目标存活（armed 页下的误杀免疫）** → **gate2 = wpm-write 预期 WROTE**——
+  MmCopyVirtualMemory 经 KeStackAttachProcess 携带目标 CR3 且 cpl=0 → 命中
+  `is_target_cr3 || cpl==0` ALLOW 分支 → **内核中介跨进程写旁路 = 现行裁决语义
+  的产品级缺口，本轮定性实证（非缺陷回归）** → 杀目标 **gate3 = 看门狗释放**
+  → 压测 → sc stop → 遥测判读。
+- 构建：default + 206 双绿；两 ps1 Parser 零错；静态检查全过。镜像 SHA256
+  `5715f01c…`（md5 `58841e76`）归档 `D:\aaaaaavm\yuanguard_hv_step206c5a_20261004.sys`。
+  机器未加载 206；稳定版未动。
+- **run_c17 判据（206-C5 PASS）**：gate1/gate3 PASS + gate2 WROTE（旁路确认）+
+  遥测：deny 空（全程应零 DENY——notepad 未必写所选页；若写了 = vr ALLOW 自由
+  证据）、npf/vr/dbg 扩容环完整可见、post sanity 0。旁路修复方向记 C6 候选：
+  裁决细化（区分 cpl=0 attach 写 vs MPW 系统空间写）需 APC/异常派发路径合法性
+  分析，不可简单翻转。
+- 提交：本记录。
