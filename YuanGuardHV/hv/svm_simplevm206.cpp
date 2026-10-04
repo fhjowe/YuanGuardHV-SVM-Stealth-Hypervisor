@@ -47,6 +47,26 @@ int yghv_protect_arm_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
+// 9.251: DENY telemetry ring (cr3/gpa/cpl triplets, island-memory only).
+// Flushed to progress.log by the yghv DriverUnload path AFTER Sv206CoopUnload
+// (bare-metal context, file I/O safe).
+extern "C" void yghv_trace(const char *msg);
+extern "C" void yghv_trace_u64(const char *label, UINT64 v);
+static volatile UINT64 g_S206DenyLog[24] = { 0 };
+static volatile ULONG g_S206DenyIdx = 0;
+extern "C" void yghv_s206_flush_deny_log(void) {
+    if (g_S206DenyIdx == 0) {
+        yghv_trace("s206 deny-log empty");
+        return;
+    }
+    yghv_trace_u64("s206 deny count", (UINT64)g_S206DenyIdx);
+    for (ULONG q = 0; q < g_S206DenyIdx && q < 8; q++) {
+        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[(q * 3) % 24]);
+        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[(q * 3 + 1) % 24]);
+        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[(q * 3 + 2) % 24]);
+    }
+    g_S206DenyIdx = 0;
+}
 // 9.250: the re-arm slot moved INTO the per-VCPU VMCB (ControlArea.GuestPaOfGhcb,
 // repurposed — SEV-ES only, we are not SEV). The old machine-global
 // g_S206RearmGpa raced when two cores had concurrent protected-write cycles.
@@ -909,6 +929,14 @@ SvHandleVmExit (
                         (1ULL << 31) | (3ULL << 8) | (1ULL << 11) |
                         0x0EULL | (ec << 32);
                     g_S206LastProtectHit = gpa;
+                    /* 9.251: verdict-input telemetry (pure memory, island-safe;
+                     * yghv DriverUnload flushes it to progress.log after
+                     * Sv206CoopUnload brings the cores back to bare metal). */
+                    g_S206DenyLog[g_S206DenyIdx % 8] = curCr3;
+                    g_S206DenyLog[(g_S206DenyIdx + 1) % 8] = gpa;
+                    g_S206DenyLog[(g_S206DenyIdx + 2) % 8] =
+                        VpData->GuestVmcb.StateSaveArea.Cpl;
+                    g_S206DenyIdx++;
                     break;
                 }
             }

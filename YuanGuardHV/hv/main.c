@@ -4844,6 +4844,9 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
      * the vendored power callback BEFORE any yghv teardown frees the NPT the
      * host loops still translate through. */
     { extern void Sv206CoopUnload(void); Sv206CoopUnload(); }
+    /* 9.251: flush the island's DENY telemetry (bare-metal now; file I/O safe).
+     * The file handle must still be open — yghv_trace_close runs later. */
+    { extern void yghv_s206_flush_deny_log(void); yghv_s206_flush_deny_log(); }
 #endif
 #if YGHV_HOOK_RENDEZVOUS_TEST
     yghv_hook_rendezvous_join();
