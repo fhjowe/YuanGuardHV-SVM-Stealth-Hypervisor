@@ -911,22 +911,54 @@ SvHandleVmExit (
             }
         }
         break;
-    case 0x0003 /* VMEXIT_CR3_WRITE (upstream hpp mislabels 0-0xF as READS) */:
+    case VMEXIT_CR3_WRITE /* 0x0013 — APM: CR writes are 0x10+index; the frozen
+        VMCB (dump 12:09) proved ExitCode=0x13 w/ ExitInfo1 CR-index=1, so my
+        earlier `case 0x0003` never fired and every context switch hit the
+        upstream default KeBugCheck */:
         //
-        // 9.250: intercept CR3 writes so the protection verdict knows the
+        // 9.250b: intercept CR3 writes so the protection verdict knows the
         // CURRENT guest address space. The write did not execute (intercepted):
         // emulate it — StateSaveArea.Cr3 = new value (VMRUN loads it on resume),
         // per-VCPU current-cr3 slot, TLB flush (we break the native CR3-write
         // flush by intercepting; ASID-flush is the conservative equivalent),
-        // RIP = NRip. Also lets us see context switches in the future.
+        // RIP = NRip (valid for CR-access exits).
         //
-        VpData->GuestVmcb.StateSaveArea.Cr3 =
-            VpData->GuestVmcb.ControlArea.ExitInfo2;
-        VpData->HostStackLayout.Padding1 =
-            VpData->GuestVmcb.ControlArea.ExitInfo2;
-        VpData->GuestVmcb.ControlArea.TlbControl = 1;
-        VpData->GuestVmcb.StateSaveArea.Rip =
-            VpData->GuestVmcb.ControlArea.NRip;
+        // The new CR3 value is NOT in ExitInfo2 (the frozen dump shows 0):
+        // decode the source GPR from the fetched instruction
+        //   [REX] 0F 22 /r  — source = modrm.rm, extended by REX.B,
+        // and read it from the PUSHAQ'd GUEST_REGS (reg n => index 15-n).
+        //
+        {
+            UINT64 newCr3 = 0;
+            UINT8 const *ib = VpData->GuestVmcb.ControlArea.GuestInstructionBytes;
+            UINT8 n = VpData->GuestVmcb.ControlArea.NumOfBytesFetched;
+            UINT32 rex = 0, rm = 0, ok = 0;
+
+            if (n >= 3 && ib[0] == 0x0F && ib[1] == 0x22) {
+                rm = ib[2] & 7;                          /* MOV cr3, rm (no REX) */
+                ok = 1;
+            } else if (n >= 4 && (ib[0] & 0xF0) == 0x40 &&
+                       ib[1] == 0x0F && ib[2] == 0x22) {
+                rex = ib[0] & 0xF;
+                rm = (ib[3] & 7) | ((rex & 1) << 3);     /* REX.B extends rm */
+                ok = 1;
+            }
+            if (ok && rm != 4 /* RSP never holds a CR3 */) {
+                newCr3 = (&guestContext.VpRegs->R15)[15 - rm];
+            }
+            if (!ok) {
+                /* decode failed: fall back to EXITINFO1 bits[7:6]
+                   (0=RAX 1=RCX 2=RDX 3=RBX — APM register encoding) */
+                UINT32 reg = (UINT32)((VpData->GuestVmcb.ControlArea.ExitInfo1 >> 6) & 3ULL);
+                static UINT16 const regOff[4] = { 15, 14, 13, 12 }; /* Rax,Rcx,Rdx,Rbx */
+                newCr3 = (&guestContext.VpRegs->R15)[regOff[reg]];
+            }
+            VpData->GuestVmcb.StateSaveArea.Cr3 = newCr3;
+            VpData->HostStackLayout.Padding1 = newCr3;
+            VpData->GuestVmcb.ControlArea.TlbControl = 1;
+            VpData->GuestVmcb.StateSaveArea.Rip =
+                VpData->GuestVmcb.ControlArea.NRip;
+        }
         break;
     case VMEXIT_EXCEPTION_DB:
         //
