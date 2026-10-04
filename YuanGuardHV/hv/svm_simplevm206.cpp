@@ -941,8 +941,11 @@ SvHandleVmExit (
                 {
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
                     VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
-                    VpData->GuestVmcb.StateSaveArea.Rip =
-                        VpData->GuestVmcb.ControlArea.NRip;
+                    // 9.254: KEEP the saved RIP. For an NPF exit the trapped
+                    // write did NOT execute and saved RIP points AT it; the
+                    // page is reopened writable so the write re-executes on
+                    // resume. The old RIP=NRip SKIPPED the protected write
+                    // entirely (silent value loss).
                     // per-VCPU re-arm slot (repurposed GHCB GPA field):
                     VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = rearmGpa;
                     g_S206LastProtectHit = gpa;
@@ -1107,8 +1110,11 @@ SvHandleVmExit (
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
             }
             VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */
-            VpData->GuestVmcb.StateSaveArea.Rip =
-                VpData->GuestVmcb.ControlArea.NRip;
+            // 9.254: do NOT touch RIP. A TF-induced #DB is a TRAP — the saved
+            // RIP already points at the next instruction. APM: NRIP for
+            // exception VMEXITs = RIP+1 (ONE BYTE), so the old RIP=NRip
+            // resumed mid-instruction -> corrupted guest stream -> the stable
+            // AccessViolationException both selftest rounds died on.
         }
         break;
     case VMEXIT_SHUTDOWN /* 0x7f */:
