@@ -217,7 +217,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File YuanGuardHV\tools\yghv_ctl.p
 
 | 命令 | 说明 |
 |---|---|
-| `state` / `target` / `list-targets` / `list-pages` / `list-hooks` | 查询状态 |
+| `state` / `target` / `list-targets` / `list-pages` / `list-hooks` / `lasthit` | 查询状态 |
 | `set-target <pid>` | 设置目标进程 |
 | `add-page <hex_va>` / `remove-page <hex_va>` | 增/删受保护页 |
 | `start` / `stop` | 启动/停止保护 |

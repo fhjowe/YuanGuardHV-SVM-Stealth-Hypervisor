@@ -5151,3 +5151,36 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   （g_S206LastProtectHit 控制面读）。另：dbg 环每轮 3 次 #DB（期望 1 次）——多出
   2 次为 rearm 槽残留触发（arm_page_bare 对已武装页 no-op，无害），C3 顺带查。
 - 提交：本记录。
+
+### 9.258 2026-10-04 206-C3 实现：看门狗 + NONE-on-write 静默重开 + last-hit 查询 + 发布序修复（镜像 e22f6142）
+
+- **①目标退出看门狗**：`PsSetCreateProcessNotifyRoutine`（coexist 块注册，DriverUnload
+  顶部先注销）→ 进程 teardown 时 `yghv_protect_on_process_exit(pid)`（PASSIVE 回调
+  上下文、持锁）：disarm 全部武装页（复用 `disarm_page_locked`：重开 RW + 清 armed +
+  per-vcpu flush_pending）→ ObDereference → 清槽 → 刷新 cr3 list。**根治 9.255 的
+  泄漏→风暴放大器**（c12/c13 的无辜进程死循环与弹窗）。
+- **②NONE-on-write 静默重开**（vendored NPF case）：写故障 verdict=NONE 时不再注入
+  #PF——`yghv_protect_reopen_page_bare(gpa)`（无锁、active 检查、恢复 PRESENT|RW）+
+  TlbControl=1 + 保持 RIP 重执行。**杀掉风暴类本身**：guest PTE 可写时注入 #PF 必然
+  spurious-retry 死循环（c12 机制）；现在任何 stale-TLB/竞态写都自愈。TLB 传播零新增
+  机器：CR3/CR4 退出仿真每次上下文切换已带 TlbControl=1 全刷。
+- **③add-page 发布序**：先填字段后 `page_count++`（x86 存储序 = 读者安全；原代码先
+  ++ 后填 = 岛内读者可见垃圾条目窗口，IOCTL 批变更静止的根）。
+- **④last-hit 查询**：IOCTL_YGHV_GET_LASTHIT（fn 0x80F，206 门控 case——getter 在
+  仅 206 编译的 vendored TU，default 构建曾 LNK2019）+ cpp `yghv_s206_last_hit()` +
+  ps1 `lasthit` 命令 + **selftest 断言**（写回读通过后 last-hit 必须非零）。
+- **⑤dbg 环 4 元组 +DR6**（BS vs B0-B3 位判定 c14 每轮 3 次 #DB 之谜）。
+- **门禁同步实录**：0x80F 加行 → ioctl_parity FAIL（Java 侧补 FN_GET_LASTHIT）→
+  command_parity FAIL（client README 补 `yghv_ctl.ps1 lasthit`）→ selftest-abort
+  命令同理。默认构建 LNK2019 → case 加 206 门控。
+- **看门狗验证设计**：新命令 `selftest-abort`（set-target/add-page/start 后**不清理
+  直接死** = 故意复现 c12 泄漏）→ 3s 后 state 探针应显示槽已被看门狗释放
+  （pid=0/page_count=0）→ 压测churn 该物理页 → 风暴不得出现（deny 环应≈空）。
+- 构建：default + 206c2 双绿；奇偶门禁全过（IOCTL 16/16、Command PS=22/Java=18）。
+  镜像 md5 `e22f6142` 归档 `D:\aaaaaavm\yuanguard_hv_step206c3a_20261004.sys`；
+  脚本 `run_c15_step206c3a.ps1`（selftest 回归 → 看门狗测试 → lasthit 查询 →
+  压测 → sc stop）。
+- **run_c15 判据（206-C3 PASS）**：selftest 双轮 PASS（回归）+ watchdog state 探针
+  page_count=0/pid=0（槽释放）+ 压测两轮存活且 deny 环空/近空（风暴根治）+
+  sc stop 干净。全绿 → 206-C3 PASS → 206-C4（或按用户优先级进入实进程保护）。
+- 提交：本记录。
