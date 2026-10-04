@@ -4989,3 +4989,20 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   bugcheck 仅保留给真正未知的形态。
 - 构建全绿，镜像 `153b4c21...` 归档；default 回归干净；已提交。
 - 提交：本记录。
+
+### 9.250e 2026-10-04 0x20601 蓝屏判读（SHUTDOWN 拦截生效）+ 206-C2e：CR4 写一并拦截仿真
+
+- 用户跑 C2d（153b4c21）：蓝屏 `0xE2 (0x20601, 0x7F, rip=0xFFFFF80654C84DDF, 0)` =
+  **SHUTDOWN 拦截出口**（0x20601 tag）——guest 三重故障被接住、带最后 RIP，可观测化
+  第二步生效。
+- **dump 反汇编最后 RIP**：`mov cr4,rax; …; mov cr3,rax; mov cr4,rcx` = Windows
+  `KiSwapContext` 的 PCIDE 原子切换序列（`mov cr4,~PGE; mov cr3,new; mov cr4,old`）。
+  只拦 CR3 仿真 + TlbControl=1，使两条**原生 CR4 写**运行在"TLB 状态与原生次序不一致"
+  的环境中 → 末条 `mov cr4,rcx` 故障 → 三重故障。
+- **修复（206-C2e）**：CR4 写一并拦截（`InterceptCrWrite=0x0018`），统一 CRx 仿真
+  （ExitCode 0x10+idx → CR3 更新 SSA.Cr3+Padding1 / CR4 更新 SSA.Cr4；TlbControl=1
+  等价原生全刷；意外 idx → `0xE2/0x20602`）。KiSwapContext 三连写全部岛内完成，
+  无中间原生写。代价 = 每次上下文切换 +2 VMEXIT（可接受）。EXITINFO1 源 GPR 编码
+  对 CR4 相同，一套解码通用。
+- 构建全绿，镜像 `9f1e2c19...` 归档；default 回归干净；已提交。
+- 提交：本记录。
