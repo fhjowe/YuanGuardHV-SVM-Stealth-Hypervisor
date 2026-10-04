@@ -4804,3 +4804,27 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 状态：代码+文档本次提交；机器未加载 206；稳定版 `70888311` 未动；SimpleSvm/yuang203-205
   残留服务由 run_c7 启动前自动 delete。
 - 提交：本记录。
+
+### 9.245 2026-10-04 step206-A 实机 PASS：OS-as-guest 进入基座正式进入 YGHV 代码库
+
+- 用户执行 `run_c7_step206.ps1`（镜像 `90e0b924`）：**全绿，零蓝屏零冻结**——
+  `sc start 16ms → RUNNING`，**4 轮 CPUID/调度压测（每轮 100s×6 线程，共 ~7min）全部
+  `stress exited: True`，脚本自然跑完**。对比：203/204/205 全灭于 sc start 或秒级冻结。
+- **意义**：这是"YGHV 自有驱动镜像内运行 OS-as-guest 进入"的首次实机成立。9.243 的
+  排除法（手抄副本=bug 源）被正面验证：逐字 vendored 上游代码 + 4 缝合点 = C0 等价行为。
+  此前 12 次 boot 的负结果全部转化为有效定位，无一浪费。
+- **遗留确认**：本轮 206-A 用的是**上游自带 NPT**（SvBuildNestedPageTables，1TB 2MB 页
+  identity），与 yghv 的 g_npt 无关；DriverEntry 早期分派先于 yghv init，所以本轮**未**
+  验证"vendored 进入与 yghv 自身 svm_core/npt 初始化共存"。这是 206-B 的正式内容。
+- **下一步（206-B，离线做，再一次 boot 验证）**：
+  1. 早期分派改为**完整 yghv init 序列之后**（svm_core_init + npt_init 之后调用 Sv206Entry
+     等价入口），验证共存；
+  2. vendored `SvPrepareForVirtualization` 的 `NCr3` 切 `g_npt.pml4_pa`（删
+     SvBuildNestedPageTables 调用或旁路）——自此进入载体使用我方 NPT 管理器；
+  3. handler CPUID 扩展点接 yghv 后门（VMMCALL 认证/状态查询走 svm_dispatch_exit 语义）；
+  4. 卸载通道：接 `sc stop`→逐核 CPUID-unload 后门（SimpleSvm SvDevirtualizeAllProcessors
+     机制，上游本有、我们镜像里也编入了，只是 DriverUnload 在早期分派下未注册到 SCM 停止
+     路径——206-B 一并修好，摆脱"重启清除"）。
+- **状态**：机器当前仍运行在 206-A guest 之下（demand-start，重启即清）；用户可随时重启
+  清除或先留着观察；稳定版 `70888311` 未动；C:\yuanguard_hv_s206.sys 保留（重启后手动删）。
+- 提交：本记录。
