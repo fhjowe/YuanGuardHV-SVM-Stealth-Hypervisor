@@ -54,7 +54,23 @@ extern "C" void yghv_trace(const char *msg);
 extern "C" void yghv_trace_u64(const char *label, UINT64 v);
 static volatile UINT64 g_S206DenyLog[24] = { 0 };
 static volatile ULONG g_S206DenyIdx = 0;
+/* 9.252: NPF-entry telemetry (write-fault NPFs reaching the handler) */
+static volatile UINT64 g_S206NpfLog[24] = { 0 };
+static volatile ULONG g_S206NpfIdx = 0;
 extern "C" void yghv_s206_flush_deny_log(void) {
+    /* 9.252: NPF-entry records (write faults reaching the handler) — dumps
+     * even when DENY was never taken (find_page-miss path). */
+    if (g_S206NpfIdx == 0)
+        yghv_trace("s206 npf-log empty");
+    else {
+        yghv_trace_u64("s206 npf count", (UINT64)g_S206NpfIdx);
+        for (ULONG q = 0; q < g_S206NpfIdx && q < 8; q++) {
+            yghv_trace_u64("s206 npf cr3", g_S206NpfLog[(q * 3) % 24]);
+            yghv_trace_u64("s206 npf gpa", g_S206NpfLog[(q * 3 + 1) % 24]);
+            yghv_trace_u64("s206 npf cpl", g_S206NpfLog[(q * 3 + 2) % 24]);
+        }
+        g_S206NpfIdx = 0;
+    }
     if (g_S206DenyIdx == 0) {
         yghv_trace("s206 deny-log empty");
         return;
@@ -900,6 +916,19 @@ SvHandleVmExit (
             // prepare-time value (VMEXIT does not save CR3) — using it made
             // every target match fail -> DENY.
             UINT64 curCr3 = VpData->HostStackLayout.Padding1;
+
+            /* 9.252: NPF-entry telemetry — record EVERY write-fault NPF that
+             * reaches this handler (cr3/gpa/cpl), island-memory only. The AV
+             * mystery needs this: DENY telemetry was empty, so either the NPF
+             * never reached the handler (NPT TLB staleness?) or it exited
+             * through the NONE path (find_page miss). Both now leave evidence. */
+            if (writeFault && g_S206NpfIdx < 8) {
+                g_S206NpfLog[g_S206NpfIdx * 3] = curCr3;
+                g_S206NpfLog[g_S206NpfIdx * 3 + 1] = gpa;
+                g_S206NpfLog[g_S206NpfIdx * 3 + 2] =
+                    VpData->GuestVmcb.StateSaveArea.Cpl;
+                g_S206NpfIdx++;
+            }
 
             if (writeFault)
             {

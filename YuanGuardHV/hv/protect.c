@@ -373,7 +373,10 @@ static NTSTATUS yghv_protect_add_page_for_locked(yghv_protect_target_t *t,
     p->target_va = target_va;
     p->flags = YGHV_PROTECT_MEM;
     p->armed = 0;
-    LOG_ERROR("protect add_page: va=0x%llx gpa=0x%llx", target_va, gpa);
+    /* 9.252: progress.log copy (DbgPrint needs a debugger) — the NPF-entry
+       telemetry compares against this. */
+    yghv_trace_u64("s206 addpage va", target_va);
+    yghv_trace_u64("s206 addpage gpa", gpa);
     return STATUS_SUCCESS;
 }
 
