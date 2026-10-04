@@ -5184,3 +5184,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   page_count=0/pid=0（槽释放）+ 压测两轮存活且 deny 环空/近空（风暴根治）+
   sc stop 干净。全绿 → 206-C3 PASS → 206-C4（或按用户优先级进入实进程保护）。
 - 提交：本记录。
+
+### 9.259 2026-10-04 run_c15（e22f6142）：**206-C3 正式 PASS** —— 控制面加固全链闭环
+
+- **看门狗注册 rc=0x0**；selftest 回归双轮 PASS（9.257 行为不变）。
+- **看门狗验证（selftest-abort = 故意 c12 泄漏）**：pid=17004 武装页后不清理直接死
+  → **3s 后 state 探针 `active=1 pid=0 page_count=0`** + list-targets 槽全零
+  （cr3=0x0 pages=0）——脏死槽被 teardown 回调精确释放。
+- **风暴根治实证**：npf count=2（仅两轮 selftest 写各一次）、vr 全 ALLOW、
+  **deny-log empty（整个运行零 DENY，对比 c12 的 1414）**、abort 页（addlog #3
+  gpa=0xBD19000）死后零受害者 NPF。②NONE-on-write 静默重开为兜底（本轮未触发 =
+  看门狗在源头断供）。
+- **lasthit=0x359804A80** = round-2 写 gpa，与 npf/vr 环一致（0x80F 查询链通）。
+- **DR6 判读**：dbg 环 8 槽 4 元组 = 每轮恰 1 次 #DB（**c14 的"3 次/轮"是我把
+  6 槽 3 元组数成 3 条的误读，本无异常**）；DR6=0xFFFF4FF0：BS(bit14)=1、B0-B3=0
+  = 纯 TF 单步。
+- 基础设施：stress ×2 全 True、**sc stop 54ms**、post sanity 0。
+- **206-C1/C2/C3 全部关闭**：OS-as-guest 下的页写保护从"进入"到"控制面"完整可
+  用——arm→NPF→岛内裸判（ALLOW/DENY）→重武装→读回→看门狗→last-hit 查询→
+  在线卸载，全链硬件实证。
+- 提交：本记录。
