@@ -57,6 +57,14 @@ static volatile ULONG g_S206DenyIdx = 0;
 /* 9.252: NPF-entry telemetry (write-fault NPFs reaching the handler) */
 static volatile UINT64 g_S206NpfLog[24] = { 0 };
 static volatile ULONG g_S206NpfIdx = 0;
+/* 9.255: verdict ring — (gpa, vr|TF<<3) per write-NPF verdict. The deny ring
+ * only records DENYs and c11/c12 left the ALLOW aftermath invisible; this
+ * records EVERY verdict so the ALLOW/#DB window becomes observable. */
+static volatile UINT64 g_S206VrLog[32] = { 0 };
+static volatile ULONG g_S206VrIdx = 0;
+/* 9.255: #DB ring — (rip, rearmSlot, rflags) per #DB-handler hit. */
+static volatile UINT64 g_S206DbgLog[24] = { 0 };
+static volatile ULONG g_S206DbgIdx = 0;
 extern "C" void yghv_s206_flush_deny_log(void) {
     /* 9.252: NPF-entry records (write faults reaching the handler) — dumps
      * even when DENY was never taken (find_page-miss path). */
@@ -71,15 +79,38 @@ extern "C" void yghv_s206_flush_deny_log(void) {
         }
         g_S206NpfIdx = 0;
     }
+    /* 9.255: verdict records */
+    if (g_S206VrIdx == 0)
+        yghv_trace("s206 vr-log empty");
+    else {
+        yghv_trace_u64("s206 vr count", (UINT64)g_S206VrIdx);
+        for (ULONG q = 0; q * 2 < g_S206VrIdx; q++) {
+            yghv_trace_u64("s206 vr gpa", g_S206VrLog[q * 2]);
+            yghv_trace_u64("s206 vr verdict", g_S206VrLog[q * 2 + 1]);
+        }
+        g_S206VrIdx = 0;
+    }
+    /* 9.255: #DB handler hits */
+    if (g_S206DbgIdx == 0)
+        yghv_trace("s206 dbg-log empty");
+    else {
+        yghv_trace_u64("s206 dbg count", (UINT64)g_S206DbgIdx);
+        for (ULONG q = 0; q * 3 < g_S206DbgIdx; q++) {
+            yghv_trace_u64("s206 dbg rip", g_S206DbgLog[q * 3]);
+            yghv_trace_u64("s206 dbg rearm", g_S206DbgLog[q * 3 + 1]);
+            yghv_trace_u64("s206 dbg rflags", g_S206DbgLog[q * 3 + 2]);
+        }
+        g_S206DbgIdx = 0;
+    }
     if (g_S206DenyIdx == 0) {
         yghv_trace("s206 deny-log empty");
         return;
     }
     yghv_trace_u64("s206 deny count", (UINT64)g_S206DenyIdx);
-    for (ULONG q = 0; q < g_S206DenyIdx && q < 8; q++) {
-        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[(q * 3) % 24]);
-        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[(q * 3 + 1) % 24]);
-        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[(q * 3 + 2) % 24]);
+    for (ULONG q = 0; q * 3 < g_S206DenyIdx && q < 8; q++) {
+        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 3]);
+        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 3 + 1]);
+        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 3 + 2]);
     }
     g_S206DenyIdx = 0;
 }
@@ -937,6 +968,17 @@ SvHandleVmExit (
                     VpData->GuestVmcb.StateSaveArea.Cpl,
                     gpa, &rearmGpa, &flip);
 
+                /* 9.255: verdict telemetry — (gpa, vr | TF<<3). Island-safe
+                 * memory only; flushed at unload. */
+                if (g_S206VrIdx + 2 <= 32) {
+                    g_S206VrLog[g_S206VrIdx] = gpa;
+                    g_S206VrLog[g_S206VrIdx + 1] =
+                        (UINT64)vr |
+                        ((VpData->GuestVmcb.StateSaveArea.Rflags &
+                          0x100ULL) << 3);
+                    g_S206VrIdx += 2;
+                }
+
                 if (vr == 1 /* YGHV_NPF_ALLOW */)
                 {
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
@@ -963,12 +1005,15 @@ SvHandleVmExit (
                     g_S206LastProtectHit = gpa;
                     /* 9.251: verdict-input telemetry (pure memory, island-safe;
                      * yghv DriverUnload flushes it to progress.log after
-                     * Sv206CoopUnload brings the cores back to bare metal). */
-                    g_S206DenyLog[g_S206DenyIdx % 8] = curCr3;
-                    g_S206DenyLog[(g_S206DenyIdx + 1) % 8] = gpa;
-                    g_S206DenyLog[(g_S206DenyIdx + 2) % 8] =
-                        VpData->GuestVmcb.StateSaveArea.Cpl;
-                    g_S206DenyIdx++;
+                     * Sv206CoopUnload brings the cores back to bare metal).
+                     * 9.255: fixed %8-stride smear — 3-slot no-wrap records. */
+                    if (g_S206DenyIdx + 3 <= 24) {
+                        g_S206DenyLog[g_S206DenyIdx] = curCr3;
+                        g_S206DenyLog[g_S206DenyIdx + 1] = gpa;
+                        g_S206DenyLog[g_S206DenyIdx + 2] =
+                            VpData->GuestVmcb.StateSaveArea.Cpl;
+                        g_S206DenyIdx += 3;
+                    }
                     break;
                 }
             }
@@ -1103,6 +1148,18 @@ SvHandleVmExit (
         // Lock-free: same bare discipline as the NPF path.
         //
         {
+            /* 9.255: #DB telemetry — (rip, rearmSlot, rflags) BEFORE anything
+             * consumes the slot; proves whether the ALLOW aftermath reached
+             * here and with which RIP/TF state. */
+            if (g_S206DbgIdx + 3 <= 24) {
+                g_S206DbgLog[g_S206DbgIdx] =
+                    VpData->GuestVmcb.StateSaveArea.Rip;
+                g_S206DbgLog[g_S206DbgIdx + 1] =
+                    VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
+                g_S206DbgLog[g_S206DbgIdx + 2] =
+                    VpData->GuestVmcb.StateSaveArea.Rflags;
+                g_S206DbgIdx += 3;
+            }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
             if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {
                 yghv_protect_arm_page_bare(
