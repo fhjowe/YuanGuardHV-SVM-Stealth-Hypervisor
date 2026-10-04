@@ -924,10 +924,10 @@ SvHandleVmExit (
             }
         }
         break;
-    case VMEXIT_CR3_WRITE /* 0x0013 — APM: CR writes are 0x10+index; the frozen
-        VMCB (dump 12:09) proved ExitCode=0x13 w/ ExitInfo1 CR-index=1, so my
-        earlier `case 0x0003` never fired and every context switch hit the
-        upstream default KeBugCheck */:
+    case VMEXIT_CR3_WRITE /* 0x0013 — APM: CR writes are 0x10+index */:
+    case VMEXIT_CR4_WRITE /* 0x0014 — intercepted alongside CR3 (see prepare):
+                              KiSwapContext's mov cr4/cr3/cr4 PCIDE dance must
+                              run entirely in-emulation */:
         //
         // 9.250b: intercept CR3 writes so the protection verdict knows the
         // CURRENT guest address space. The write did not execute (intercepted):
@@ -947,7 +947,11 @@ SvHandleVmExit (
         // garbage CR3 (that triple-faults instantly, the 12:34 failure mode).
         //
         {
-            UINT64 newCr3 = 0;
+            /* Which control register is being written: ExitCode 0x10+idx.
+               (APM: CR-write exits are 0x10+CR-index; ExitInfo1's
+               "general1" bits 3:0 echo the CR index too.) */
+            UINT32 crIdx = (UINT32)(VpData->GuestVmcb.ControlArea.ExitCode & 0xF);
+            UINT64 newCr = 0;
             UINT32 rex = 0, rm = 0, ok = 0;
             UINT64 rip = VpData->GuestVmcb.StateSaveArea.Rip;
             UINT64 curCr3 = VpData->HostStackLayout.Padding1;
@@ -986,7 +990,7 @@ SvHandleVmExit (
             }
             if (ok && rm == 4) ok = 0;      /* RSP never sources a CR3 write */
             if (ok) {
-                newCr3 = (&guestContext.VpRegs->R15)[15 - rm];
+                newCr = (&guestContext.VpRegs->R15)[15 - rm];
             }
             if (!ok) {
                 /* PRIMARY path (13:28 crash fix): EXITINFO1 bits[7:6] ALWAYS
@@ -1002,15 +1006,30 @@ SvHandleVmExit (
                 if (e1 & 0x8000000000000000ULL) {
                     /* extended register: bits[9:8] give R8..R15 */
                     gpr = 8 + (UINT32)((e1 >> 8) & 3ULL);
-                    newCr3 = (&guestContext.VpRegs->R15)[15 - gpr];
+                    newCr = (&guestContext.VpRegs->R15)[15 - gpr];
                 } else {
                     /* gpr: 0=RAX 1=RCX 2=RDX 3=RBX (RSP/RBP are illegal here) */
                     static UINT8 const regIdx[4] = { 15, 14, 13, 12 };
-                    newCr3 = (&guestContext.VpRegs->R15)[regIdx[gpr]];
+                    newCr = (&guestContext.VpRegs->R15)[regIdx[gpr]];
                 }
             }
-            VpData->GuestVmcb.StateSaveArea.Cr3 = newCr3;
-            VpData->HostStackLayout.Padding1 = newCr3;
+            if (crIdx == 3) {
+                /* CR3 write: update VMCB state (VMRUN loads it) + the
+                   protection-verdict's current-CR3 slot */
+                VpData->GuestVmcb.StateSaveArea.Cr3 = newCr;
+                VpData->HostStackLayout.Padding1 = newCr;
+            } else if (crIdx == 4) {
+                /* CR4 write: update VMCB state (VMRUN loads it). Native TLB
+                   flush semantics are replaced by TlbControl=1 below. */
+                VpData->GuestVmcb.StateSaveArea.Cr4 = newCr;
+            } else {
+                /* unexpected CR index (we only intercept 3 and 4) */
+                S206RecordFatal(VpData->GuestVmcb.ControlArea.ExitCode,
+                                rip, newCr);
+                KeBugCheckEx(0xE2, 0x20602,
+                             VpData->GuestVmcb.ControlArea.ExitCode,
+                             rip, newCr);
+            }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
             VpData->GuestVmcb.StateSaveArea.Rip =
                 VpData->GuestVmcb.ControlArea.NRip;
@@ -1287,7 +1306,21 @@ SvPrepareForVirtualization (
     // = new value) must be paired with TlbControl=1 since intercepting
     // removes the native CR3-write TLB flush. Cost: one VMEXIT per context
     // switch. Only in the g_npt mode; 206-A baseline stays verbatim.
-    VpData->GuestVmcb.ControlArea.InterceptCrWrite |= 0x0008;
+    // 9.250: intercept CR3 AND CR4 writes (UINT16 write half at +0x002:
+    // bit3 = CR3, bit4 = CR4). 9.250e (13:43 SHUTDOWN bugcheck): Windows'
+    // KiSwapContext does  mov cr4,~PGE; mov cr3,new; mov cr4,old  — an
+    // atomicity trick around PCIDE. Intercepting ONLY the CR3 write and
+    // emulating it with TlbControl=1 left the surrounding native CR4 writes
+    // running with a TLB state the native sequence doesn't expect -> the
+    // final mov cr4,rcx faulted -> triple fault -> SHUTDOWN (our 0xE2/0x20601).
+    // Intercepting BOTH CR3 and CR4 writes moves the whole sequence into the
+    // island: each write is emulated + TlbControl=1, which is the exact
+    // semantics a native write would have (full flush), and no intermediate
+    // native CR4 write executes with a half-updated PCID/TLB state.
+    // ExitInfo1 encoding is the same for all CR writes (bits[7:6] source GPR,
+    // bit63 extended GPR), so one emulator serves both. Cost: +2 VMEXITs per
+    // KiSwapContext. 206-A baseline stays verbatim.
+    VpData->GuestVmcb.ControlArea.InterceptCrWrite |= 0x0018;
     // 9.250c: intercept SHUTDOWN (bit 31) — a guest triple fault then becomes
     // an observable VMEXIT (handler bugchecks with the state) instead of the
     // CPU dying silently = the instant-reset failure mode.
