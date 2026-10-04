@@ -5043,3 +5043,35 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   落盘后一并可见）；等 = NONE 分支逻辑，不等 = 页迁移/CR3 错，npf 环空 = NPF 未到
   handler。
 - 提交：本记录。
+
+### 9.254 2026-10-04 run_c11（127073fb）全绿判读：遥测环闭环 + AV 根因双 bug（ALLOW 跳写 / #DB 字节跳）
+
+- **9.253 验证通过**：run_c11（镜像 127073fb）全程无卡死——selftest 跑到写入点、
+  AV 立即出现（两轮一致）、2×65s 压测存活、**sc stop 51ms 干净卸载**、post-unload
+  sanity exit=0。addlog 环随卸载正确落盘（岛内 ring 方案成立）。
+- **遥测环闭环判读（决策规则兑现）**：
+  - npf 环 3 条 vs addlog 环 2 页：#1 `gpa=28F2CFFA8 cpl=3` ∈ 页A `28F2CF000`；
+    #2 `gpa=230013360 cpl=3` ∈ 页B `230013000` —— **测试写全部精确到达 handler，
+    gpa 零漂移**（页迁移/CR3 链嫌疑排除）。
+  - #3 `gpa=28F2CF000 cpl=0 cr3=1AD000` = 内核脏页回写线程写用户页 → 未蓝屏 →
+    **cpl==0→ALLOW 分支 + find_page/armed 全部工作正常**。
+  - deny 环空 + 无内核 #PF 误注入 → #1/#2 verdict = **ALLOW**（唯一与全部证据一致的
+    分支）；cr3 匹配（PCID 掩码修复）也间接得证。
+- **AV 根因（两个，同修）**：vendored handler 的 RIP 处理错误——
+  1. **ALLOW 路径 `Rip=NRip` 跳过被保护写**：NPF 退出时写指令**未执行**且保存 RIP
+     指向它；NRip=RIP+指令长度 → 恢复后写被整个跳过，保护值永不落内存（静默丢失）。
+     修复：**保持 saved RIP**——页已重开可写，写指令重新执行，TF 在写完成后触发
+     #DB 重武装（auto_disarm 语义完整闭环）。
+  2. **#DB 路径 `Rip=NRip` 字节跳 = AV 直接原因**：TF 单步 #DB 是 trap，saved RIP
+     已指向下一条指令；APM 异常退出 NRIP=RIP+**1 字节** → `Rip=NRip` 落到指令中间
+     → guest 执行损坏指令流 → 两轮 selftest 稳定复现的
+     AccessViolationException（AV 栈 = 动态调用点 stub = 字节跳落点，全部吻合）。
+     修复：**#DB 路径完全不碰 RIP**（只重武装 + 清 TF）。
+- 构建：default + STEP=206/COEXIST/GNPT 双绿。镜像 SHA256 `f6c6ad26…`（md5
+  `bee02158`）归档 `D:\aaaaaavm\yuanguard_hv_step206c2c_20261004.sys`；脚本
+  `run_c12_step206c2c.ps1`。
+- **run_c12 预期（206-C2 PASS 判据）**：selftest 双轮全绿（写入值落内存 + 读回校验
+  通过 + ALLOW→#DB 重武装闭环）、deny 环仍空或仅含预期 DENY、npf/addlog 环 gpa
+  继续对齐、压测 + sc stop 干净。全绿 → **206-C2 正式 PASS** → 206-C3（控制面加固：
+  IOCTL 批变更多样静止、last-hit 查询、目标退出看门狗）。
+- 提交：本记录。
