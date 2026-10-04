@@ -5126,3 +5126,28 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   rflags TF 位=1）→ 重武装 → 读回一致 → stop/remove 全链）；vr 环继续
   ALLOW；victim 风暴仍在（C3 看门狗根治）。全绿 = **206-C2 PASS**。
 - 提交：本记录。
+
+### 9.257 2026-10-04 run_c14（552dd681）：**206-C2 正式 PASS** —— 页写保护在 OS-as-guest 下端到端闭环
+
+- **selftest 双轮全绿**：`user write/read OK (page armed in NPT)` + `selftest: PASS`
+  ×2（round 2 = 换新页新进程的**重武装性**验证）；`selftest overall: PASS`。无 AV、
+  无弹窗、无蓝屏。
+- **state probe：`active=0 pid=15480 page_count=0`** = round 1 走完完整
+  stop(0x804)+remove(0x802) 流程——**页零泄漏 → 本轮 DENY 风暴未出现**（风暴纯粹
+  是泄漏页的后果，9.255 判读的反证闭环）。
+- **遥测环终判**：npf count=2（每轮恰 1 次写 NPF，无循环）；vr count=4 = 2 对
+  verdict 全 = ALLOW；**dbg count=6（每轮 3 次 #DB）——rearm gpa 精确对应各轮页面
+  （0x1F3B78000 / 0x10EE28000），rflags=0x346 = TF 位(0x100)置位** —— TF 单步
+  →#DB 拦截→重武装机制首次在硬件完整工作。
+- 基础设施：stress ×2 存活（round1 exited:False 仍为 65s 采样竞态，进程本身正常
+  退出）、**sc stop 55ms 在线卸载**、post-unload sanity exit=0。
+- **管线全景（全部 OS-as-guest 下硬件实证）**：arm（split+PRESENT-only）→ 用户写
+  → NPF → 岛内裸判（ALLOW: 重开+TF+写重执行+#DB 拦截+重武装 / DENY: #PF 注入）
+  → 读回一致 → stop/remove 干净 → 在线卸载。**"页写保护下沉到虚拟化层"的核心
+  科学问题（206-C2）正式关闭。**
+- **下一步 206-C3（控制面加固）**：①目标退出看门狗——目标进程死亡时 disarm+remove
+  其武装页（本 PASS 依赖 selftest 自觉清理；真实崩溃/被杀场景 = 9.255 的泄漏→
+  风暴机制）；②IOCTL 批变更静止（锁自由岛读 vs 多字更新）；③last-hit 查询
+  （g_S206LastProtectHit 控制面读）。另：dbg 环每轮 3 次 #DB（期望 1 次）——多出
+  2 次为 rearm 槽残留触发（arm_page_bare 对已武装页 no-op，无害），C3 顺带查。
+- 提交：本记录。
