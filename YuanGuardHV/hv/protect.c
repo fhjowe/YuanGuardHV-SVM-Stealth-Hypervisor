@@ -354,6 +354,30 @@ NTSTATUS yghv_protect_add_page_for(uint64_t cr3, uint64_t target_va) {
     return st;
 }
 
+#if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
+/* 9.253: island-safe armed-page ring. The 9.252 progress.log traces ran under
+ * ExAcquireFastMutex (APC_LEVEL) while all cores were virtualized; the run_c10
+ * wedge was exactly such a synchronous ZwWriteFile that never completed (the
+ * selftest thread sat 40min between the two adjacent trace calls). Runtime
+ * file I/O from this driver is banned — record to memory here, flush in
+ * DriverUnload after Sv206CoopUnload brings the cores back to bare metal. */
+static uint64_t g_s206_addlog[16];
+static uint32_t g_s206_addidx;
+static void yghv_s206_addlog_record(uint64_t va, uint64_t gpa) {
+    if (g_s206_addidx + 2 <= 16) {
+        g_s206_addlog[g_s206_addidx++] = va;
+        g_s206_addlog[g_s206_addidx++] = gpa;
+    }
+}
+void yghv_s206_flush_addlog(void) {
+    uint32_t i;
+    for (i = 0; i + 1 < g_s206_addidx; i += 2) {
+        yghv_trace_u64("s206 addlog va", g_s206_addlog[i]);
+        yghv_trace_u64("s206 addlog gpa", g_s206_addlog[i + 1]);
+    }
+}
+#endif
+
 static NTSTATUS yghv_protect_add_page_for_locked(yghv_protect_target_t *t,
     uint64_t target_va) {
     uint64_t gpa;
@@ -374,11 +398,9 @@ static NTSTATUS yghv_protect_add_page_for_locked(yghv_protect_target_t *t,
     p->flags = YGHV_PROTECT_MEM;
     p->armed = 0;
 #if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
-    /* 9.252 (206-gated; keep default build clean): progress.log copy of the
-       armed page identity (DbgPrint needs a debugger) — the vendored NPF-entry
-       telemetry compares against this. */
-    yghv_trace_u64("s206 addpage va", target_va);
-    yghv_trace_u64("s206 addpage gpa", gpa);
+    /* 9.253: island ring only (was 9.252 progress.log traces — file I/O under
+       FastMutex during live virtualization wedged run_c10 for 40min). */
+    yghv_s206_addlog_record(target_va, gpa);
 #endif
     return STATUS_SUCCESS;
 }

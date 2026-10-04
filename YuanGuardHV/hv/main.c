@@ -4847,6 +4847,9 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
     /* 9.251: flush the island's DENY telemetry (bare-metal now; file I/O safe).
      * The file handle must still be open — yghv_trace_close runs later. */
     { extern void yghv_s206_flush_deny_log(void); yghv_s206_flush_deny_log(); }
+    /* 9.253: flush the armed-page ring (same bare-metal-now contract; the
+     * runtime add-page path must not touch the file system, see run_c10). */
+    { extern void yghv_s206_flush_addlog(void); yghv_s206_flush_addlog(); }
 #endif
 #if YGHV_HOOK_RENDEZVOUS_TEST
     yghv_hook_rendezvous_join();
