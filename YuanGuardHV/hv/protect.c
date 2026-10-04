@@ -690,6 +690,23 @@ static NTSTATUS yghv_protect_stop_locked(void) {
 /* TlbControl=1 (flush-all on next VMRUN) when a flip happened — no      */
 /* INVLPGA needed since we do not tag per-ASID in the vendored VMCB.     */
 /* ------------------------------------------------------------------ */
+/* 9.269: island-safe control probe for the DENY GVA decoder's walk
+ * diagnostics — walks the first armed target's (cr3, va) pair, whose gpa the
+ * control plane already knows. Lock-free read of the same tables the NPF
+ * verdict scans; pure arithmetic; no telemetry. 0 = no armed target. */
+uint64_t yghv_protect_control_walk_gpa(void) {
+    uint32_t t;
+    for (t = 0; t < g_protect.target_count; t++) {
+        if (g_protect.targets[t].cr3 != 0 &&
+            g_protect.targets[t].page_count > 0) {
+            return yghv_protect_guest_va_to_pa(
+                g_protect.targets[t].cr3,
+                g_protect.targets[t].pages[0].target_va);
+        }
+    }
+    return 0;
+}
+
 yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,
                                                  uint32_t cpl,
                                                  uint64_t gpa,

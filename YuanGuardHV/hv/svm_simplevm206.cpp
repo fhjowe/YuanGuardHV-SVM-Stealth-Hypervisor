@@ -46,6 +46,7 @@ int yghv_protect_on_npf_write_bare(UINT64 guest_cr3, UINT32 cpl,
 int yghv_protect_arm_page_bare(UINT64 gpa);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
+UINT64 yghv_protect_control_walk_gpa(void);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
 /* 9.258 (206-C3): control-plane read of the last protection verdict hit. */
@@ -900,9 +901,13 @@ static UINT32 S206DecodeStoreGva(
         PHYSICAL_ADDRESS pa;
         PVOID va;
         if (!gpa) {
-            /* 9.267: walk failed — classify WHICH level and capture the raw
-             * failing entry (9.250c's self-fetch missed the same way and was
-             * never root-caused; EXITINFO1 masked it). */
+            /* 9.269: walk failed — classify level (11-14), then run the
+             * CONTROL walk: the target's own (cr3, va) pair whose gpa we
+             * already know. Control matches the known gpa => the walk
+             * machinery and the direct map are fine and curCr3 (Padding1)
+             * is the wrong address space (CR3-write emulation drift);
+             * control fails => the machinery itself is broken. aux carries
+             * the control-walk gpa (0 = control walk failed too). */
             UINT64 *auxOut = aux;
             static const UINT64 PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
             UINT64 pml4e, pdpte, pde, pte;
@@ -949,15 +954,15 @@ static UINT32 S206DecodeStoreGva(
                     }
                 }
             }
-            /* entry says present but the shared helper returned 0 — fall
-             * through and let the direct-map fetch try anyway (the helper's
-             * arithmetic may be subtly off; the fetch itself is the truth). */
+            /* entry says present but the shared helper returned 0 — run the
+             * CONTROL walk against the target's known-good (cr3, va) pair;
+             * its result decides machinery-vs-state. */
             {
+                UINT64 ctrl = yghv_protect_control_walk_gpa();
+                if (auxOut) *auxOut = ctrl;   /* == known gpa => curCr3 wrong */
                 UINT64 pte2 = yghv_protect_guest_va_to_pa(curCr3, rip);
-                if (!pte2) {
-                    if (auxOut) *auxOut = pte;
-                    return 3;      /* keep DG_WALK_FAIL with aux evidence */
-                }
+                if (!pte2)
+                    return 3;      /* DG_WALK_FAIL with control evidence */
                 pa.QuadPart = (LONGLONG)pte2;
             }
             va = MmGetVirtualForPhysical(pa);
