@@ -82,9 +82,15 @@ static FAST_MUTEX g_protect_lock;
 
 static BOOLEAN yghv_protect_is_target_cr3_locked(uint64_t cr3) {
     uint32_t i;
+    /* 9.249 (run_c10 evidence): with CR4.PCIDE=1 the CR3 in the VMCB carries
+     * the PCID in bits 11:0 (and possibly bit 63 no-flush), while targets[]
+     * stores KPROCESS.DirectoryTableBase = PFN only. A raw == compare always
+     * fails -> every protected write was DENY'd. Compare PFN bits only
+     * (51:12); PCID/no-flush must not affect target matching. */
+    uint64_t cr3_pfn = cr3 & YGHV_PT_ADDR_MASK;
     for (i = 0; i < g_protect.target_count; i++) {
         if (g_protect.targets[i].cr3 != 0 &&
-            g_protect.targets[i].cr3 == cr3)
+            (g_protect.targets[i].cr3 & YGHV_PT_ADDR_MASK) == cr3_pfn)
             return TRUE;
     }
     return FALSE;
@@ -105,9 +111,10 @@ static yghv_protect_page_t *yghv_protect_find_page_locked(uint64_t gpa) {
 static yghv_protect_target_t *yghv_protect_find_target_by_cr3_locked(
     uint64_t cr3) {
     uint32_t i;
+    uint64_t cr3_pfn = cr3 & YGHV_PT_ADDR_MASK;   /* 9.249: PCID-immune */
     for (i = 0; i < g_protect.target_count; i++) {
         if (g_protect.targets[i].cr3 != 0 &&
-            g_protect.targets[i].cr3 == cr3)
+            (g_protect.targets[i].cr3 & YGHV_PT_ADDR_MASK) == cr3_pfn)
             return &g_protect.targets[i];
     }
     return NULL;
