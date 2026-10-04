@@ -149,20 +149,66 @@ static NTSTATUS yghv_protect_stop_locked(void);
 static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_va);
 static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id);
 
-/* 9.271: PA->VA via the arithmetic direct map (0xFFFF800000000000 + PA).
- * MmGetVirtualForPhysical is EMPIRICALLY UNRELIABLE on this build: it
- * consults per-page state and returns NULL for valid in-use RAM pages
- * (run 206c5f: NULL for the target's live PML4 page while succeeding on
- * other pages). The kernel direct map is global (G-bit PML4Es) and linear,
- * so arithmetic translation is deterministic and island-safe. */
+/* 9.272: PA->VA via an arithmetic direct map whose BASE IS DERIVED AT BOOT
+ * from MmGetVirtualForPhysical (run 206c5f proved the helper is selective —
+ * NULL for some in-use RAM pages — but correct where it answers; and 206c5g
+ * proved the textbook base 0xFFFF800000000000 is NOT readable for all RAM on
+ * this box: bugcheck 0xD1 faulting at 0xFFFF8000001ADF80). Deriving the base
+ * keeps the deterministic arithmetic channel while inheriting whatever real
+ * layout Windows uses. Fail-safe: base 0 (derivation failed) or PA at/above
+ * the captured RAM ceiling => NULL; every caller checks. */
+static uint64_t g_pa_va_base;
+static uint64_t g_pa_ceiling;
+
 PVOID yghv_pa_to_va(uint64_t pa) {
-    return (PVOID)(0xFFFF800000000000ULL + pa);
+    if (g_pa_va_base == 0 || pa >= g_pa_ceiling)
+        return NULL;
+    return (PVOID)(g_pa_va_base + pa);
+}
+
+static void yghv_pa_to_va_init(void) {
+    /* sample the helper on this driver's own pages: ground truth VA from
+     * MmGetVirtualForPhysical, cross-checked byte-for-byte. */
+    static volatile uint64_t probe[2] = { 0x1122334455667788ULL,
+                                          0x8877665544332211ULL };
+    PHYSICAL_ADDRESS pa;
+    PVOID hv;
+    g_pa_va_base = 0;
+    g_pa_ceiling = 0;
+    {
+        /* RAM ceiling from the physical memory ranges (PASSIVE, boot time) */
+        PPHYSICAL_MEMORY_RANGE r = MmGetPhysicalMemoryRanges();
+        if (r) {
+            int i;
+            for (i = 0; i < 64; i++) {
+                if (r[i].BaseAddress.QuadPart == 0 &&
+                    r[i].NumberOfBytes.QuadPart == 0)
+                    break;
+                {
+                    uint64_t end = (uint64_t)r[i].BaseAddress.QuadPart +
+                                   (uint64_t)r[i].NumberOfBytes.QuadPart;
+                    if (end > g_pa_ceiling)
+                        g_pa_ceiling = end;
+                }
+            }
+            ExFreePool(r);
+        }
+        if (g_pa_ceiling == 0)
+            return;
+    }
+    pa.QuadPart = (LONGLONG)MmGetPhysicalAddress((PVOID)probe).QuadPart;
+    hv = MmGetVirtualForPhysical(pa);
+    if (!hv)
+        return;
+    if (RtlCompareMemory(hv, (PVOID)probe, 16) == 16)
+        g_pa_va_base = (uint64_t)hv - (uint64_t)pa.QuadPart;
 }
 
 static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
     uint64_t *va;
     if (!table_pa) return 0;
     va = (uint64_t *)yghv_pa_to_va(table_pa);
+    if (!va) return 0;
     return va[index];
 }
 
@@ -219,6 +265,7 @@ static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
 }
 
 NTSTATUS yghv_protect_init(void) {
+    yghv_pa_to_va_init();
     ExInitializeFastMutex(&g_protect_lock);
     RtlZeroMemory(&g_protect, sizeof(g_protect));
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
@@ -732,6 +779,8 @@ void yghv_protect_control_walk_diag(uint64_t out[5]) {
         uint64_t *v1;
         v1 = (uint64_t *)yghv_pa_to_va(cr3 & M);
         out[1] = (uint64_t)v1;
+        if (!v1)
+            return;
         {
             uint64_t pml4e = v1[(va >> 39) & 0x1FF];
             uint64_t *v2;
@@ -742,6 +791,8 @@ void yghv_protect_control_walk_diag(uint64_t out[5]) {
             }
             v2 = (uint64_t *)yghv_pa_to_va(pml4e & M);
             out[3] = (uint64_t)v2;
+            if (!v2)
+                return;
             out[4] = v2[(va >> 30) & 0x1FF];
         }
         out[0] = yghv_protect_guest_va_to_pa(cr3, va);

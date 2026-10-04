@@ -954,10 +954,14 @@ static UINT32 S206DecodeStoreGva(
                     return 3;      /* DG_WALK_FAIL; ctl[] = control evidence */
                 va = yghv_pa_to_va(pte2);
             }
+            if (!va)
+                return 4;          /* DG_NO_DIRECTMAP */
             for (i = 0; i < 15; i++)
                 ib[i] = ((volatile UINT8 *)va)[i];
         } else {
             va = yghv_pa_to_va(gpa);
+            if (!va)
+                return 4;          /* DG_NO_DIRECTMAP */
             for (i = 0; i < 15; i++)
                 ib[i] = ((volatile UINT8 *)va)[i];
         }
@@ -1389,17 +1393,13 @@ SvHandleVmExit (
                 for (UINT8 q = 0; q < 8 && q < n; q++)
                     ib[q] = VpData->GuestVmcb.ControlArea.GuestInstructionBytes[q];
                 inst = ib;
-            } else if (curCr3 != 0) {
-                UINT64 gpa = yghv_protect_guest_va_to_pa(curCr3, rip);
-                if (gpa) {
-                    PVOID va = yghv_pa_to_va(gpa);
-                    if (va) {
-                        for (UINT8 q = 0; q < 8; q++)
-                            ib[q] = ((volatile UINT8 *)va)[q];
-                        inst = ib;
-                    }
-                }
             }
+            /* 9.272: the CR-path self-fetch is DELETED. It ran on EVERY
+             * CR3-write exit (every context switch) and its PT walk was the
+             * 0xD1 crash surface once the fail-safe NULL channel was fixed —
+             * a garbage/stale Padding1 CR3 walked into unmapped direct-map
+             * VAs with GIF=0. EXITINFO1 bits[7:6] is the hardware-primary
+             * answer (9.250d) and needs no memory reads. */
 
             if (inst && inst[0] == 0x0F && inst[1] == 0x22) {
                 rm = inst[2] & 7;                        /* MOV cr3, rm */
