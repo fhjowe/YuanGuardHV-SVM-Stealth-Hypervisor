@@ -5354,3 +5354,32 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   裁决细化（区分 cpl=0 attach 写 vs MPW 系统空间写）需 APC/异常派发路径合法性
   分析，不可简单翻转。
 - 提交：本记录。
+
+### 9.264 2026-10-04 run_c17（206c5a/58841e76）：**206-C5 实进程试点 PASS** —— 真实进程保护 + WPM 旁路环形实证
+
+- **三 gate 全 PASS**：gate1 = 真实未修改 notepad.exe（pid=1856）带 armed 堆页
+  （va=0x7320000 → gpa=0x28D8FF000）存活 8s+（误杀免疫）；gate2 = wpm-write
+  `WROTE 8 bytes` + readback=0x5150C4C400000001（写真实落地）；gate3 = 杀目标后
+  看门狗释放槽。压测存活、**sc stop 48ms**、post sanity 0、全程零蓝屏。
+  （前置连修：9.263b VirtualQueryEx 签名 bool、9.263c wrapper bool 接收、
+  9.263d UInt64→IntPtr 需经 Int64、9.263e IntPtr 无 ToUInt64 用 ToInt64。）
+- **WPM 旁路的环形证据（本轮核心产出）**：npf 环 2 条 **cpl=0、
+  cr3=0x1664DD000 = 控制器（攻击者）进程的 CR3 而非目标**、gpa=武装页——
+  MmCopyVirtualMemory 拷贝循环的 2 次内核写全部 NPF 后走 `cpl==0 → ALLOW`
+  （vr 2 条全 ALLOW，1:1 对应）。**跨进程写 = "攻击者 CR3 + cpl 0"，现行裁决
+  无法区分它与内核合法写——旁路定性实证完成**。dbg 恰 2 条 = 2 次 ALLOW 各
+  1 次 #DB：**#DB 在内核上下文触发**（rip=0xfffff805…内核地址，rflags=0x40383
+  TF 置位，DR6=0xFFFF4FF0 纯 TF）——ALLOW→写重执行→#DB→重武装在内核态完整
+  闭环零副作用；TF 窗口暴露 1 条内核指令为已知可接受残留（记录在案）。
+- deny 环空 = 全程零 DENY 零风暴；notepad 未写所选页（ ALLOW 路径零 cpl=3
+  证据留待真实写场景）。addlog va/gpa 对齐；lasthit 链通。
+- **GVA 解码器验证状态**：本轮零 DENY，`s206 deny gva` 未获得样本——解码器+
+  递送配对的实战验证由下一次带 MMF 攻击者的运行（run_c16 重跑）完成：预期
+  gate1 BLOCKED 且 `s206 deny gva` = 攻击者映射的真实 VA（非 0）。
+- **206-C5 关闭**。C6 候选（按优先级）：①内核中介写裁决细化——区分
+  attach-CR3 的 cpl=0 写（WriteProcessMemory 类）与 MPW 系统空间写（系统 CR3）：
+  同为 cpl=0，前者 CR3=目标可加白名单外判据（调用栈/来源进程不可岛内获得，
+  需要新机制——候选：cpl=0 且 CR3==某 target CR3 且非系统 CR3 → 视为 attach
+  写 → DENY；需先证 APC/异常派发不会以目标 CR3 写用户内存）；②真实产品场景
+  （Minecraft/Forge）页选取与目标选择流程化。
+- 提交：本记录。
