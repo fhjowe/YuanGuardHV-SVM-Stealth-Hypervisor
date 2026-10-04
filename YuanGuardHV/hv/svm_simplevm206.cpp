@@ -906,17 +906,27 @@ static UINT32 S206DecodeStoreGva(
             UINT64 *auxOut = aux;
             static const UINT64 PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
             UINT64 pml4e, pdpte, pde, pte;
+            {
+                /* decisive probe: the PML4 page is mapped RAM by definition;
+                 * if the PA->VA helper returns NULL for it, MmGetVirtualFor
+                 * Physical itself is the broken link (9.250c's unexplained
+                 * self-fetch failure, same shape). aux = the PML4 PA. */
+                PHYSICAL_ADDRESS pml4pa;
+                pml4pa.QuadPart = (LONGLONG)(curCr3 & PT_ADDR_MASK);
+                if (!MmGetVirtualForPhysical(pml4pa)) {
+                    if (auxOut) *auxOut = curCr3 & PT_ADDR_MASK;
+                    return 16;
+                }
+            }
             pml4e = S206ReadGuestPt(curCr3 & PT_ADDR_MASK, (rip >> 39) & 0x1FF);
             if (!(pml4e & 1)) {
-                *gva = 11;
                 if (auxOut) *auxOut = pml4e;
-                return 3;
+                return 11;   /* PML4E not present / read as zero */
             }
             pdpte = S206ReadGuestPt(pml4e & PT_ADDR_MASK, (rip >> 30) & 0x1FF);
             if (!(pdpte & 1)) {
-                *gva = 12;
                 if (auxOut) *auxOut = pdpte;
-                return 3;
+                return 12;   /* PDPTE not present / read as zero */
             }
             if (pdpte & (1ULL << 7)) {
                 *gva = 0;
@@ -925,9 +935,8 @@ static UINT32 S206DecodeStoreGva(
             } else {
                 pde = S206ReadGuestPt(pdpte & PT_ADDR_MASK, (rip >> 21) & 0x1FF);
                 if (!(pde & 1)) {
-                    *gva = 13;
                     if (auxOut) *auxOut = pde;
-                    return 3;
+                    return 13;   /* PDE not present / read as zero */
                 }
                 if (pde & (1ULL << 7)) {
                     *gva = 0;
@@ -935,9 +944,8 @@ static UINT32 S206DecodeStoreGva(
                 } else {
                     pte = S206ReadGuestPt(pde & PT_ADDR_MASK, (rip >> 12) & 0x1FF);
                     if (!(pte & 1)) {
-                        *gva = 14;
                         if (auxOut) *auxOut = pte;
-                        return 3;
+                        return 14;   /* PTE not present / read as zero */
                     }
                 }
             }
