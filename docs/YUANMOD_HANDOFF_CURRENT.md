@@ -4871,3 +4871,40 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - 状态：206-B 代码已提交（上一笔）；机器仍可能运行在 206-A 之下——**run_c8 前
   需先重启**（脚本会自己检测并提示）；稳定版未动。
 - 提交：本记录。
+
+### 9.247 2026-10-04 step206-B 实机 PASS + 分派点前移修 trace 盲区
+
+- 用户跑 run_c8：**三项里程碑一次全中**——`sc start 71ms → RUNNING`（progress.log
+  完整走完 yghv 自身 init：svm_core_init/npt_init/R1 单测/NPT 测试/hook 测试/合成
+  resident 心跳全绿后，vendored 上游入口才接管）→ **共存成立**；NCr3=g_npt（扩展到
+  512GB 同构覆盖）→ **我方 NPT 成立**；3 轮 ×100s 压测存活；**`sc stop` 78ms →
+  STOPPED + 卸载后 30s 压测 exit=0 系统健全** → **在线卸载成立**。C0 时代
+  "实验一次重启一次"结束；sc stop quirk 根因（缺 DRVO_LEGACY_DRIVER）推断被验证。
+- **判读细节 + 修复**：progress.log 无 `s206b coexist dispatch` trace——旧分派点在
+  默认路径 `yghv_trace_close()`（"all stopped"）之后，日志已关。部署镜像与归档逐字节
+  一致（b043bd40），且 sc start 返回 RUNNING 本身即证明 Sv206Entry 全核成功（失败
+  会让 SCM 报启动失败）。但证据应进日志：分派点前移到 **"npt set ok" 之后、合成
+  resident/hook 测试序列之前**（trace 仍开 + 跳过 OS-as-guest 下无意义的合成测试）。
+  三套重建全绿（s206b 串 default/206-A=0、206-B=1/1），镜像 `1e167922`。
+- 提交：本记录（代码同批）。
+
+### 9.248 2026-10-04 step206-C1：控制设备前移到虚拟化之前 → OS-as-guest 下客户端可用
+
+- 206-C 拆两增量。**C1（本轮，零岛风险）**：`yghv_control_device_init` 是纯
+  PASSIVE_LEVEL 操作（IoCreateDevice + 符号链接 + MajorFunction 表），前移到
+  Sv206Entry **之前**执行。进 guest 后客户端连 `\\.\YuanGuardHV` 的 IRP 路径 =
+  普通 Windows 执行（不触发 VMEXIT），IOCTL 只动 g_protect + g_npt（无 VMRUN）→
+  **保护控制面在整机隐形状态下可用**（产品地基）。DriverUnload 已有
+  yghv_control_device_cleanup。
+- 构建：默认/206-A/206-C1 三套全绿（控制设备失败串 0/0/1），镜像 `b64aba89` 归档
+  `yuanguard_hv_step206c1_20260918.sys`。验证脚本 `run_c9_step206c1.ps1`：进 guest 后
+  用**独立进程**跑 yghv_ctl state×3 + selftest（关键测点）→ 2 轮压测 → sc stop →
+  卸载后设备应消失 → 健全性压测。
+- **C2（下一增量，最高风险，待 C1 实机确认后做）**：NPF 页保护桥接。难点=岛内纪律：
+  vendored `SvHandleVmExit` 抬 IRQL 到 DISPATCH，而 `yghv_protect_on_npf_write` 用
+  `ExAcquireFastMutex`（DISPATCH 直接 bugcheck + 岛内阻塞=死锁，9.229 教训）→ 需写
+  **无锁岛内版** NPF verdict（复用 `_locked` 逻辑但去锁；表为非分页只读、NPT 翻转走
+  direct map 纯算术，岛内安全）+ #DB rearm 同路径 + 桥接函数放 vmexit.c 导出、
+  vendored handler 在 VMEXIT_NPF/EXCEPTION_DB case 调用。
+- 状态：C1 代码已提交；机器未加载 206；稳定版未动。
+- 提交：本记录。
