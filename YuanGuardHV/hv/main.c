@@ -5124,6 +5124,45 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     }
 #endif
 
+#if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
+    /* 9.247 step206-B dispatch (RELOCATED here from the control-device site):
+     * yghv's core init is complete (svm_core_init + g_npt + per-core NPT set —
+     * "npt set ok" is in the log) but the default path's resident/hook test
+     * sequence has NOT run yet. That sequence must be skipped in 206-B mode:
+     * its synthetic guests VMRUN too, and the trace file is closed at
+     * "all stopped" (5336) — dispatching after it left the s206b traces
+     * unsighted (the 9.246 run proved the dispatch itself works: RUNNING +
+     * 5.5min + sc stop 78ms, but we want the evidence IN the log).
+     * Here: extend g_npt to upstream-parity identity 0-512GB (MMIO included),
+     * then run the verbatim vendored upstream entry with NCr3=g_npt.
+     * Residents are not started; control device is NOT created yet (206-C
+     * will decide where it belongs). DriverUnload (registered at entry top,
+     * re-registered after Sv206Entry) calls Sv206CoopUnload before teardown. */
+    {
+        extern NTSTATUS Sv206Entry(struct _DRIVER_OBJECT *, PUNICODE_STRING);
+        npt_identity_map_range(&g_npt, 0, 0x8000000000ULL);
+        yghv_trace_u64("s206b ncr3", g_npt.pml4_pa);
+        yghv_trace("s206b coexist dispatch");
+        sv = Sv206Entry(d, r);
+        yghv_trace_u64("s206b entry rc", (uint64_t)(NTSTATUS)sv);
+        if (sv) {
+            yghv_protect_cleanup();
+            npt_cleanup(&g_npt);
+            svm_core_cleanup();
+            if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
+            g_guest_code_page = NULL;
+            yghv_trace_close();
+            KeRevertToUserAffinityThread();
+            return (NTSTATUS)sv;
+        }
+        /* upstream overwrote d->DriverUnload with its own half-teardown; keep
+         * yghv's (which runs Sv206CoopUnload first, then full yghv teardown). */
+        d->DriverUnload = DriverUnload;
+        KeRevertToUserAffinityThread();
+        return STATUS_SUCCESS;
+    }
+#endif
+
 #if !YGHV_R1_SKIP_NPT_TEST
     /* Single-core NPT permission test first. */
     npt_test_buf = MmAllocateContiguousMemory(
@@ -5459,45 +5498,8 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
         }
     }
     sv = yghv_control_device_init(d);
-#if YGHV_BAREMETAL_STEP == 206 && defined(YGHV_206B_COEXIST)
-    /* 9.246 step206-B coexist dispatch: yghv's FULL init ran (svm_core_init +
-     * g_npt built + control device live). Extend g_npt to upstream-parity
-     * identity 0-512GB (2MB pages, RWX — same coverage as C0's private NPT,
-     * MMIO included; g_npt's RAM-only map would NPF on guest APIC/IOAPIC/PCIe
-     * accesses), then run the verbatim vendored upstream entry with NCr3 =
-     * g_npt.pml4_pa (YGHV_206B_GNPT). yghv persistent residents are skipped:
-     * the OS itself is now the guest, nested synthetic residents are not the
-     * point. DriverUnload (registered at entry top) calls Sv206CoopUnload to
-     * devirtualize all cores before yghv teardown. */
-    if (!sv) {
-        extern NTSTATUS Sv206Entry(struct _DRIVER_OBJECT *, PUNICODE_STRING);
-        npt_identity_map_range(&g_npt, 0, 0x8000000000ULL);
-        yghv_trace_u64("s206b ncr3", g_npt.pml4_pa);
-        yghv_trace("s206b coexist dispatch");
-        sv = Sv206Entry(d, r);
-        yghv_trace_u64("s206b entry rc", (uint64_t)(NTSTATUS)sv);
-        if (sv) {
-            yghv_control_device_cleanup(d);
-            yghv_protect_cleanup();
-            npt_cleanup(&g_npt);
-            svm_core_cleanup();
-            if (g_guest_code_page) MmFreeContiguousMemory(g_guest_code_page);
-            g_guest_code_page = NULL;
-            yghv_trace_close();
-            KeRevertToUserAffinityThread();
-            return (NTSTATUS)sv;
-        }
-        /* Sv206Entry overwrote d->DriverUnload with upstream's SvDriverUnload;
-         * re-register yghv's so sc stop runs CoopUnload (devirt) + FULL yghv
-         * teardown (control device, NPT, SVM state) — not just upstream's half. */
-        d->DriverUnload = DriverUnload;
-        KeRevertToUserAffinityThread();
-        return STATUS_SUCCESS;
-    }
-#else
     if (!sv)
         sv = svm_core_start_persistent_residents(online);
-#endif
     if (sv) {
         LOG_ERROR("persistent residents/control device start failed 0x%x", sv);
         svm_core_wait_remote_ready(online);
