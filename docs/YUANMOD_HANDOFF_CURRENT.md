@@ -4828,3 +4828,46 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **状态**：机器当前仍运行在 206-A guest 之下（demand-start，重启即清）；用户可随时重启
   清除或先留着观察；稳定版 `70888311` 未动；C:\yuanguard_hv_s206.sys 保留（重启后手动删）。
 - 提交：本记录。
+
+### 9.246 2026-10-04 step206-B 离线实现完成：共存分派 + NCr3=g_npt + 在线卸载（待用户一次 boot）
+
+- 承 9.245 计划。门控 `YGHV_206B_COEXIST` / `YGHV_206B_GNPT`（build.bat 透传，
+  主编译 + vendored cl 双通道；**不带门控时 = 206-A 基线逐字不变**，字符串断言
+  `s206b coexist dispatch`/`s206b ncr3` 在 206-A 构建 =0、206-B 构建 =1）。
+- **实现**：
+  1. `main.c`：206 早期分派改为 `#if STEP==206 && !COEXIST`；COEXIST 时分派点移到
+     **yghv 完整 init 之后**（svm_core_init + g_npt 建好 + control device 就绪；
+     跳过 persistent residents——OS 本身就是 guest，合成 resident 无意义）；
+     分派前 `npt_identity_map_range(&g_npt, 0, 512GB)` 把 g_npt 扩到与上游
+     SvBuildNestedPageTables **完全同构**的 identity 覆盖（含 MMIO——上游是
+     0-512GB 全映射，g_npt 原本只映射 RAM ranges，guest 碰 APIC/IOAPIC/PCIe MMIO
+     会 NPF；map 函数对已有项幂等重写同值，安全）；
+  2. `svm_simplevm206.cpp`：GNPT 门控下 `NCr3 = g_npt.pml4_pa` + 旁路
+     `SvBuildNestedPageTables`（MSRPM 仍上游自建）；新增 `Sv206CoopUnload()`
+     （注销电源回调 + `SvDevirtualizeAllProcessors` 逐核 CPUID 后门反虚拟化）；
+     `#error` 强制 GNPT⊂COEXIST（早期分派时 g_npt 未初始化，NCr3=0 必炸）；
+  3. `main.c DriverUnload`：COEXIST 下先调 `Sv206CoopUnload()` 再做 yghv 自身
+     teardown；Sv206Entry 返回后**重新注册 yghv 的 DriverUnload**（上游会覆盖成
+     它自己的半套）。
+- **sc stop quirk 根因推断（本轮解决）**：C0 的 1052/0xC0000010 不是 DriverEntry
+  经 VMRUN 返回的问题（上游 DriverEntry 正常返回），而是 **Win10+ 卸载要求
+  DRVO_LEGACY_DRIVER 标志**——上游没设。yghv 的 DriverEntry 在分派前就设了
+  （main.c:4945），COEXIST 路径保留它 + 重注册 yghv DriverUnload → **206-B 的
+  sc stop 应天然可用**（run_c8 实测验证）。
+- **共存安全离线核实**：`SvIsSvmSupported` 只查 CPUID 特性位 + VM_CR.SVMDIS，
+  不查 EFER.SVME → yghv 先置 SVME 不误判；`svm_core_stop_all_residents` 只动
+  ACTIVE vcpu（residents 未启动=全 OFF，安全跳过）。
+- **构建**：默认 / 206-A（无门控，字符串 0/0 断言基线不变）/ 206-B（1/1）三套全绿；
+  206-B 镜像 `b043bd40...` 归档 `D:\aaaaaavm\yuanguard_hv_step206b_20260918.sys`。
+- **runbook `D:\aaaaaavm\run_c8_step206b.ps1`**：开头带**防呆**——检测到
+  yuang206/SimpleSvm 仍 RUNNING（机器已在别的 VMM 之下，206-B 的 VMRUN 会 #GP）
+  则中止并提示先重启。**流程**：启动 → 3 轮 ×100s 压测 → **`sc stop` 在线卸载
+  验证（本轮关键新看点）** → 卸载后 30s 压测健全性 → 删服务。若 sc stop 成功，
+  **从此不再需要重启清除**。
+- 判读：成功 = OS-as-guest 基座在 YGHV 树内与保护栈共存 + 可装卸 → 进入 206-C
+  （NPF 页保护/VMMCALL 认证挂到 vendored handler 扩展点）；共存崩 → 按
+  progress.log + dump 定位（g_npt 512GB 扩展 / SVME 前置 / residents 跳过三处
+  是仅有的新变量，可二分）。
+- 状态：206-B 代码已提交（上一笔）；机器仍可能运行在 206-A 之下——**run_c8 前
+  需先重启**（脚本会自己检测并提示）；稳定版未动。
+- 提交：本记录。
