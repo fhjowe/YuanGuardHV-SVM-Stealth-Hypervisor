@@ -21,6 +21,7 @@ int npt_init(npt_mgr_t*m,uint64_t x); int npt_identity_map_range(npt_mgr_t*m,uin
 int npt_set_page_perm(npt_mgr_t*m,uint64_t g,uint64_t f); int npt_set_page_perm_range(npt_mgr_t*m,uint64_t g,uint64_t s,uint64_t f);
 uint64_t npt_translate(npt_mgr_t*m,uint64_t g); int npt_cleanup(npt_mgr_t*m);
 uint64_t npt_read_entry(npt_mgr_t*m,uint64_t g);
+int npt_write_entry(npt_mgr_t*m,uint64_t g,uint64_t v);
 int npt_split_2mb_to_4kb(npt_mgr_t*m,uint64_t g);
 int npt_map_page(npt_mgr_t*m,uint64_t g,uint64_t spa,uint64_t flags);
 int npt_exclude_pa(npt_mgr_t*m,uint64_t g);

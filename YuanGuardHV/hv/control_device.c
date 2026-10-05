@@ -374,6 +374,18 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = yghv_protect_remove_page_for_pid(in->pid, in->target_va);
         break;
     }
+    case IOCTL_YGHV_SET_FAKE_MODE: {
+        /* 9.275 (C6): shadow fake-write mode for foreign KERNEL writes
+         * (cpl=0, non-target CR3). Default OFF. */
+        yghv_ioctl_fake_mode_t *in = (yghv_ioctl_fake_mode_t *)buf;
+        if (in_len < sizeof(*in)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+        yghv_protect_fake_mode_set(in->enable ? 1 : 0);
+        status = STATUS_SUCCESS;
+        break;
+    }
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;

@@ -210,6 +210,7 @@ static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
 }
 
 NTSTATUS yghv_protect_init(void) {
+    yghv_protect_fake_init();
     ExInitializeFastMutex(&g_protect_lock);
     RtlZeroMemory(&g_protect, sizeof(g_protect));
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
@@ -707,6 +708,75 @@ uint64_t yghv_protect_control_walk_gpa(void) {
     return 0;
 }
 
+/* 9.275 (C6 v1): shadow fake-write for foreign KERNEL writes (cpl=0,
+ * non-target CR3 — the WriteProcessMemory/MiDoPoolCopy shape, run_c17
+ * evidence). Injecting #PF at cpl=0 would bugcheck the kernel, so instead:
+ * remap the armed GPA to a scratch page, let the kernel write land there
+ * (real page untouched), TF fires #DB on the next instruction and the #DB
+ * handler restores the saved NPT entry. The writer believes it succeeded.
+ * Default OFF (config-fake 0x812); one fake in flight (global), fallback to
+ * plain ALLOW on any race. Island-safe: raw NPT ops + volatile flags only. */
+static uint64_t g_fake_scratch_pa;
+static volatile uint64_t g_fake_gpa;    /* real gpa currently shadowed */
+static volatile uint64_t g_fake_saved;  /* raw saved NPT entry */
+static volatile LONG g_fake_mode;
+
+void yghv_protect_fake_init(void) {
+    PVOID p = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
+    if (p) {
+        RtlZeroMemory(p, HV_PAGE_SIZE);
+        g_fake_scratch_pa = MmGetPhysicalAddress(p).QuadPart;
+    }
+}
+
+void yghv_protect_fake_mode_set(int on) {
+    InterlockedExchange(&g_fake_mode, on ? 1 : 0);
+    LOG_ERROR("protect fake mode: %d", on ? 1 : 0);
+}
+
+int yghv_protect_fake_mode_get(void) {
+    return InterlockedCompareExchange(&g_fake_mode, 0, 0);
+}
+
+int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
+    uint64_t saved;
+    ULONG i;
+    int st;
+    if (!InterlockedCompareExchange(&g_fake_mode, 0, 0))
+        return 0;
+    if (!g_fake_scratch_pa || g_fake_gpa != 0)
+        return 0;                          /* no scratch / one in flight */
+    saved = npt_read_entry(&g_npt, gpa);
+    if (!(saved & 1))
+        return 0;                          /* not a live 4K entry */
+    g_fake_saved = saved;
+    g_fake_gpa = gpa;
+    st = npt_map_page(&g_npt, gpa, g_fake_scratch_pa,
+                      NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    if (st) {
+        g_fake_gpa = 0;
+        g_fake_saved = 0;
+        return 0;                          /* fall back to plain ALLOW */
+    }
+    for (i = 0; i < SVM_MAX_CORES; i++)
+        if (g_vcpus[i])
+            g_vcpus[i]->npt_flush_pending = 1;
+    *rearm_out = gpa | 1ULL;               /* bit0 = fake, #DB restores */
+    return 1;
+}
+
+void yghv_protect_fake_restore(uint64_t gpa) {
+    ULONG i;
+    if (g_fake_gpa == gpa && g_fake_saved) {
+        (void)npt_write_entry(&g_npt, gpa, g_fake_saved);
+        g_fake_gpa = 0;
+        g_fake_saved = 0;
+        for (i = 0; i < SVM_MAX_CORES; i++)
+            if (g_vcpus[i])
+                g_vcpus[i]->npt_flush_pending = 1;
+    }
+}
+
 yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,
                                                  uint32_t cpl,
                                                  uint64_t gpa,
@@ -723,6 +793,14 @@ yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,
     }
     pp = yghv_protect_find_page_locked(gpa);   /* lock-free read */
     if (pp) {
+        /* 9.275: foreign KERNEL write (cpl=0, non-target CR3) — the WPM/
+         * MiDoPoolCopy shape. Injection would bugcheck the kernel; shadow it
+         * instead (writer sees success, scratch gets the bytes). */
+        if (!yghv_protect_is_target_cr3_locked(guest_cr3) && cpl == 0 &&
+            yghv_protect_fake_bare(pp->gpa, rearm_gpa_out)) {
+            *flip_out = 1;
+            return YGHV_NPF_FAKE;
+        }
         if (yghv_protect_is_target_cr3_locked(guest_cr3) || cpl == 0) {
             if (g_protect.config.auto_disarm) {
                 st = npt_set_page_perm(&g_npt, pp->gpa,

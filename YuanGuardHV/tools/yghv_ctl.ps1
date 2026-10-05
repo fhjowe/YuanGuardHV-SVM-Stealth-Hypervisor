@@ -811,6 +811,17 @@ try {
                 -InBytes $buf | Out-Null
             Write-Host ("unprotect-page: pid={0} va=0x{1:X} OK" -f $pidVal, $va)
         }
+        'config-fake' {
+            # 206-C6: shadow fake-write mode -- foreign KERNEL writes (cpl=0,
+            # e.g. WriteProcessMemory) to an armed page are redirected to a
+            # scratch page (writer sees success, real page untouched).
+            if ($null -eq $Arg1) { throw 'config-fake: usage: config-fake <0|1>' }
+            $val = [uint32]::Parse($Arg1)
+            if ($val -gt 1) { throw 'config-fake: must be 0 or 1' }
+            Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x812)) `
+                -InBytes ([BitConverter]::GetBytes($val)) | Out-Null
+            Write-Host ("config-fake: {0} OK" -f $val)
+        }
         'mmf-open' {
             if ($null -eq $Arg1) { throw 'mmf-open: usage: mmf-open <path>' }
             $size = [uint32]4096

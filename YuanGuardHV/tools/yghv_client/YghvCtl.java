@@ -28,6 +28,7 @@ public class YghvCtl {
     private static final int FN_GET_LASTHIT = 0x80F;
     private static final int FN_ADD_PAGE_FOR_PID = 0x810;
     private static final int FN_REMOVE_PAGE_FOR_PID = 0x811;
+    private static final int FN_SET_FAKE_MODE = 0x812;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);

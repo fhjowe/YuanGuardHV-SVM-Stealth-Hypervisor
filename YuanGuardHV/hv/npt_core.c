@@ -171,6 +171,22 @@ uint64_t npt_translate(npt_mgr_t*m,uint64_t g){
     return ((uint64_t)pt[p0].pfn<<12)|(g&0xFFF);
 }
 
+/* 9.275: raw-entry writeback (C6 fake-write shadow restore). Armed pages are
+ * always 4K (split before arm), so a large-page PDE here is an error. */
+int npt_write_entry(npt_mgr_t*m,uint64_t g,uint64_t v){
+    npt_entry_t *pd, *pt;
+    uint32_t p4=(uint32_t)NPT_PML4_INDEX(g),p2=(uint32_t)NPT_PDPT_INDEX(g),p1=(uint32_t)NPT_PD_INDEX(g),p0=(uint32_t)NPT_PT_INDEX(g);
+    if(!m||!m->pml4_va)return STATUS_INVALID_PARAMETER;
+    pd=npt_get_pd(m,p4,p2);
+    if(!pd)return STATUS_NOT_FOUND;
+    if(pd[p1].large_page)return STATUS_NOT_FOUND;
+    if(!pd[p1].present)return STATUS_NOT_FOUND;
+    pt=npt_get_pt(m,p4,p2,p1);
+    if(!pt)return STATUS_NOT_FOUND;
+    pt[p0].all=v;
+    return STATUS_SUCCESS;
+}
+
 uint64_t npt_read_entry(npt_mgr_t*m,uint64_t g){
     npt_entry_t *pd, *pt;
     uint32_t p4=(uint32_t)NPT_PML4_INDEX(g),p2=(uint32_t)NPT_PDPT_INDEX(g),p1=(uint32_t)NPT_PD_INDEX(g),p0=(uint32_t)NPT_PT_INDEX(g);

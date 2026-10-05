@@ -44,6 +44,8 @@ extern "C" {
 int yghv_protect_on_npf_write_bare(UINT64 guest_cr3, UINT32 cpl,
                                    UINT64 gpa, UINT64 *rearm_gpa, int *flip);
 int yghv_protect_arm_page_bare(UINT64 gpa);
+int yghv_protect_fake_bare(UINT64 gpa, UINT64 *rearm_out);
+void yghv_protect_fake_restore(UINT64 gpa);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 UINT64 yghv_protect_control_walk_gpa(void);
@@ -1250,7 +1252,9 @@ SvHandleVmExit (
                     g_S206VrIdx += 2;
                 }
 
-                if (vr == 1 /* YGHV_NPF_ALLOW */)
+                if (vr == 1 /* YGHV_NPF_ALLOW */ ||
+                    vr == 3 /* YGHV_NPF_FAKE: shadow remap done, TF +
+                    rearm|1 -> #DB restores the saved entry */)
                 {
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
                     VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
@@ -1498,8 +1502,13 @@ SvHandleVmExit (
             }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
             if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {
-                yghv_protect_arm_page_bare(
-                    VpData->GuestVmcb.ControlArea.GuestPaOfGhcb);
+                UINT64 slot = VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
+                /* 9.275: bit0 set = fake-write shadow (C6) — restore the
+                 * saved real NPT entry instead of plain re-arm. */
+                if (slot & 1ULL)
+                    yghv_protect_fake_restore(slot & ~1ULL);
+                else
+                    yghv_protect_arm_page_bare(slot);
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
             }
             VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */
