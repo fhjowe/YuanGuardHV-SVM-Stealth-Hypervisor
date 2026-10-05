@@ -796,8 +796,15 @@ yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,
         /* 9.275: foreign KERNEL write (cpl=0, non-target CR3) — the WPM/
          * MiDoPoolCopy shape. Injection would bugcheck the kernel; shadow it
          * instead (writer sees success, scratch gets the bytes). */
-        if (!yghv_protect_is_target_cr3_locked(guest_cr3) && cpl == 0 &&
-            yghv_protect_fake_bare(pp->gpa, rearm_gpa_out)) {
+        /* 9.276: condition is cpl==0 ONLY. run_c18 evidence: MmCopyVirtual
+         * Memory has TWO shapes -- MiDoPoolCopy (caller CR3, the c17 shape)
+         * AND KeStackAttachProcess (TARGET CR3 + cpl=0, the c18 shape: the
+         * npf ring showed the target's own CR3 on the WPM write). Gating on
+         * !is_target missed the attach shape entirely. Shadowing any kernel
+         * write to the armed page also covers APC/exception-delivery writes
+         * (they land in scratch) -- acceptable for the experimental flag,
+         * which is default-OFF and per-run opt-in. */
+        if (cpl == 0 && yghv_protect_fake_bare(pp->gpa, rearm_gpa_out)) {
             *flip_out = 1;
             return YGHV_NPF_FAKE;
         }
