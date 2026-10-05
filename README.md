@@ -31,8 +31,8 @@
 - 早期版本是运行在 Ring 0 的内核驱动（YuanGuard），直接挂钩内核函数来保护 Minecraft/Forge 进程。
 - 本仓库（YuanGuardHV）把同样的一套保护逻辑（内存写保护、进程终止保护、句柄保护、常驻）**搬进 AMD SVM 虚拟化层**，通过 NPT（Nested Page Table）+ VMMCALL + VMEXIT 拦截实现：
   - 保护语义与宿主 OS 解耦，宿主内核对保护逻辑“看不见”；
-  - 未来目标是把保护对象放进 guest 态，形成整机级隔离（OS-as-guest 路线，当前受平台限制停线，见[已知限制](#已知限制与路线图)）。
-- 当前主线是非驻留保护路线：驱动在真实 Windows 中运行，用合成 resident guest 承载 VMRUN 验证链；真实进程代码仍原生执行。
+  - **OS-as-guest 路线已打通（2026-10，206 里程碑）**：vendored 上游 SimpleSvm 逐字进场，全核无缝虚拟化（coexist），真实 Windows 以 guest 态运行，页写保护全链（arm→NPF→岛内裸判→重武装→看门狗→在线卸载）硬件实证。
+- 双路线并存：非驻留合成 guest 路线（驱动在真实 Windows 中运行，用合成 resident guest 承载 VMRUN 验证链）+ **206 主线**（OS-as-guest，全核虚拟化下的跨进程页保护，见[功能里程碑](#功能里程碑)）。
 
 ---
 
@@ -57,7 +57,7 @@
 ```
 
 - **SVM 虚拟化**：`VMRUN`/`VMLOAD`/`VMSAVE`/`CLGI`，VMCB 字段对照 AMD APM 实现；合成 guest 通过 VMMCALL 心跳与宿主通信。
-- **NPT**：16GB identity-map + NPF（Nested Page Fault）权限注入；支持 `perm / range / translate / split` API（v25 单测 PASS）。
+- **NPT**：512GB identity-map（206 路线）/ 16GB（合成路线）+ NPF（Nested Page Fault）权限注入；支持 `perm / range / translate / split` API（v25 单测 PASS）。
 - **VMEXIT/VMMCALL**：VMEXIT 分发、VMMCALL 认证分层（控制面要求 SeDebugPrivilege / 目标绑定）。
 - **控制面**：内核驱动暴露 `\\.\YuanGuardHV` 设备，IOCTL 命令号统一（`0x5947` 文件标志），PowerShell/Java 客户端共用同一接口。
 - **多核**：每核一个系统线程进入 guest 态，双核 10000 轮心跳稳定。
@@ -113,7 +113,13 @@ yuanguard/
 | 真实目标 | Java/JNI 客户端、真实进程接入（`protect/unprotect/scan`） | ✅ |
 | R1 安全地基 | VMMCALL 认证分层、NPT 权限 API | ⏳ 部分（VMware 嵌套阻塞部分验证） |
 | 隐形 | 加载隐藏门控、痕迹自查工具 | ⏳ 默认关闭，待 kd 复核 |
-| OS-as-guest | 整机进 guest 的 B 路线（APIC 虚拟化等） | ⛔ 平台级硬冻结，已停线（见限制） |
+| **206-A/B** | vendored 上游 SimpleSvm 逐字进场 + coexist 全核无缝虚拟化 + 512GB identity NPT + 在线卸载（~50ms） | ✅ |
+| **206-C1** | OS-as-guest 下 IOCTL 控制面可用（PASSIVE 创建 + guest 态 IRP） | ✅ |
+| **206-C2** | 页写保护端到端：arm(split+PRESENT-only)→NPF→岛内裸判（ALLOW 重开+TF+#DB 重武装 / DENY 注入 #PF）→读回 | ✅ |
+| **206-C3** | 控制面加固：目标退出看门狗（根治泄漏→风暴）、NONE 静默重开、last-hit 查询（fn 0x80F） | ✅ |
+| **206-C4** | 跨进程保护：外部控制器按 pid 武装目标页（fn 0x810/0x811），目标写 ALLOW、外部进程写 DENY→确定性 AV | ✅ |
+| **206-C5** | 实进程试点（notepad 真实目标 + scan-pid/wpm-write）+ WPM 内核中介旁路定性实证 + 遥测环扩容 | ✅ |
+| 旧 B 路线 | 整机进 guest 的 APIC 虚拟化实验 | ⛔ 已由 206 通路取代（历史见 docs） |
 
 ---
 
@@ -169,7 +175,8 @@ build.bat
 | `YGHV_LOADER_STEALTH` | 启用加载隐藏（模块摘链） |
 | `YGHV_UNLOAD_GUARD` | 反卸载守卫 |
 | `YGHV_BAREMETAL_NO_RESIDENT` | 裸机模式去 resident guest |
-| `YGHV_BAREMETAL_STEP` | 裸机 step 选择（OS-as-guest 实验用） |
+| `YGHV_BAREMETAL_STEP` | 裸机 step 选择（`206` = OS-as-guest 主线） |
+| `YGHV_206B_COEXIST` / `YGHV_206B_GNPT` | 206 路线：coexist 全核虚拟化 + 512GB identity NPT（与 STEP=206 配合） |
 | `YGHV_SINGLECORE` | 单核 guest |
 | `YGHV_APIC_SHADOW` | APIC 影子（B-1full，裸机等价物） |
 | `YGHV_APIC_IDENTITY` / `YGHV_APIC_PASSTHROUGH` | APIC identity / passthrough 实验 |
@@ -219,13 +226,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File YuanGuardHV\tools\yghv_ctl.p
 |---|---|
 | `state` / `target` / `list-targets` / `list-pages` / `list-hooks` / `lasthit` | 查询状态 |
 | `set-target <pid>` | 设置目标进程 |
-| `add-page <hex_va>` / `remove-page <hex_va>` | 增/删受保护页 |
+| `add-page <hex_va>` / `remove-page <hex_va>` | 增/删受保护页（调用者自身地址空间） |
+| `protect-page <pid> <hex_va>` / `unprotect-page <pid> <hex_va>` | **跨进程武装**（fn 0x810/0x811，206-C4：外部控制器对已注册目标按 pid 武装） |
 | `start` / `stop` | 启动/停止保护 |
 | `install-hook <name\|hex_va> [hook_id]` / `remove-hook <hook_id>` | 挂钩管理 |
 | `config [auto-disarm <0\|1> \| deny-status <hex>]` | 配置 |
 | `set-auto-start` / `unset-auto-start` / `harden-service` / `unharden-service` | 服务加固 |
-| `selftest` / `exit-test` | 自检 / 退出测试 |
+| `selftest` / `selftest-abort` / `exit-test` | 自检 / 看门狗测试（武装后脏死）/ 退出测试 |
 | `protect <pid> [maxPages]` / `unprotect` / `scan <pid> [maxPages]` | 一键保护 / 停止 / 只读扫描 |
+| `mmf-open <path>` / `mmf-loop <path> <sec> [info]` / `mmf-write <path>` | 跨进程保护实验介质（文件映射共享页：目标写循环 / 攻击者单写，输出 BLOCKED/LANDED） |
+| `scan-pid <pid> [count]` / `wpm-write <pid> <hex_va> <hex_val>` | 实进程试点（VirtualQueryEx 枚举私有页 / WriteProcessMemory 内核中介写） |
 
 ### Java/JNI 客户端（`tools\yghv_client`）
 
@@ -235,7 +245,7 @@ build.bat          # 编译（含 JNI native）
 run.bat state      # 用法与 PowerShell 客户端一致
 ```
 
-> **REV-019 注意**：`protect <pid>` 仅对调用进程自身 PID 生效（驱动把 ADD_PAGE 绑定到调用者 CR3，P0 自我保护目标）；保护其他进程需配合后续 OS-as-guest 里程碑。`scan <pid>` 为只读，可用于任意进程。
+> **REV-019 注意（已部分取代）**：Java 客户端的 `protect <pid>` 仍仅对调用进程自身 PID 生效（ADD_PAGE 绑定调用者 CR3）。**206-C4 起用 PowerShell 客户端的 `protect-page <pid> <hex_va>`（fn 0x810）跨进程武装**：目标先经 `set-target <pid>` 注册，控制器即可从外部武装目标地址空间的页。`scan <pid>` / `scan-pid <pid>` 为只读。
 
 ---
 
@@ -269,12 +279,13 @@ run.bat state      # 用法与 PowerShell 客户端一致
 
 ## 已知限制与路线图
 
-1. **OS-as-guest 已停线**：让真实 Windows 整机跑进 guest 的路线在 Ryzen 5 5500 上遇到平台级硬冻结（AMD errata 1363 guest 中断死锁/1235 AVIC），B 路线（APIC 虚拟化）也无法绕过；唯一 PASS 形态是 step20 自旋 + INTR/NMI 拦截 + 宿主 ISR。因此“整机隐形”形态当前不可用，真实进程的 NPT/vmmcall 拦截有待该里程碑。
-   **2026-09-18 复审降级**：此前全部裸机常驻实验都保留了 INTR/NMI 拦截 + 宿主 ISR 等高频异步退出，偏离上游 AMD OS-as-guest 参考构型（SimpleSvm/HelloAmdHv：不拦中断、只拦 CPUID/VMRUN、全核无缝进入）；且本机实测 CPUID = Family 19h Model 50h（Zen3 Cezanne），1363/1235 属 Family 17h 编号系——"平台级"归因**未证实**。裁决方案 = C0 原版 SimpleSvm 实机对照（构建已完成）+ C1 `step203`（SimpleSvm 等价门控，代码已入库），见 `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md`。
-2. **隐形是尽力而为**：内核驱动在真实 Windows 中加载，绝对隐形不现实；`loader_stealth` 默认关闭且未经 kd `!driver` 复核；不承诺绕过任何具体反作弊产品（ACE 仅尽力优化，不作验收标准）。
-3. **NPT 安全地基部分未验证**：ASID 多管理、向 guest 注入 #PF 等因 VMware 嵌套限制未完整验证。
-4. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
-5. **路线图**：R1 私有内存剔除 → `loader_stealth` 并入默认（先 kd 复核）→ MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
+1. **OS-as-guest 已打通（206 线，2026-10）**：早期"平台级硬冻结"结论经 C0 原版 SimpleSvm 实机对照推翻（errata 1363/1235 属 Family 17h 编号系，本机 Zen3 不适用）。当前形态 = vendored 上游 SimpleSvm 逐字进场 + coexist 全核虚拟化，真实 Windows 以 guest 态运行，页写保护全链硬件实证（206-C1–C5 全 PASS，判读史见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.244–9.274）。历史 APIC 虚拟化 B 路线实验保留在 docs/ 作存档。
+2. **WPM 内核中介写旁路（C6 待细化）**：`WriteProcessMemory` 类内核 API 经 `MmCopyVirtualMemory`+`KeStackAttachProcess` 以"目标 CR3 + cpl=0"完成写，现行裁决（is_target_cr3 ‖ cpl==0 → ALLOW）无法区分它与内核合法写——已在实机定性实证（run_c17）。候选规则 = cpl==0 且 CR3==某 target CR3 → DENY，前置条件 = 证明 APC/异常派发不以目标 CR3 写用户内存（否则误杀合法路径）。
+3. **DENY 的 AV 报告地址为 VA 0**：精确 GVA 重建在实测平台不可实现（`MmGetVirtualForPhysical` 选择性失效 + 直接映射基址不可无故障验证，206c5g/h 两轮蓝屏学费已记录并回退）。DENY 语义本身无损（确定性递 AV、零风暴），CR2=0/ec P=0 为最终行为。
+4. **隐形是尽力而为**：内核驱动在真实 Windows 中加载，绝对隐形不现实；`loader_stealth` 默认关闭且未经 kd `!driver` 复核；不承诺绕过任何具体反作弊产品（ACE 仅尽力优化，不作验收标准）。
+5. **NPT 安全地基部分未验证**：ASID 多管理、向 guest 注入 #PF 等因 VMware 嵌套限制未完整验证。
+6. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
+7. **路线图**：**C6 内核中介写裁决细化** → 真实产品目标（Minecraft/Forge）目标选择/页选取流程化 → R1 私有内存剔除 → `loader_stealth` 并入默认（先 kd 复核）→ MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
 
 ---
 
