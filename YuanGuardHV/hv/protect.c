@@ -149,65 +149,10 @@ static NTSTATUS yghv_protect_stop_locked(void);
 static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_va);
 static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id);
 
-/* 9.272: PA->VA via an arithmetic direct map whose BASE IS DERIVED AT BOOT
- * from MmGetVirtualForPhysical (run 206c5f proved the helper is selective —
- * NULL for some in-use RAM pages — but correct where it answers; and 206c5g
- * proved the textbook base 0xFFFF800000000000 is NOT readable for all RAM on
- * this box: bugcheck 0xD1 faulting at 0xFFFF8000001ADF80). Deriving the base
- * keeps the deterministic arithmetic channel while inheriting whatever real
- * layout Windows uses. Fail-safe: base 0 (derivation failed) or PA at/above
- * the captured RAM ceiling => NULL; every caller checks. */
-static uint64_t g_pa_va_base;
-static uint64_t g_pa_ceiling;
-
-PVOID yghv_pa_to_va(uint64_t pa) {
-    if (g_pa_va_base == 0 || pa >= g_pa_ceiling)
-        return NULL;
-    return (PVOID)(g_pa_va_base + pa);
-}
-
-static void yghv_pa_to_va_init(void) {
-    /* sample the helper on this driver's own pages: ground truth VA from
-     * MmGetVirtualForPhysical, cross-checked byte-for-byte. */
-    static volatile uint64_t probe[2] = { 0x1122334455667788ULL,
-                                          0x8877665544332211ULL };
-    PHYSICAL_ADDRESS pa;
-    PVOID hv;
-    g_pa_va_base = 0;
-    g_pa_ceiling = 0;
-    {
-        /* RAM ceiling from the physical memory ranges (PASSIVE, boot time) */
-        PPHYSICAL_MEMORY_RANGE r = MmGetPhysicalMemoryRanges();
-        if (r) {
-            int i;
-            for (i = 0; i < 64; i++) {
-                if (r[i].BaseAddress.QuadPart == 0 &&
-                    r[i].NumberOfBytes.QuadPart == 0)
-                    break;
-                {
-                    uint64_t end = (uint64_t)r[i].BaseAddress.QuadPart +
-                                   (uint64_t)r[i].NumberOfBytes.QuadPart;
-                    if (end > g_pa_ceiling)
-                        g_pa_ceiling = end;
-                }
-            }
-            ExFreePool(r);
-        }
-        if (g_pa_ceiling == 0)
-            return;
-    }
-    pa.QuadPart = (LONGLONG)MmGetPhysicalAddress((PVOID)probe).QuadPart;
-    hv = MmGetVirtualForPhysical(pa);
-    if (!hv)
-        return;
-    if (RtlCompareMemory(hv, (PVOID)probe, 16) == 16)
-        g_pa_va_base = (uint64_t)hv - (uint64_t)pa.QuadPart;
-}
-
 static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
     uint64_t *va;
     if (!table_pa) return 0;
-    va = (uint64_t *)yghv_pa_to_va(table_pa);
+    va = MmGetVirtualForPhysical((PHYSICAL_ADDRESS){ .QuadPart = table_pa });
     if (!va) return 0;
     return va[index];
 }
@@ -265,7 +210,6 @@ static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
 }
 
 NTSTATUS yghv_protect_init(void) {
-    yghv_pa_to_va_init();
     ExInitializeFastMutex(&g_protect_lock);
     RtlZeroMemory(&g_protect, sizeof(g_protect));
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
@@ -751,52 +695,16 @@ static NTSTATUS yghv_protect_stop_locked(void) {
  * control plane already knows. Lock-free read of the same tables the NPF
  * verdict scans; pure arithmetic; no telemetry. 0 = no armed target. */
 uint64_t yghv_protect_control_walk_gpa(void) {
-    uint64_t diag[5];
-    yghv_protect_control_walk_diag(diag);
-    return diag[0];
-}
-
-/* 9.270: full-trace variant -- out[0]=final gpa, out[1]=direct-map VA of the
- * PML4 page (0 = MmGetVirtualForPhysical returned NULL), out[2]=PML4E raw,
- * out[3]=direct-map VA of the PDP page, out[4]=PDPTE raw. Island-safe pure
- * reads; classifies walk-fail as helper-NULL vs wrong-content. */
-void yghv_protect_control_walk_diag(uint64_t out[5]) {
     uint32_t t;
-    uint64_t cr3 = 0, va = 0;
-    static const uint64_t M = 0x000FFFFFFFFFF000ULL;
-    out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 0; out[4] = 0;
     for (t = 0; t < g_protect.target_count; t++) {
         if (g_protect.targets[t].cr3 != 0 &&
             g_protect.targets[t].page_count > 0) {
-            cr3 = g_protect.targets[t].cr3;
-            va = g_protect.targets[t].pages[0].target_va;
-            break;
+            return yghv_protect_guest_va_to_pa(
+                g_protect.targets[t].cr3,
+                g_protect.targets[t].pages[0].target_va);
         }
     }
-    if (!cr3)
-        return;
-    {
-        uint64_t *v1;
-        v1 = (uint64_t *)yghv_pa_to_va(cr3 & M);
-        out[1] = (uint64_t)v1;
-        if (!v1)
-            return;
-        {
-            uint64_t pml4e = v1[(va >> 39) & 0x1FF];
-            uint64_t *v2;
-            out[2] = pml4e;
-            if (!(pml4e & 1)) {
-                out[0] = yghv_protect_guest_va_to_pa(cr3, va);
-                return;
-            }
-            v2 = (uint64_t *)yghv_pa_to_va(pml4e & M);
-            out[3] = (uint64_t)v2;
-            if (!v2)
-                return;
-            out[4] = v2[(va >> 30) & 0x1FF];
-        }
-        out[0] = yghv_protect_guest_va_to_pa(cr3, va);
-    }
+    return 0;
 }
 
 yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,

@@ -47,8 +47,6 @@ int yghv_protect_arm_page_bare(UINT64 gpa);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 UINT64 yghv_protect_control_walk_gpa(void);
-void yghv_protect_control_walk_diag(UINT64 out[5]);
-void *yghv_pa_to_va(UINT64 pa);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
 /* 9.258 (206-C3): control-plane read of the last protection verdict hit. */
@@ -58,7 +56,7 @@ extern "C" UINT64 yghv_s206_last_hit(void) { return g_S206LastProtectHit; }
 // (bare-metal context, file I/O safe).
 extern "C" void yghv_trace(const char *msg);
 extern "C" void yghv_trace_u64(const char *label, UINT64 v);
-static volatile UINT64 g_S206DenyLog[288] = { 0 };
+static volatile UINT64 g_S206DenyLog[192] = { 0 };
 static volatile ULONG g_S206DenyIdx = 0;
 /* 9.252: NPF-entry telemetry (write-fault NPFs reaching the handler) */
 static volatile UINT64 g_S206NpfLog[96] = { 0 };
@@ -115,16 +113,13 @@ extern "C" void yghv_s206_flush_deny_log(void) {
         return;
     }
     yghv_trace_u64("s206 deny count", (UINT64)g_S206DenyIdx);
-    for (ULONG q = 0; q * 9 < g_S206DenyIdx && q < 32; q++) {
-        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 9]);
-        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 9 + 1]);
-        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 9 + 2]);
-        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 9 + 3]);
-        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 9 + 4]);
-        yghv_trace_u64("s206 deny ctl0", g_S206DenyLog[q * 9 + 5]);
-        yghv_trace_u64("s206 deny ctl1", g_S206DenyLog[q * 9 + 6]);
-        yghv_trace_u64("s206 deny ctl2", g_S206DenyLog[q * 9 + 7]);
-        yghv_trace_u64("s206 deny ctl3", g_S206DenyLog[q * 9 + 8]);
+    for (ULONG q = 0; q * 6 < g_S206DenyIdx && q < 32; q++) {
+        yghv_trace_u64("s206 deny cr3", g_S206DenyLog[q * 6]);
+        yghv_trace_u64("s206 deny gpa", g_S206DenyLog[q * 6 + 1]);
+        yghv_trace_u64("s206 deny cpl", g_S206DenyLog[q * 6 + 2]);
+        yghv_trace_u64("s206 deny gva", g_S206DenyLog[q * 6 + 3]);
+        yghv_trace_u64("s206 deny rip", g_S206DenyLog[q * 6 + 4]);
+        yghv_trace_u64("s206 deny aux", g_S206DenyLog[q * 6 + 5]);
     }
     g_S206DenyIdx = 0;
 }
@@ -867,9 +862,13 @@ SvHandleVmrun (
 static UINT64 S206ReadGuestPt(UINT64 table_pa, UINT64 index)
 {
     UINT64 *va;
+    PHYSICAL_ADDRESS pa;
     if (!table_pa)
         return 0;
-    va = (UINT64 *)yghv_pa_to_va(table_pa);
+    pa.QuadPart = (LONGLONG)table_pa;
+    va = (UINT64 *)MmGetVirtualForPhysical(pa);
+    if (!va)
+        return 0;
     return va[index];
 }
 
@@ -910,10 +909,20 @@ static UINT32 S206DecodeStoreGva(
              * control fails => the machinery itself is broken. aux carries
              * the control-walk gpa (0 = control walk failed too). */
             UINT64 *auxOut = aux;
-            UINT64 ctl[5] = { 0, 0, 0, 0, 0 };
-            yghv_protect_control_walk_diag(ctl);
             static const UINT64 PT_ADDR_MASK = 0x000FFFFFFFFFF000ULL;
             UINT64 pml4e, pdpte, pde, pte;
+            {
+                /* decisive probe: the PML4 page is mapped RAM by definition;
+                 * if the PA->VA helper returns NULL for it, MmGetVirtualFor
+                 * Physical itself is the broken link (9.250c's unexplained
+                 * self-fetch failure, same shape). aux = the PML4 PA. */
+                PHYSICAL_ADDRESS pml4pa;
+                pml4pa.QuadPart = (LONGLONG)(curCr3 & PT_ADDR_MASK);
+                if (!MmGetVirtualForPhysical(pml4pa)) {
+                    if (auxOut) *auxOut = curCr3 & PT_ADDR_MASK;
+                    return 16;
+                }
+            }
             pml4e = S206ReadGuestPt(curCr3 & PT_ADDR_MASK, (rip >> 39) & 0x1FF);
             if (!(pml4e & 1)) {
                 if (auxOut) *auxOut = pml4e;
@@ -949,17 +958,21 @@ static UINT32 S206DecodeStoreGva(
              * CONTROL walk against the target's known-good (cr3, va) pair;
              * its result decides machinery-vs-state. */
             {
+                UINT64 ctrl = yghv_protect_control_walk_gpa();
+                if (auxOut) *auxOut = ctrl;   /* == known gpa => curCr3 wrong */
                 UINT64 pte2 = yghv_protect_guest_va_to_pa(curCr3, rip);
                 if (!pte2)
-                    return 3;      /* DG_WALK_FAIL; ctl[] = control evidence */
-                va = yghv_pa_to_va(pte2);
+                    return 3;      /* DG_WALK_FAIL with control evidence */
+                pa.QuadPart = (LONGLONG)pte2;
             }
+            va = MmGetVirtualForPhysical(pa);
             if (!va)
                 return 4;          /* DG_NO_DIRECTMAP */
             for (i = 0; i < 15; i++)
                 ib[i] = ((volatile UINT8 *)va)[i];
         } else {
-            va = yghv_pa_to_va(gpa);
+            pa.QuadPart = (LONGLONG)gpa;
+            va = MmGetVirtualForPhysical(pa);
             if (!va)
                 return 4;          /* DG_NO_DIRECTMAP */
             for (i = 0; i < 15; i++)
@@ -1283,10 +1296,10 @@ SvHandleVmExit (
                      * (0 = decode fell back) so one run validates both the
                      * decoder and the delivery pairing. */
                     UINT64 gva = 0;
-                    UINT64 dAux[4] = { 0, 0, 0, 0 };
+                    UINT64 dAux = 0;
                     UINT32 dReason =
                         S206DecodeStoreGva(VpData, GuestRegisters, &gva,
-                                           dAux);
+                                           &dAux);
                     BOOLEAN haveGva = (dReason == 0);
                     UINT64 e1 = VpData->GuestVmcb.ControlArea.ExitInfo1;
                     VpData->GuestVmcb.StateSaveArea.Cr2 = haveGva ? gva : 0;
@@ -1311,7 +1324,7 @@ SvHandleVmExit (
                      * 0xDEAD0000|reason on fallback (11-14 = walk failed at
                      * PML4E/PDPTE/PDE/PTE); rip = faulting instruction;
                      * aux = raw failing PT entry (or large-page tag). */
-                    if (g_S206DenyIdx + 9 <= 288) {
+                    if (g_S206DenyIdx + 6 <= 192) {
                         g_S206DenyLog[g_S206DenyIdx] = curCr3;
                         g_S206DenyLog[g_S206DenyIdx + 1] = gpa;
                         g_S206DenyLog[g_S206DenyIdx + 2] =
@@ -1320,11 +1333,8 @@ SvHandleVmExit (
                             haveGva ? gva : (0xDEAD0000ULL | dReason);
                         g_S206DenyLog[g_S206DenyIdx + 4] =
                             VpData->GuestVmcb.StateSaveArea.Rip;
-                        g_S206DenyLog[g_S206DenyIdx + 5] = dAux[0];
-                        g_S206DenyLog[g_S206DenyIdx + 6] = dAux[1];
-                        g_S206DenyLog[g_S206DenyIdx + 7] = dAux[2];
-                        g_S206DenyLog[g_S206DenyIdx + 8] = dAux[3];
-                        g_S206DenyIdx += 9;
+                        g_S206DenyLog[g_S206DenyIdx + 5] = dAux;
+                        g_S206DenyIdx += 6;
                     }
                     break;
                 }
@@ -1393,13 +1403,19 @@ SvHandleVmExit (
                 for (UINT8 q = 0; q < 8 && q < n; q++)
                     ib[q] = VpData->GuestVmcb.ControlArea.GuestInstructionBytes[q];
                 inst = ib;
+            } else if (curCr3 != 0) {
+                UINT64 gpa = yghv_protect_guest_va_to_pa(curCr3, rip);
+                if (gpa) {
+                    PHYSICAL_ADDRESS pa;
+                    pa.QuadPart = (LONGLONG)gpa;
+                    PVOID va = MmGetVirtualForPhysical(pa);
+                    if (va) {
+                        for (UINT8 q = 0; q < 8; q++)
+                            ib[q] = ((volatile UINT8 *)va)[q];
+                        inst = ib;
+                    }
+                }
             }
-            /* 9.272: the CR-path self-fetch is DELETED. It ran on EVERY
-             * CR3-write exit (every context switch) and its PT walk was the
-             * 0xD1 crash surface once the fail-safe NULL channel was fixed —
-             * a garbage/stale Padding1 CR3 walked into unmapped direct-map
-             * VAs with GIF=0. EXITINFO1 bits[7:6] is the hardware-primary
-             * answer (9.250d) and needs no memory reads. */
 
             if (inst && inst[0] == 0x0F && inst[1] == 0x22) {
                 rm = inst[2] & 7;                        /* MOV cr3, rm */
