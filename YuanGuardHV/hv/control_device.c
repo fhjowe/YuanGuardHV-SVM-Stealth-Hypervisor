@@ -376,14 +376,22 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
     }
     case IOCTL_YGHV_SET_FAKE_MODE: {
         /* 9.275 (C6): shadow fake-write mode for foreign KERNEL writes
-         * (cpl=0, non-target CR3). Default OFF. */
-        yghv_ioctl_fake_mode_t *in = (yghv_ioctl_fake_mode_t *)buf;
-        if (in_len < sizeof(*in)) {
-            status = STATUS_BUFFER_TOO_SMALL;
+         * (cpl=0, non-target CR3). Default OFF. Dual mode: 4-byte input sets
+         * the flag; zero-length input reads diagnostics {mode, attempts, ok,
+         * last_reject} (9.277). */
+        if (in_len == 0 && out_len >= 32) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_protect_fake_diag(out);
+            info = 32;
             break;
         }
-        yghv_protect_fake_mode_set(in->enable ? 1 : 0);
-        status = STATUS_SUCCESS;
+        if (in_len >= sizeof(yghv_ioctl_fake_mode_t)) {
+            yghv_ioctl_fake_mode_t *in = (yghv_ioctl_fake_mode_t *)buf;
+            yghv_protect_fake_mode_set(in->enable ? 1 : 0);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
         break;
     }
     default:

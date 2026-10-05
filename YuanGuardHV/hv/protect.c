@@ -738,17 +738,39 @@ int yghv_protect_fake_mode_get(void) {
     return InterlockedCompareExchange(&g_fake_mode, 0, 0);
 }
 
+static volatile LONG g_fake_attempts;   /* cpl=0 verdicts entering the check */
+static volatile LONG g_fake_ok;
+static volatile LONG g_fake_last_reject;/* 1=mode 2=scratch 3=busy 4=entry 5=map */
+
+void yghv_protect_fake_diag(UINT64 out[4]) {
+    out[0] = (UINT64)InterlockedCompareExchange(&g_fake_mode, 0, 0);
+    out[1] = (UINT64)InterlockedCompareExchange(&g_fake_attempts, 0, 0);
+    out[2] = (UINT64)InterlockedCompareExchange(&g_fake_ok, 0, 0);
+    out[3] = (UINT64)InterlockedCompareExchange(&g_fake_last_reject, 0, 0);
+}
+
 int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
     uint64_t saved;
     ULONG i;
     int st;
-    if (!InterlockedCompareExchange(&g_fake_mode, 0, 0))
+    InterlockedIncrement(&g_fake_attempts);
+    if (!InterlockedCompareExchange(&g_fake_mode, 0, 0)) {
+        InterlockedExchange(&g_fake_last_reject, 1);
         return 0;
-    if (!g_fake_scratch_pa || g_fake_gpa != 0)
-        return 0;                          /* no scratch / one in flight */
+    }
+    if (!g_fake_scratch_pa) {
+        InterlockedExchange(&g_fake_last_reject, 2);
+        return 0;
+    }
+    if (g_fake_gpa != 0) {
+        InterlockedExchange(&g_fake_last_reject, 3);
+        return 0;                          /* one in flight */
+    }
     saved = npt_read_entry(&g_npt, gpa);
-    if (!(saved & 1))
+    if (!(saved & 1)) {
+        InterlockedExchange(&g_fake_last_reject, 4);
         return 0;                          /* not a live 4K entry */
+    }
     g_fake_saved = saved;
     g_fake_gpa = gpa;
     st = npt_map_page(&g_npt, gpa, g_fake_scratch_pa,
@@ -756,11 +778,13 @@ int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
     if (st) {
         g_fake_gpa = 0;
         g_fake_saved = 0;
+        InterlockedExchange(&g_fake_last_reject, 5);
         return 0;                          /* fall back to plain ALLOW */
     }
     for (i = 0; i < SVM_MAX_CORES; i++)
         if (g_vcpus[i])
             g_vcpus[i]->npt_flush_pending = 1;
+    InterlockedIncrement(&g_fake_ok);
     *rearm_out = gpa | 1ULL;               /* bit0 = fake, #DB restores */
     return 1;
 }

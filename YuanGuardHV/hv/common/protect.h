@@ -145,6 +145,7 @@ int  yghv_protect_fake_mode_get(void);
 void yghv_protect_fake_mode_set(int on);
 int  yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out);
 void yghv_protect_fake_restore(uint64_t gpa);
+void yghv_protect_fake_diag(UINT64 out[4]);
 uint64_t yghv_protect_control_walk_gpa(void);
 void yghv_protect_on_process_exit(uint32_t pid);
 void yghv_protect_rearm(svm_vcpu_t *vcpu);
