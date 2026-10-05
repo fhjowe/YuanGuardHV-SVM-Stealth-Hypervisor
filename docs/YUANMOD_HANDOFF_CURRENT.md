@@ -5490,3 +5490,30 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   CR3==某 target CR3 → 视为内核中介 attach 写 → DENY；前置 = 证明 APC/异常
   派发不以目标 CR3 写用户内存），或真实产品目标（Minecraft/Forge）流程化。
 - 提交：本记录。
+
+### 9.275–9.276 2026-10-05 C6 v1 影子假写实现 + run_c18 首跑判读（gate1 FAIL→条件修正 206c6b；本地提交未推送）
+
+- **C6 v1（9.275，206c6a/3fd5d59b）**：影子假写——外来内核写命中武装页时
+  `npt_map_page(gpa→scratch, RW)`，写落影子真页无损，TF+#DB（rearm 槽 bit0=1
+  标记）恢复保存的原始 NPT 条目，写者见假成功。默认关（config-fake fn 0x812
+  + ps1 `config-fake` + Java FN_SET_FAKE_MODE），vr 序号 3 = fake，单飞行 +
+  竞态降级 ALLOW。npt_write_entry 新原语。设计要点：对 cpl=0 注入 #PF 必
+  bugcheck 内核，影子是唯一安全的拒绝形态。
+- **run_c18 首跑（用户执行，全程零蓝屏）**：gate2（cpl=3 BLOCKED）/gate3
+  （fake OFF 写落地）/gate4（看门狗）PASS；**gate1 FAIL**——WPM readback =
+  写入值（真落地），vr 环无序号 3，且 npf 环 30 条 cr3 全 = 目标自身
+  0x3D1012000，其中 2 条 cpl=0 = WPM 写。
+- **根因（重要机制修正）**：**MmCopyVirtualMemory 有两种形态**——
+  MiDoPoolCopy（调用方 CR3 + cpl=0，c17 那次）和 KeStackAttachProcess
+  （**目标 CR3 + cpl=0**，c18 这次，npf 环实证）。c17 时我据单样本推断
+  "不 attach"是错的。fake 分支原条件 `!is_target_cr3` 把 attach 形态整个
+  放进了 is_target ALLOW 分支。
+- **修复（9.276，206c6b，SHA256 205b7525…，md5 f0f96f14）**：fake 分支条件
+  放宽为 **cpl==0-only**（覆盖两种形态；APC/异常派发写也落影子——实验旗标
+  默认关 + 每次运行显式 opt-in，可接受）。gate3 的 A/B 语义不变。
+- **用户指令**：**不再主动推送 GitHub，用户说推才推**。9.275/9.276 均为本地
+  提交（0308991/7ee171d/8e7b442）。
+- run_c18 重跑判据：gate1 变 PASS（WPM WROTE + readback=旧目标值 + vr 出现
+  序号 3）+ gate2/3/4 维持 → C6 v1 PASS。gate3 若同时 FAIL = config 开关
+  链路问题（查 0x812 case）。
+- 提交：本记录。
