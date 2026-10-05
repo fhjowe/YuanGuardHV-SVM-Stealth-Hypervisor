@@ -57,10 +57,11 @@
 ```
 
 - **SVM 虚拟化**：`VMRUN`/`VMLOAD`/`VMSAVE`/`CLGI`，VMCB 字段对照 AMD APM 实现；合成 guest 通过 VMMCALL 心跳与宿主通信。
+- **206 主线（OS-as-guest）**：`svm_simplevm206.cpp`（vendored 上游 SimpleSvm 逐字进场，仅 4 处缝合）承载全核虚拟化；NPF/CR3/CR4/#DB 在 VMEXIT 内由**岛内裸判**处理（GIF=0、无锁、禁一切 NT API），页写保护裁决与遥测环全部岛内完成。
 - **NPT**：512GB identity-map（206 路线）/ 16GB（合成路线）+ NPF（Nested Page Fault）权限注入；支持 `perm / range / translate / split` API（v25 单测 PASS）。
 - **VMEXIT/VMMCALL**：VMEXIT 分发、VMMCALL 认证分层（控制面要求 SeDebugPrivilege / 目标绑定）。
-- **控制面**：内核驱动暴露 `\\.\YuanGuardHV` 设备，IOCTL 命令号统一（`0x5947` 文件标志），PowerShell/Java 客户端共用同一接口。
-- **多核**：每核一个系统线程进入 guest 态，双核 10000 轮心跳稳定。
+- **控制面**：内核驱动暴露 `\\.\YuanGuardHV` 设备，IOCTL 命令号统一（`0x5947` 文件标志），PowerShell/Java 客户端共用同一接口（ioctl_parity 门禁强制三端一致）。
+- **多核**：206 路线全核无缝虚拟化（每核 VMCB + per-VCPU current-CR3 槽 + CR3/CR4 写拦截仿真）；合成路线为每核一个系统线程，双核 10000 轮心跳稳定。
 
 ---
 
@@ -74,12 +75,13 @@ yuanguard/
 │   ├── build.bat                 # 构建脚本（先跑静态检查，再编译+链接+签名）
 │   ├── hv/                       # 内核驱动源码
 │   │   ├── main.c                # DriverEntry、resident/OS-as-guest 实验框架
-│   │   ├── svm_core.c            # SVM 初始化、VMRUN、VMCB
+│   │   ├── svm_simplevm206.cpp/.hpp/.asm  # 206 主线：vendored 上游 SimpleSvm（OS-as-guest 核心）
+│   │   ├── svm_core.c            # SVM 初始化、VMRUN、VMCB（合成路线）
 │   │   ├── npt_core.c            # NPT identity map + NPF 权限注入
-│   │   ├── vmexit.c              # VMEXIT 分发
+│   │   ├── vmexit.c              # VMEXIT 分发（合成路线）
 │   │   ├── vmmcall.c             # VMMCALL 处理与认证
 │   │   ├── multi_core.c          # 每核系统线程
-│   │   ├── protect.c             # 保护逻辑
+│   │   ├── protect.c             # 保护逻辑 + 岛内裸判桥（on_npf_write_bare 等）
 │   │   ├── control_device.c      # IOCTL 控制设备
 │   │   ├── loader_stealth.c      # 加载隐藏（门控，默认关）
 │   │   ├── svm_trampoline.S      # 进入/退出 guest 的汇编蹦床
@@ -209,6 +211,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File YuanGuardHV\unload_driver.ps
 - 服务名：`yuanguard`；控制设备：`\\.\YuanGuardHV`。
 - 加载后可用 `tools\yghv_ctl.ps1 state` 验证驱动响应。
 - 迭代流程（本仓库惯例）：构建 → 归档 `bin\yuanguard_hv.sys` → 拷贝到目标机 `C:\yuanguard_hv.sys` → `sc.exe start yuanguard` → 回归 → `unload_driver.ps1` 卸载（不重启可反复）。
+
+### 206 主线（OS-as-guest）加载
+
+206 镜像以 `YGHV_BAREMETAL_STEP=206` + `YGHV_206B_COEXIST/GNPT` 构建（DriverEntry 末尾 dispatch 进 vendored SimpleSvm，**全核进入虚拟化**）：
+
+```powershell
+sc.exe create yuang206c2 type= kernel binPath= C:\yuanguard_hv_s206c2.sys start= demand
+sc.exe start yuang206c2      # entry + coexist dispatch，桌面无感
+# ...控制面/保护实验...
+sc.exe stop  yuang206c2      # 在线卸载（实测 ~50-130ms），无需重启
+```
+
+- 与合成路线的加载互斥（脚本自带残留 VMM guard，`yuang206*`/SimpleSvm 在 RUNNING 会拒绝启动）。
+- 206 模式下控制面命令（`protect-page`/`mmf-*`/`lasthit` 等）在 guest 态 IRP 全可用。
+- 完整实验脚本（run_c7…run_c16 系列）与判读记录见 `docs/YUANMOD_HANDOFF_CURRENT.md`。
 
 ---
 
