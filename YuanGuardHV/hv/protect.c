@@ -763,8 +763,21 @@ int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
         return 0;
     }
     if (g_fake_gpa != 0) {
+        /* 9.278: same page already shadowed (restore pending or the rearm
+         * slot was overwritten by a competing ALLOW) — RE-ASSERT the fake
+         * (idempotent restore) instead of falling to ALLOW. The c6b run
+         * proved the old busy->ALLOW fallback leaks g_fake_gpa (the ALLOW
+         * branch overwrites the rearm slot, bit0 lost, the restore never
+         * fires) and livelocks: 4.4e8 NPFs at ~3M/s with ok frozen at 1.
+         * With re-assert every NPF gets a paired #DB restore and the
+         * writer's copy terminates. */
+        if (g_fake_gpa == gpa) {
+            InterlockedIncrement(&g_fake_ok);
+            *rearm_out = gpa | 1ULL;
+            return 1;
+        }
         InterlockedExchange(&g_fake_last_reject, 3);
-        return 0;                          /* one in flight */
+        return 0;                          /* different page in flight */
     }
     saved = npt_read_entry(&g_npt, gpa);
     if (!(saved & 1)) {
