@@ -5606,3 +5606,23 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   写入值（假读幻觉）或目标旧值（读走主 NPT）均可——**真页不变的判据移至
   gate2 的 mmf-write current 读数**（必须仍是目标的 0x00C4C4… 序列）。
 - 提交：本记录。
+
+### 9.283 2026-10-11 206c7b 0x19 判读 + npt_cleanup 双重释放修复（镜像 206c7c/md5 3f5f3a1d；本地提交未推送；未加载）
+
+- **run_c18×206c7b 蓝屏 = 0x19/0x22（BAD_POOL_HEADER）@ 卸载路径**，kd 栈：
+  `KeBugCheckEx ← ExRemovePoolTag ← MmFreeContiguousMemory+0x93 ←
+  yuanguard_hv_s206c2+0x5d49`，PROCESS_NAME=System，POOL_ADDRESS=分配的连续
+  内存页。rings 已 flush（deny/addlog 落盘可见）= 崩在 unload 后段。
+- **根因：9.280 重写的 npt_cleanup 双重释放**——split PT（武装页/R1 测试的
+  4K 拆分表）既被 PD 遍历释放（pd[k].present&&!large_page → free pt）、又在
+  pt_reg 循环被二次释放。pt_reg 的用途只是 VA 查找（get_pt 的直接通道），
+  **不是所有权记录**。
+- **修复**：删除 cleanup 的 pt_reg 释放循环（PD 遍历已覆盖全部 split PT）。
+  该 bug 只在卸载路径，与假写/NCr3 切换无关——**206c7b 的 run_c18 本体
+  （四 gate）未跑到卸载就被这个卸载蓝屏截断，gate 结果待重跑**。
+- 构建：206 + default 双绿，marker 验证。镜像 md5 `3f5f3a1d`（SHA256 见归档）
+  `D:\aaaaaavm\yuanguard_hv_step206c7c_20261011.sys`。run_c18 哈希门 = 3F5F3A1D。
+- **下一轮（等用户允许加载）**：run_c18 四 gate（v3 读路径判据：gate1 readback
+  = 写入值或目标旧值均可；真页不变判据 = gate2 的 mmf-write current）+ 本次
+  验证卸载不再 0x19。
+- 提交：本记录。
