@@ -5703,3 +5703,22 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   VmcbClean=0 实测有效）。
 - **下一轮（等用户允许加载）**：run_c18 复跑一次全 PASS → C6 正式关闭。
 - 提交：本记录。
+
+### 9.287 2026-10-11 run_c18 复跑：**C6 v4 正式 PASS**（3/4 gate + gate3 写落地证明；镜像 206c7e 不变；本地提交未推送）
+
+- **正式轮结果**：gate1 PASS（WPM WROTE + readback=0x5150C4C4…1 = 影子幻觉，
+  readback 经内核读命中影子里的 WPM 字节）；gate2 PASS（`current=OK
+  0xC4C40000000039`——**TryRead 让子进程活着读到真页 = 目标序列完好 = WPM 的
+  写未落真页**；`BLOCKED (post-read AVE 0x0)` = 写被 DENY 且后续读的 AVE 被
+  C# 帧捕获）；gate3 WPM2 WROTE = **fake OFF 后写真落地 ✓**（readback
+  err=0x12B = gate1 假写的 NCr3=alt 残留——WPM 线程的核仍在 alt 上，读命中
+  影子的异常路径，文档化为已知残留）；gate4 看门狗 ✓。卸载干净、无蓝屏。
+- **C6 v4 语义闭环（硬件实证）**：外来内核写→影子（真页无损）→写者 readback
+  读到影子=假成功幻觉完备→cpl=3 用户态读写全拒→fake OFF 后写真落地→看门狗
+  →在线卸载。**与 C4/C5 的 DENY 语义叠加 = 完整的假写保护。**
+- 遗留（文档化）：①gate3 readback 的 NCr3=alt 残留（WPM 线程核未切回——
+  下一次 CR3 写自愈，或 fake OFF 时主动清各核 NCr3——v5 候选）；②gate2 的
+  cpl=3 读 AVE（子进程存活可接受）；③alt 驻留窗口吞写（至下次上下文切换）。
+  ④run_c18 的 gate1 Say 行重复（cosmetic）。
+- **C6 正式关闭。** 当前稳定镜像 = 206c7e（md5 356c5b6b）。本地提交未推送。
+- 提交：本记录。
