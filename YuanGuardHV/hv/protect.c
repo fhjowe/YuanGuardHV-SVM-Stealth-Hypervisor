@@ -149,17 +149,6 @@ static NTSTATUS yghv_protect_stop_locked(void);
 static NTSTATUS yghv_protect_install_hook_locked(uint8_t hook_id, uint64_t func_va);
 static NTSTATUS yghv_protect_remove_hook_locked(uint8_t hook_id);
 
-/* 9.280 (C6 v2) fake machinery: declarations live here because the arm/
- * disarm paths mirror NPT ops into the alt NPT. Definitions further down. */
-static npt_mgr_t g_npt_alt;              /* identity clone + scratch mappings */
-static int g_npt_alt_ready;
-static volatile LONG g_fake_mode;
-static volatile LONG g_fake_attempts;
-static volatile LONG g_fake_ok;
-static volatile LONG g_fake_restores;
-static volatile LONG g_fake_last_reject; /* 1=mode 2=alt 0=ok */
-static PVOID yghv_protect_fake_scratch_for(uint64_t gpa);
-
 static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
     uint64_t *va;
     if (!table_pa) return 0;
@@ -221,7 +210,6 @@ static uint64_t yghv_protect_resolve_va(uint64_t target_va) {
 }
 
 NTSTATUS yghv_protect_init(void) {
-    yghv_protect_fake_init();
     ExInitializeFastMutex(&g_protect_lock);
     RtlZeroMemory(&g_protect, sizeof(g_protect));
     RtlZeroMemory(g_protect_hooks, sizeof(g_protect_hooks));
@@ -537,11 +525,6 @@ static int yghv_protect_arm_page_locked(yghv_protect_page_t *p) {
     st = npt_set_page_perm(&g_npt, p->gpa, NPT_PERM_PRESENT);
     if (!st) {
         p->armed = 1;
-        /* 9.280: mirror into the alt NPT when fake mode is on — the alt
-         * maps armed pages to their scratch buffers so a foreign kernel
-         * write during a fake window lands in scratch. */
-        if (InterlockedCompareExchange(&g_fake_mode, 0, 0) && g_npt_alt_ready)
-            (void)yghv_protect_fake_scratch_for(p->gpa);
         for (i = 0; i < SVM_MAX_CORES; i++) {
             if (g_vcpus[i])
                 g_vcpus[i]->npt_flush_pending = 1;
@@ -564,13 +547,6 @@ static int yghv_protect_disarm_page_locked(yghv_protect_page_t *p) {
         NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
     if (!st) {
         p->armed = 0;
-        /* 9.280: disarm mirror — the alt maps the page back to identity RW
-         * (no longer protected; writes land for real). */
-        if (InterlockedCompareExchange(&g_fake_mode, 0, 0) && g_npt_alt_ready) {
-            (void)npt_split_2mb_to_4kb(&g_npt_alt, p->gpa);
-            (void)npt_map_page(&g_npt_alt, p->gpa, p->gpa,
-                NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-        }
         for (i = 0; i < SVM_MAX_CORES; i++) {
             if (g_vcpus[i])
                 g_vcpus[i]->npt_flush_pending = 1;
@@ -731,134 +707,6 @@ uint64_t yghv_protect_control_walk_gpa(void) {
     return 0;
 }
 
-/* 9.280 (C6 v2): DUAL-NPT fake-write for foreign KERNEL writes (cpl=0 — the
- * WriteProcessMemory shape; both MmCopyVirtualMemory forms arrive here, see
- * run_c18). v1's in-place PTE remap failed on Zen3: TlbControl=1 does NOT
- * flush NPT (GPA->HPA) translations, so the shadowed store re-faulted forever
- * (4.4e8 NPFs, ok=1, restores=0). v2 switches the VMCB's nCR3 instead — the
- * cpp sets NCr3=alt on the fake NPF and NCr3=main on the #DB; a DIFFERENT
- * nCR3 value architecturally flushes the NPT TLB (APM 15.16), so the shadow
- * mapping is always visible. The main NPT entry is never modified: no
- * disarm/re-arm bookkeeping, no snapshot, no scratch aliasing of the real
- * page. The alt NPT is a full identity clone built at init; armed pages are
- * remapped to per-page scratch buffers when fake mode is enabled (or when
- * armed while fake is on). While a core runs on alt, only armed pages differ
- * (they write to scratch); every other translation is identity-identical. */
-void yghv_protect_fake_init(void) {
-    /* build the alt NPT at DriverEntry (PASSIVE, bare metal): full identity
-     * clone of the 512GB window. Allocating ~514 table pages at boot costs
-     * 2MB and keeps every later fake switch allocation-free. */
-    if (NT_SUCCESS(npt_init(&g_npt_alt, 0x8000000000ULL)))
-        g_npt_alt_ready = 1;
-    LOG_ERROR("protect fake: alt npt build rc=%d pa=0x%llx", g_npt_alt_ready,
-              (unsigned long long)g_npt_alt.pml4_pa);
-}
-
-int yghv_protect_fake_mode_get(void) {
-    return InterlockedCompareExchange(&g_fake_mode, 0, 0);
-}
-
-void yghv_protect_fake_mode_set(int on) {
-    /* enable: map every currently-armed page to its own scratch buffer in
-     * the alt NPT; disable: restore identity mappings in alt (main untouched
-     * either way). IOCTL context = PASSIVE; the ops are the same raw NPT
-     * edits the arm path uses. */
-    uint32_t t;
-    ULONG i2;
-    if (on) {
-        for (t = 0; t < g_protect.target_count; t++) {
-            uint32_t i;
-            for (i = 0; i < g_protect.targets[t].page_count; i++) {
-                uint64_t gpa = g_protect.targets[t].pages[i].gpa;
-                PVOID sc = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE,
-                                                 YGHV_TAG);
-                if (!sc)
-                    continue;
-                RtlZeroMemory(sc, HV_PAGE_SIZE);
-                if (npt_split_2mb_to_4kb(&g_npt_alt, gpa) == 0)
-                    (void)npt_map_page(&g_npt_alt, gpa,
-                        MmGetPhysicalAddress(sc).QuadPart,
-                        NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-            }
-        }
-        LOG_ERROR("protect fake mode: 1 (alt pa=0x%llx)",
-                  (unsigned long long)g_npt_alt.pml4_pa);
-    } else {
-        for (t = 0; t < g_protect.target_count; t++) {
-            uint32_t i;
-            for (i = 0; i < g_protect.targets[t].page_count; i++) {
-                uint64_t gpa = g_protect.targets[t].pages[i].gpa;
-                (void)npt_split_2mb_to_4kb(&g_npt_alt, gpa);
-                (void)npt_map_page(&g_npt_alt, gpa, gpa,
-                    NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-            }
-        }
-        LOG_ERROR("protect fake mode: 0");
-    }
-    InterlockedExchange(&g_fake_mode, on ? 1 : 0);
-}
-
-UINT64 yghv_protect_fake_alt_pa(void) {
-    return g_npt_alt_ready ? g_npt_alt.pml4_pa : 0;
-}
-
-UINT64 yghv_protect_fake_main_pa(void) {
-    return g_npt.pml4_pa;
-}
-
-/* scratch buffers handed to the alt NPT: one per armed page, allocated on
- * demand (config-fake enable / arm-while-fake-on). */
-static PVOID yghv_protect_fake_scratch_for(uint64_t gpa) {
-    PVOID sc = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
-    if (sc) {
-        RtlZeroMemory(sc, HV_PAGE_SIZE);
-        if (npt_split_2mb_to_4kb(&g_npt_alt, gpa) == 0)
-            (void)npt_map_page(&g_npt_alt, gpa,
-                MmGetPhysicalAddress(sc).QuadPart,
-                NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
-    }
-    return sc;
-}
-
-void yghv_protect_fake_diag(UINT64 out[5]) {
-    out[0] = (UINT64)InterlockedCompareExchange(&g_fake_mode, 0, 0);
-    out[1] = (UINT64)InterlockedCompareExchange(&g_fake_attempts, 0, 0);
-    out[2] = (UINT64)InterlockedCompareExchange(&g_fake_ok, 0, 0);
-    out[3] = (UINT64)InterlockedCompareExchange(&g_fake_last_reject, 0, 0);
-    out[4] = (UINT64)InterlockedCompareExchange(&g_fake_restores, 0, 0);
-}
-
-/* 9.280: v2 fake_bare is a pure gate — no NPT mutation here. The cpp flips
- * the calling core's NCr3 to alt (guaranteed flush) and the #DB handler
- * flips it back. Counters stay for the 0x812 diagnostics. */
-int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
-    InterlockedIncrement(&g_fake_attempts);
-    if (!InterlockedCompareExchange(&g_fake_mode, 0, 0)) {
-        InterlockedExchange(&g_fake_last_reject, 1);
-        return 0;
-    }
-    if (!g_npt_alt_ready) {
-        InterlockedExchange(&g_fake_last_reject, 2);
-        return 0;
-    }
-    InterlockedIncrement(&g_fake_ok);
-    InterlockedExchange(&g_fake_last_reject, 0);
-    *rearm_out = gpa | 1ULL;               /* bit0 = fake, #DB switches back */
-    return 1;
-}
-
-/* 9.280: called by the #DB handler after switching NCr3 back to main —
- * counters only (the alt is not un-mapped; fake mode keeps it). */
-void yghv_protect_fake_restore(uint64_t gpa) {
-    ULONG i;
-    UNREFERENCED_PARAMETER(gpa);
-    InterlockedIncrement(&g_fake_restores);
-    for (i = 0; i < SVM_MAX_CORES; i++)
-        if (g_vcpus[i])
-            g_vcpus[i]->npt_flush_pending = 1;
-}
-
-
 yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,
                                                  uint32_t cpl,
                                                  uint64_t gpa,
@@ -875,23 +723,6 @@ yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3,
     }
     pp = yghv_protect_find_page_locked(gpa);   /* lock-free read */
     if (pp) {
-        /* 9.280 (C6 v2): foreign KERNEL write (cpl=0, any CR3 — WPM has
-         * both MiDoPoolCopy and attach shapes). The cpp switches this core's
-         * NCr3 to the alt NPT (architectural flush): the store lands in the
-         * page's scratch buffer and the #DB switches NCr3 back. Writer sees
-         * success; the real page is untouched. */
-        /* 9.276: condition is cpl==0 ONLY. run_c18 evidence: MmCopyVirtual
-         * Memory has TWO shapes -- MiDoPoolCopy (caller CR3, the c17 shape)
-         * AND KeStackAttachProcess (TARGET CR3 + cpl=0, the c18 shape: the
-         * npf ring showed the target's own CR3 on the WPM write). Gating on
-         * !is_target missed the attach shape entirely. Shadowing any kernel
-         * write to the armed page also covers APC/exception-delivery writes
-         * (they land in scratch) -- acceptable for the experimental flag,
-         * which is default-OFF and per-run opt-in. */
-        if (cpl == 0 && yghv_protect_fake_bare(pp->gpa, rearm_gpa_out)) {
-            *flip_out = 1;
-            return YGHV_NPF_FAKE;
-        }
         if (yghv_protect_is_target_cr3_locked(guest_cr3) || cpl == 0) {
             if (g_protect.config.auto_disarm) {
                 st = npt_set_page_perm(&g_npt, pp->gpa,
