@@ -242,4 +242,16 @@ SvLV20: ;
         jmp rbx
 Sv206LaunchVm endp
 
+; 9.289 (C6.1): INVLPGA helper — invalidates the nested-TLB translation for
+; the guest virtual address in RCX, associated with the guest ASID in EDX,
+; under this core's current nCR3. Used by the fake-write path to make the
+; shadow mapping immediately visible (Zen3 does not flush NPT translations
+; on TlbControl=1 or on nCr3 change).
+SvInvlpgaByVa proc
+    mov rax, rcx        ; RAX = GVA
+    mov ecx, edx        ; ECX = guest ASID
+    invlpga rax, ecx
+    ret
+SvInvlpgaByVa endp
+
         end

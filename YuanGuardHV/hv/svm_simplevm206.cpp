@@ -47,6 +47,9 @@ int yghv_protect_arm_page_bare(UINT64 gpa);
 void *yghv_protect_find_page_bare(UINT64 gpa);
 int yghv_protect_fake_bare(UINT64 gpa, UINT64 *rearm_out);
 void yghv_protect_fake_restore(UINT64 gpa);
+void yghv_protect_fake_invpga_armeds(UINT32 asid);
+LONG yghv_protect_fake_alt_active(void);   /* 9.289 C6.1 */
+void SvInvlpgaByVa(UINT64 gva, UINT32 asid);         // asm helper
 UINT64 yghv_protect_fake_alt_pa(void);
 UINT64 yghv_protect_fake_main_pa(void);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
@@ -1312,6 +1315,13 @@ SvHandleVmExit (
                          * visible and the copy's stores land in the shadow.
                          * 9.285: VmcbClean=0 forces the CPU to reload the
                          * field (the bare write was cache-swallowed). */
+                        /* 9.289 (C6.1): INVLPGA the armed pages' known
+                         * GVAs first -- Zen3 does not flush NPT translations
+                         * on TlbControl or nCr3 change, so the stale
+                         * gpa->real translation would keep the store
+                         * spinning until a natural TLB eviction. */
+                        yghv_protect_fake_invpga_armeds(
+                            VpData->GuestVmcb.ControlArea.GuestAsid);
                         UINT64 altPa = yghv_protect_fake_alt_pa();
                         if (altPa) {
                             VpData->GuestVmcb.ControlArea.NCr3 = altPa;
@@ -1527,6 +1537,21 @@ SvHandleVmExit (
                    protection-verdict's current-CR3 slot */
                 VpData->GuestVmcb.StateSaveArea.Cr3 = newCr;
                 VpData->HostStackLayout.Padding1 = newCr;
+                /* 9.289 (C6 v4): a context switch ends the fake window --
+                 * if this core is on the alt NPT, switch back to main. The
+                 * switched-out thread's shadow writes are simply discarded,
+                 * and the incoming thread sees the real mappings. */
+                if (yghv_protect_fake_alt_active() &&
+                    VpData->GuestVmcb.ControlArea.NCr3 ==
+                        yghv_protect_fake_alt_pa()) {
+                    /* 9.289 (C6.1): drop the alt's stale scratch
+                     * translations for the armed pages before switching. */
+                    yghv_protect_fake_invpga_armeds(
+                        VpData->GuestVmcb.ControlArea.GuestAsid);
+                    VpData->GuestVmcb.ControlArea.NCr3 =
+                        yghv_protect_fake_main_pa();
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                }
             } else if (crIdx == 4) {
                 /* CR4 write: update VMCB state (VMRUN loads it). Native TLB
                    flush semantics are replaced by TlbControl=1 below. */

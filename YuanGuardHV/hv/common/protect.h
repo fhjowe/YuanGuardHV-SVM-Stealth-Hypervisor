@@ -148,6 +148,7 @@ int  yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out);
 void yghv_protect_fake_restore(uint64_t gpa);
 LONG yghv_protect_fake_alt_active(void);
 void yghv_protect_fake_ncr3_resync(void);
+void yghv_protect_fake_invpga_all(UINT32 asid);   /* 9.289 C6.1 */
 void yghv_protect_fake_diag(UINT64 out[5]);
 uint64_t yghv_protect_control_walk_gpa(void);
 void yghv_protect_on_process_exit(uint32_t pid);

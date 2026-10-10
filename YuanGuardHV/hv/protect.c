@@ -160,6 +160,7 @@ static volatile LONG g_fake_restores;
 static volatile LONG g_fake_last_reject; /* 1=mode 2=alt 0=ok */
 static volatile LONG g_fake_alt_active;  /* a core is running on the alt NPT */
 static PVOID yghv_protect_fake_scratch_for(uint64_t gpa);
+void SvInvlpgaByVa(UINT64 gva, UINT32 asid);   /* 9.289: asm, 206-only */
 
 static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
     uint64_t *va;
@@ -824,6 +825,21 @@ void yghv_protect_fake_mode_set(int on) {
 UINT64 yghv_protect_fake_alt_pa(void) {
     return g_npt_alt_ready ? g_npt_alt.pml4_pa : 0;
 }
+
+#if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
+/* 9.289 (C6.1): INVLPGA the known GVA (target_va) of every armed page --
+ * drops the stale NPT translation for that GVA so the shadow mapping is
+ * immediately visible. Island-safe (the asm helper only). */
+void yghv_protect_fake_invpga_armeds(UINT32 asid) {
+    uint32_t t;
+    for (t = 0; t < g_protect.target_count; t++) {
+        uint32_t i;
+        for (i = 0; i < g_protect.targets[t].page_count; i++) {
+            SvInvlpgaByVa(g_protect.targets[t].pages[i].target_va, asid);
+        }
+    }
+}
+#endif
 
 LONG yghv_protect_fake_alt_active(void) {
     return InterlockedCompareExchange(&g_fake_alt_active, 0, 0);
