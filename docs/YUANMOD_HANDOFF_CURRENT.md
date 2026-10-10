@@ -5578,3 +5578,31 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **下一步**：真实产品目标流程化（Minecraft/Forge 目标选择+页选取，控制面
   已就绪），或 C6 重新立项（前置 = KD 在场的受控环境）。
 - 提交：本记录。
+
+### 9.282 2026-10-11 kd 转储取证突破 + C6 v3 读路径修复（镜像 206c7b/md5 da50ee8d；本地提交未推送；未加载）
+
+- **取证能力突破（无需第二台机器）**：本机 WDK 自带 kd.exe，对 minidump 跑
+  `!analyze -v`（符号经代理从 MS 服务器拉取）——0x50 转储全栈还原：
+  `KeBugCheckEx ← MiZeroFault ← MiUserFault ← MmAccessFault ← KiPageFault ←
+  memcpy+0xf ← MmCopyVirtualMemory+0x33a ← MiReadWriteVirtualMemory ←
+  **NtReadVirtualMemory** ← KiSystemServiceCopyEnd`，PROCESS_NAME =
+  powershell.exe。**崩溃 = WPM readback（NtReadVirtualMemory 的 memcpy）在
+  系统别名 VA（0xFFFFB85C2E03F400，系统 PTE 区段）上读到 fake NCr3 状态后、
+  cpl=0 read fault 走进"反射 #PF"分支 → 内核态注入 = 0x50。**
+- **结论**：206c6f 的 v2 写路径（NCr3=alt 落影子）**没有问题**——缺的是读
+  路径：cpl=0 的 NPF（读/写都算）在武装页上绝不能注入 #PF。
+- **C6 v3（206c7b，SHA256 见归档）**：①恢复 9.280 v2 双 NPT 全套（9.281 回退
+  临时撤下）；②新增 **cpl=0 read-fault 假读路径**：非写 NPF 且 cpl=0 且命中
+  武装页（`yghv_protect_find_page_bare`，岛内无锁查找）且 fake 模式 →
+  NCr3=alt + TF + rearm|1 → 读返回影子内容（= 写者自己写入的字节——readback
+  假成功幻觉完备：作弊者读回自己写的值，真页数据不变）；③cpl=3 读 fault 与
+  未知页保持反射路径（guest 用户态 #PF 自行处理）。
+- 附带：kd 取证 batch 模板 `C:\aaaaaavm\kd_c6f.bat`（符号路径+代理+logo），
+  后续所有蓝屏先过 kd 再判读。
+- 构建：206 + default 双绿，marker 验证。镜像 md5 `da50ee8d` 归档
+  `D:\aaaaaavm\yuanguard_hv_step206c7b_20261011.sys`。run_c18 哈希门 =
+  DA50EE8D。**本地提交（b2e7203），未推送，未加载。**
+- **下一轮（等用户允许加载）**：run_c18 四 gate。gate1 判据修正：readback =
+  写入值（假读幻觉）或目标旧值（读走主 NPT）均可——**真页不变的判据移至
+  gate2 的 mmf-write current 读数**（必须仍是目标的 0x00C4C4… 序列）。
+- 提交：本记录。
