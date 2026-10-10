@@ -873,8 +873,12 @@ try {
                 while ((Get-Date) -lt $deadline) {
                     $i++
                     $val = [long]0x00C4C40000000000 + $i
-                    [YghvMmf]::WriteVal($map.View, $val)
-                    Write-Host ("mmf-loop: wrote i={0} val=0x{1:X}" -f $i, $val)
+                    try {
+                        [YghvMmf]::WriteVal($map.View, $val)
+                        Write-Host ("mmf-loop: wrote i={0} val=0x{1:X}" -f $i, $val)
+                    } catch [System.AccessViolationException] {
+                        Write-Host ("mmf-loop: i={0} WRITE AVE" -f $i)
+                    }
                     Start-Sleep -Milliseconds 400
                 }
             } finally {
@@ -887,20 +891,34 @@ try {
             # page is armed this must come back BLOCKED (DENY -> injected #PF
             # -> AccessViolationException caught in TryWrite). After the
             # target dies and the watchdog disarms, the same command must
-            # report LANDED.
+            # report LANDED. 9.284: every access is CSE-guarded and AVEs are
+            # reported (never fatal) so the fake-state read behavior is fully
+            # visible in the output.
             if ($null -eq $Arg1) { throw 'mmf-write: usage: mmf-write <path>' }
             $map = [YghvMmf]::MapFile($Arg1, [uint32]4096)
             try {
-                $before = [YghvMmf]::ReadVal($map.View)
-                Write-Host ("mmf-write: pid={0} va=0x{1:X} current=0x{2:X}" -f
-                    [YghvCtlNative]::GetCurrentProcessId(),
-                    $map.View.ToInt64(), $before)
-                $r = [YghvMmf]::TryWrite($map.View, [long]0xDEADBEEF00000001)
-                if ($r -eq 'BLOCKED') {
-                    $after = [YghvMmf]::ReadVal($map.View)
-                    Write-Host ("mmf-write: BLOCKED (value still 0x{0:X})" -f $after)
-                } else {
-                    Write-Host 'mmf-write: LANDED'
+                try {
+                    $before = [YghvMmf]::ReadVal($map.View)
+                    Write-Host ("mmf-write: pid={0} va=0x{1:X} current=0x{2:X}" -f
+                        [YghvCtlNative]::GetCurrentProcessId(),
+                        $map.View.ToInt64(), $before)
+                } catch [System.AccessViolationException] {
+                    Write-Host ('mmf-write: current READ AVE (pre-write)')
+                }
+                try {
+                    $r = [YghvMmf]::TryWrite($map.View, [long]0xDEADBEEF00000001)
+                    if ($r -eq 'BLOCKED') {
+                        try {
+                            $after = [YghvMmf]::ReadVal($map.View)
+                            Write-Host ("mmf-write: BLOCKED (value still 0x{0:X})" -f $after)
+                        } catch [System.AccessViolationException] {
+                            Write-Host 'mmf-write: BLOCKED (post-read AVE)'
+                        }
+                    } else {
+                        Write-Host 'mmf-write: LANDED'
+                    }
+                } catch [System.AccessViolationException] {
+                    Write-Host 'mmf-write: WRITE AVE (uncaught by TryWrite)'
                 }
             } finally {
                 [YghvMmf]::UnmapFile($map)
