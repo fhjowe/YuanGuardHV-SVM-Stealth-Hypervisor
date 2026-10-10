@@ -740,13 +740,18 @@ int yghv_protect_fake_mode_get(void) {
 
 static volatile LONG g_fake_attempts;   /* cpl=0 verdicts entering the check */
 static volatile LONG g_fake_ok;
-static volatile LONG g_fake_last_reject;/* 1=mode 2=scratch 3=busy 4=entry 5=map */
+static volatile LONG g_fake_restores;   /* 9.279: fake_restore counter */
+static volatile LONG g_fake_seq;        /* consecutive fakes w/o a #DB restore */
+static volatile LONG g_fake_last_reject;/* 1=mode 2=scratch 3=busy 4=entry 5=map 6=runaway */
 
-void yghv_protect_fake_diag(UINT64 out[4]) {
+#define YGHV_FAKE_SEQ_CAP 1048576L
+
+void yghv_protect_fake_diag(UINT64 out[5]) {
     out[0] = (UINT64)InterlockedCompareExchange(&g_fake_mode, 0, 0);
     out[1] = (UINT64)InterlockedCompareExchange(&g_fake_attempts, 0, 0);
     out[2] = (UINT64)InterlockedCompareExchange(&g_fake_ok, 0, 0);
     out[3] = (UINT64)InterlockedCompareExchange(&g_fake_last_reject, 0, 0);
+    out[4] = (UINT64)InterlockedCompareExchange(&g_fake_restores, 0, 0);
 }
 
 int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
@@ -754,6 +759,14 @@ int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
     ULONG i;
     int st;
     InterlockedIncrement(&g_fake_attempts);
+    /* 9.279: runaway cap — if the same write keeps faking without its #DB
+     * restore ever firing (the c6c livelock shape), fail OPEN (ALLOW) instead
+     * of spinning: the seq counter resets on every restore, so a healthy
+     * per-store cycle never reaches the cap, but a broken cycle self-limits. */
+    if (InterlockedCompareExchange(&g_fake_seq, 0, 0) > YGHV_FAKE_SEQ_CAP) {
+        InterlockedExchange(&g_fake_last_reject, 6);
+        return 0;
+    }
     if (!InterlockedCompareExchange(&g_fake_mode, 0, 0)) {
         InterlockedExchange(&g_fake_last_reject, 1);
         return 0;
@@ -798,6 +811,7 @@ int yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out) {
         if (g_vcpus[i])
             g_vcpus[i]->npt_flush_pending = 1;
     InterlockedIncrement(&g_fake_ok);
+    InterlockedIncrement(&g_fake_seq);
     *rearm_out = gpa | 1ULL;               /* bit0 = fake, #DB restores */
     return 1;
 }
@@ -808,6 +822,8 @@ void yghv_protect_fake_restore(uint64_t gpa) {
         (void)npt_write_entry(&g_npt, gpa, g_fake_saved);
         g_fake_gpa = 0;
         g_fake_saved = 0;
+        InterlockedExchange(&g_fake_seq, 0);   /* healthy cycle closed */
+        InterlockedIncrement(&g_fake_restores);
         for (i = 0; i < SVM_MAX_CORES; i++)
             if (g_vcpus[i])
                 g_vcpus[i]->npt_flush_pending = 1;

@@ -817,10 +817,11 @@ try {
             # scratch page (writer sees success, real page untouched).
             # No arg = read diagnostics {mode, attempts, ok, last_reject}.
             if ($null -eq $Arg1) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x812)) -OutputLength 32
-                Write-Host ("config-fake: mode={0} attempts={1} ok={2} last_reject={3}" -f
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x812)) -OutputLength 40
+                Write-Host ("config-fake: mode={0} attempts={1} ok={2} last_reject={3} restores={4}" -f
                     [BitConverter]::ToUInt64($out, 0), [BitConverter]::ToUInt64($out, 8),
-                    [BitConverter]::ToUInt64($out, 16), [BitConverter]::ToUInt64($out, 24))
+                    [BitConverter]::ToUInt64($out, 16), [BitConverter]::ToUInt64($out, 24),
+                    [BitConverter]::ToUInt64($out, 32))
             } else {
                 $val = [uint32]::Parse($Arg1)
                 if ($val -gt 1) { throw 'config-fake: must be 0 or 1' }

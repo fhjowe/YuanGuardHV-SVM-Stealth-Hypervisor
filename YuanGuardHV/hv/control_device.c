@@ -379,10 +379,10 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
          * (cpl=0, non-target CR3). Default OFF. Dual mode: 4-byte input sets
          * the flag; zero-length input reads diagnostics {mode, attempts, ok,
          * last_reject} (9.277). */
-        if (in_len == 0 && out_len >= 32) {
+        if (in_len == 0 && out_len >= 40) {
             UINT64 *out = (UINT64 *)buf;
             yghv_protect_fake_diag(out);
-            info = 32;
+            info = 40;
             break;
         }
         if (in_len >= sizeof(yghv_ioctl_fake_mode_t)) {
