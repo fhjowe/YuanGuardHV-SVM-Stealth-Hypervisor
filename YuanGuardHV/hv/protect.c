@@ -158,6 +158,7 @@ static volatile LONG g_fake_attempts;
 static volatile LONG g_fake_ok;
 static volatile LONG g_fake_restores;
 static volatile LONG g_fake_last_reject; /* 1=mode 2=alt 0=ok */
+static volatile LONG g_fake_alt_active;  /* a core is running on the alt NPT */
 static PVOID yghv_protect_fake_scratch_for(uint64_t gpa);
 
 static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
@@ -815,6 +816,10 @@ void yghv_protect_fake_mode_set(int on) {
 
 UINT64 yghv_protect_fake_alt_pa(void) {
     return g_npt_alt_ready ? g_npt_alt.pml4_pa : 0;
+}
+
+LONG yghv_protect_fake_alt_active(void) {
+    return InterlockedCompareExchange(&g_fake_alt_active, 0, 0);
 }
 
 UINT64 yghv_protect_fake_main_pa(void) {

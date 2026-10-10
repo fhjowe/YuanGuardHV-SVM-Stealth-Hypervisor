@@ -1279,24 +1279,29 @@ SvHandleVmExit (
                 }
 
                 if (vr == 1 /* YGHV_NPF_ALLOW */ ||
-                    vr == 3 /* YGHV_NPF_FAKE: shadow remap done, TF +
-                    rearm|1 -> #DB restores the saved entry */)
+                    vr == 3 /* YGHV_NPF_FAKE (C6 v4): the cpp switches this
+                    core's NCr3 to the alt NPT below and the WHOLE copy runs
+                    shadowed until the next CR3 write (context switch) */)
                 {
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
                     if (vr == 3 /* YGHV_NPF_FAKE */) {
-                        /* C6 v2: switch this core's NCr3 to the alt NPT —
-                         * a DIFFERENT nCr3 value architecturally flushes the
-                         * NPT TLB, so the scratch mapping is visible and the
-                         * store lands in the page's shadow buffer.
-                         * 9.285: VmcbClean=0 — the CPU caches nCr3 across
-                         * VMRUNs unless the clean bits are invalidated; the
-                         * c6e/c7c runs proved the bare NCr3 write was
-                         * swallowed (1.47M/7.1e8 re-faults, restores=0). */
+                        /* C6 v4: switch this core's NCr3 to the alt NPT — a
+                         * DIFFERENT nCr3 value architecturally flushes the
+                         * NPT TLB, so the armed page's scratch mapping is
+                         * visible and the copy's stores land in the shadow.
+                         * 9.285: VmcbClean=0 forces the CPU to reload the
+                         * field (the bare write was cache-swallowed). */
                         UINT64 altPa = yghv_protect_fake_alt_pa();
                         if (altPa) {
                             VpData->GuestVmcb.ControlArea.NCr3 = altPa;
                             VpData->GuestVmcb.ControlArea.VmcbClean = 0;
                         }
+                        /* 9.285 (C6 v4): NO TF — the window closes at the
+                         * next CR3 write (context switch), not per store;
+                         * the whole copy runs shadowed on alt. */
+                        VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
+                        g_S206LastProtectHit = gpa;
+                        break;
                     }
                     VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
                     // 9.254: KEEP the saved RIP. For an NPF exit the trapped
