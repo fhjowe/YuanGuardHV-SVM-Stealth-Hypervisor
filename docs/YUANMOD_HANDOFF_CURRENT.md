@@ -5768,3 +5768,24 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   到 WPM 自己的字节）+ 零重故障旋（diag attempts ≈ 10 量级而非百万）+ gate2
   current=写入值（同核 alt 驻留读影子）或目标序列（已切回）+ gate3 真落地。
 - 提交：本记录。
+
+### 9.290 2026-10-11 run_c18×206c9 判读：C6 假写最终定论（功能达成/性能不可接受/需要 KD；本地提交未推送）
+
+- **206c9（v3+INVLPGA）结果**：gate1 WPM WROTE + readback=0xC4C4…2A（目标旧
+  值 = 真页无损 ✓）——但 **WPM 自旋 92 秒**（1.05M 次重故障）耗尽目标的 90s
+  窗口 → mmf-loop 超时退出 → gate3 OpenProcess err 87 连锁失败；gate2 的
+  mmf-write 恰好被调度到 **alt 残留核**（NCr3=alt 泄漏）：`current=OK
+  0xC4C40000000039`（读→scratch = 目标最新值 ✓）、`LANDED`（写→scratch|RW
+  **无 NPF 直接落影子被吞**——假成功幻觉 ✓ 真页无损 ✓）；gate4 ✓；卸载干净。
+- **根因闭环（五轮迭代的最终结论）**：**Zen3 的 NPT 翻译缓存（GPA→HPA）不随
+  TlbControl=1、nCr3 切换、甚至 INVLPGA（对已知 GVA target_va）失效**——唯一
+  有效时机 = 自然 TLB 逐出。INVLPGA 对 pool-copy 形态无效的原因 = 拷贝走系统
+  别名 VA（GVA 未知，无法按页冲刷）。**与 APM 文档语义不符，属 CPU 微架构/
+  errata 级问题，需要内核调试器单步 NPF 路径的 TLB 行为才能继续。**
+- **C6 v4/v5 定性：功能达成（真页无损 ✓ 假成功幻觉 ✓ cpl=3 全拒 ✓ 看门狗 ✓
+  卸载 ✓），性能不可接受（自旋延迟 92s），需 KD 环境**。当前稳定镜像 =
+  206c7e（md5 356c5b6b，假写默认关、无假写时零影响）。206c9 归档保留（诊断
+  设施完整）。
+- **C6 冻结。** 重启恢复由用户操作（驱动已在脚本里卸载）。下一步：真实产品
+  目标流程化，或推送 GitHub（等用户指示）。
+- 提交：本记录。
