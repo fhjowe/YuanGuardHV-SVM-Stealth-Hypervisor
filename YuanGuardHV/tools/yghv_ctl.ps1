@@ -232,6 +232,25 @@ public static class YghvMmf
         v.View = v.Map = v.File = IntPtr.Zero;
     }
 
+    /* 9.286: the AVE must be caught INSIDE this C# frame — PowerShell's
+     * dynamic call site cannot catch cross-boundary AVEs even with the CSE
+     * attributes (the mmf-write child died unhandled in run_c18). */
+    [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
+    [System.Security.SecurityCritical]
+    public static string TryRead(IntPtr view, out long value)
+    {
+        try
+        {
+            value = Marshal.ReadInt64(view);
+            return "OK";
+        }
+        catch (AccessViolationException)
+        {
+            value = 0;
+            return "AVE";
+        }
+    }
+
     /* 9.284: CSE-protected — a read right after a DENY-injected #PF can
      * still catch an in-flight AV; without the attribute the mmf-write
      * child dies unhandled before printing BLOCKED (run_c18 gate2). */
@@ -897,23 +916,18 @@ try {
             if ($null -eq $Arg1) { throw 'mmf-write: usage: mmf-write <path>' }
             $map = [YghvMmf]::MapFile($Arg1, [uint32]4096)
             try {
-                try {
-                    $before = [YghvMmf]::ReadVal($map.View)
-                    Write-Host ("mmf-write: pid={0} va=0x{1:X} current=0x{2:X}" -f
-                        [YghvCtlNative]::GetCurrentProcessId(),
-                        $map.View.ToInt64(), $before)
-                } catch [System.AccessViolationException] {
-                    Write-Host ('mmf-write: current READ AVE (pre-write)')
-                }
+                $before = 0L
+                $st1 = [YghvMmf]::TryRead($map.View, [ref]$before)
+                Write-Host ("mmf-write: pid={0} va=0x{1:X} current={2} 0x{3:X}" -f
+                    [YghvCtlNative]::GetCurrentProcessId(),
+                    $map.View.ToInt64(), $st1, $before)
                 try {
                     $r = [YghvMmf]::TryWrite($map.View, [long]0xDEADBEEF00000001)
                     if ($r -eq 'BLOCKED') {
-                        try {
-                            $after = [YghvMmf]::ReadVal($map.View)
-                            Write-Host ("mmf-write: BLOCKED (value still 0x{0:X})" -f $after)
-                        } catch [System.AccessViolationException] {
-                            Write-Host 'mmf-write: BLOCKED (post-read AVE)'
-                        }
+                        $after = 0L
+                        $st2 = [YghvMmf]::TryRead($map.View, [ref]$after)
+                        Write-Host ("mmf-write: BLOCKED (post-read {0} 0x{1:X})" -f
+                            $st2, $after)
                     } else {
                         Write-Host 'mmf-write: LANDED'
                     }
