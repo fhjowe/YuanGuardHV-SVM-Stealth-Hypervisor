@@ -5722,3 +5722,24 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   ④run_c18 的 gate1 Say 行重复（cosmetic）。
 - **C6 正式关闭。** 当前稳定镜像 = 206c7e（md5 356c5b6b）。本地提交未推送。
 - 提交：本记录。
+
+### 9.288 2026-10-11 C6 v5：NCr3 残留清理（CPUID VPD leaf + per-core resync；镜像 206c8a/md5 267e14ea；本地提交未推送；未加载）
+
+- **v5 内容**：①新 CPUID leaf `CPUID_FAKE_VPD`='SSV1'(0x41414142)：内核态
+  （DPL 检查）返回 EDX:EAX = 该核 VPD PA，**不去虚拟化**；②
+  `SvFakeNcr3Resync`：per-core 回调（SvExecuteOnEachProcessor）经该 leaf 取
+  VPD → NCr3==alt 的核切回 main + VmcbClean=0；③config-fake 0 →
+  `yghv_protect_fake_ncr3_resync()` 清全部核的 NCr3 残留——**gate3 的
+  readback 0x12B 残留（WPM 线程核滞留 alt）自愈**。
+- **陷阱两连（均已规避）**：①default 构建 LNK2019（resync 定义在 206-only 的
+  vendored TU）→ 调用点 `#if STEP==206` 门控；②首个 commit 误入遗留脚本
+  apply_v5.py → 已清除。npt_cleanup 双重释放修复（9.283）与 npt 表 VA 直接
+  持有重构（9.280）一并保留。
+- 构建：206 + default 双绿，marker 验证。镜像 SHA256 `0a6c2330…`（md5
+  `267e14ea`）归档 `D:\aaaaaavm\yuanguard_hv_step206c8a_20261011.sys`。
+  run_c18 哈希门未改（206c7e 名义——**注意：重跑前需把 run_c18 的
+  Copy-Item/哈希门更新为 206c8a/267E14EA**，或手动拷贝覆盖）。
+- **下一轮（等用户允许加载）**：run_c18（部署 206c8a）四 gate + **gate3
+  readback 应=写入值（NCr3 残留已清，readback 不再 0x12B）**→ C6 v5 完整
+  PASS。
+- 提交：本记录。
