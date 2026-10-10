@@ -810,6 +810,13 @@ void yghv_protect_fake_mode_set(int on) {
             }
         }
         LOG_ERROR("protect fake mode: 0");
+        /* 9.288 (C6 v5): clear the per-core NCr3 residue - any core still on
+         * the alt NPT switches back to main at its next VMRUN. The definition
+         * lives in the 206-only vendored TU - gate the call (LNK2019 in the
+         * default build otherwise). */
+#if defined(YGHV_BAREMETAL_STEP) && (YGHV_BAREMETAL_STEP == 206)
+        yghv_protect_fake_ncr3_resync();
+#endif
     }
     InterlockedExchange(&g_fake_mode, on ? 1 : 0);
 }

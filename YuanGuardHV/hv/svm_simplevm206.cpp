@@ -397,6 +397,9 @@ typedef struct _GUEST_CONTEXT
 // SimpleSVM specific constants.
 //
 #define CPUID_UNLOAD_SIMPLE_SVM     0x41414141
+// 9.288 (C6 v5): returns EDX:EAX = the per-core VPD physical address WITHOUT
+// de-virtualizing (kernel-mode only; used by the fake-write NCr3 resync).
+#define CPUID_FAKE_VPD              0x41414142
 #define CPUID_HV_MAX                CPUID_HV_INTERFACE
 
 /*!
@@ -662,6 +665,24 @@ SvHandleCpuid (
         //
         registers[0] = '0#vH';  // Hv#0
         registers[1] = registers[2] = registers[3] = 0;
+        break;
+    case CPUID_FAKE_VPD:
+        //
+        // 9.288 (C6 v5): return EDX:EAX = this core's VPD PA without
+        // de-virtualizing. Kernel mode only (the fake-write resync runs at
+        // APC_LEVEL from yghv's control plane).
+        //
+        if (subLeaf == CPUID_FAKE_VPD)
+        {
+            attribute.AsUInt16 = VpData->GuestVmcb.StateSaveArea.SsAttrib;
+            if (attribute.Fields.Dpl == DPL_SYSTEM)
+            {
+                PHYSICAL_ADDRESS vpdPa;
+                vpdPa = MmGetPhysicalAddress(VpData);
+                registers[3] = static_cast<int>(vpdPa.HighPart);
+                registers[0] = static_cast<int>(vpdPa.LowPart);
+            }
+        }
         break;
     case CPUID_UNLOAD_SIMPLE_SVM:
         if (subLeaf == CPUID_UNLOAD_SIMPLE_SVM)
@@ -2217,6 +2238,51 @@ _IRQL_requires_max_(DISPATCH_LEVEL)
 _IRQL_requires_min_(PASSIVE_LEVEL)
 _IRQL_requires_same_
 _Check_return_
+/* 9.288 (C6 v5): per-core NCr3 residue clear — runs on each core via
+ * SvExecuteOnEachProcessor at the config-fake disable time. The core's VPD
+ * is obtained via the CPUID_FAKE_VPD leaf (no de-virtualization). */
+static
+NTSTATUS
+SvFakeNcr3Resync (
+    _In_opt_ PVOID Context
+    )
+{
+    int registers[4];   // EAX, EBX, ECX, and EDX
+    UINT64 high, low;
+    PVIRTUAL_PROCESSOR_DATA vpData;
+
+    UNREFERENCED_PARAMETER(Context);
+
+    __cpuidex(registers, CPUID_FAKE_VPD, CPUID_FAKE_VPD);
+    if (registers[2] != '1VSS')
+    {
+        goto Exit;
+    }
+    high = registers[3];
+    low = registers[0] & MAXUINT32;
+    vpData = reinterpret_cast<PVIRTUAL_PROCESSOR_DATA>(high << 32 | low);
+    if (vpData->GuestVmcb.ControlArea.NCr3 ==
+        yghv_protect_fake_alt_pa())
+    {
+        vpData->GuestVmcb.ControlArea.NCr3 =
+            yghv_protect_fake_main_pa();
+        vpData->GuestVmcb.ControlArea.VmcbClean = 0;
+    }
+Exit:
+    return STATUS_SUCCESS;
+}
+
+extern "C"
+VOID
+yghv_protect_fake_ncr3_resync (
+    VOID
+    )
+{
+    NT_VERIFY(NT_SUCCESS(SvExecuteOnEachProcessor(SvFakeNcr3Resync,
+                                                  nullptr,
+                                                  nullptr)));
+}
+
 static
 NTSTATUS
 SvDevirtualizeProcessor (
