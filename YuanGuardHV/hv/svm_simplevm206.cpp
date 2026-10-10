@@ -44,6 +44,11 @@ extern "C" {
 int yghv_protect_on_npf_write_bare(UINT64 guest_cr3, UINT32 cpl,
                                    UINT64 gpa, UINT64 *rearm_gpa, int *flip);
 int yghv_protect_arm_page_bare(UINT64 gpa);
+void *yghv_protect_find_page_bare(UINT64 gpa);
+int yghv_protect_fake_bare(UINT64 gpa, UINT64 *rearm_out);
+void yghv_protect_fake_restore(UINT64 gpa);
+UINT64 yghv_protect_fake_alt_pa(void);
+UINT64 yghv_protect_fake_main_pa(void);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 UINT64 yghv_protect_control_walk_gpa(void);
@@ -1232,6 +1237,29 @@ SvHandleVmExit (
                 g_S206NpfIdx++;
             }
 
+            /* 9.282 (C6 v3): cpl=0 NPFs on ARMED pages must NEVER inject #PF
+             * (kernel-mode injection = 0x50 bugcheck — the 206c6f crash was
+             * the WPM readback's NtReadVirtualMemory memcpy hitting the fake
+             * NCr3 state and taking the reflect branch: READ faults on armed
+             * pages reach here too and the old code reflected them). Route
+             * cpl=0 read faults through the fake path: NCr3=alt makes the
+             * read return the scratch content (the writer's own bytes — a
+             * perfect fake-success illusion for readbacks), TF fires #DB and
+             * the handler switches NCr3 back to main. cpl=3 read faults and
+             * unknown pages keep the reflect path (guest handles user #PFs). */
+            if (!writeFault &&
+                VpData->GuestVmcb.StateSaveArea.Cpl == 0 &&
+                yghv_protect_find_page_bare(gpa) != NULL &&
+                yghv_protect_fake_bare(gpa, &rearmGpa)) {
+                UINT64 altPa = yghv_protect_fake_alt_pa();
+                VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                if (altPa)
+                    VpData->GuestVmcb.ControlArea.NCr3 = altPa;
+                VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = gpa | 1ULL;
+                VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
+                break;
+            }
+
             if (writeFault)
             {
                 int vr = yghv_protect_on_npf_write_bare(
@@ -1250,9 +1278,20 @@ SvHandleVmExit (
                     g_S206VrIdx += 2;
                 }
 
-                if (vr == 1 /* YGHV_NPF_ALLOW */)
+                if (vr == 1 /* YGHV_NPF_ALLOW */ ||
+                    vr == 3 /* YGHV_NPF_FAKE: shadow remap done, TF +
+                    rearm|1 -> #DB restores the saved entry */)
                 {
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    if (vr == 3 /* YGHV_NPF_FAKE */) {
+                        /* C6 v2: switch this core's NCr3 to the alt NPT —
+                         * a DIFFERENT nCr3 value architecturally flushes the
+                         * NPT TLB, so the scratch mapping is visible and the
+                         * store lands in the page's shadow buffer. */
+                        UINT64 altPa = yghv_protect_fake_alt_pa();
+                        if (altPa)
+                            VpData->GuestVmcb.ControlArea.NCr3 = altPa;
+                    }
                     VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
                     // 9.254: KEEP the saved RIP. For an NPF exit the trapped
                     // write did NOT execute and saved RIP points AT it; the
@@ -1498,8 +1537,19 @@ SvHandleVmExit (
             }
             VpData->GuestVmcb.ControlArea.TlbControl = 1;
             if (VpData->GuestVmcb.ControlArea.GuestPaOfGhcb != 0) {
-                yghv_protect_arm_page_bare(
-                    VpData->GuestVmcb.ControlArea.GuestPaOfGhcb);
+                UINT64 slot = VpData->GuestVmcb.ControlArea.GuestPaOfGhcb;
+                /* 9.275: bit0 set = fake-write shadow (C6) — restore the
+                 * saved real NPT entry instead of plain re-arm. */
+                if (slot & 1ULL) {
+                    /* C6 v2: switch NCr3 back to main (different value =
+                     * architectural NPT TLB flush) before resuming. */
+                    VpData->GuestVmcb.ControlArea.NCr3 =
+                        yghv_protect_fake_main_pa();
+                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    yghv_protect_fake_restore(slot & ~1ULL);
+                } else {
+                    yghv_protect_arm_page_bare(slot);
+                }
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
             }
             VpData->GuestVmcb.StateSaveArea.Rflags &= ~0x100ULL; /* clear TF */

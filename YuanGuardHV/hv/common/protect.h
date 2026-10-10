@@ -111,6 +111,8 @@ typedef enum {
     YGHV_NPF_NONE = 0,
     YGHV_NPF_ALLOW,
     YGHV_NPF_DENY,
+    YGHV_NPF_FAKE = 3,   /* 9.275 C6: shadow fake-write (foreign cpl=0 write
+                            redirected to a scratch page; vr ring shows 3) */
 } yghv_npf_result_t;
 
 NTSTATUS yghv_protect_init(void);
@@ -124,6 +126,7 @@ NTSTATUS yghv_protect_remove_page_for(uint64_t cr3, uint64_t target_va);
 NTSTATUS yghv_protect_add_page_for_pid(uint32_t pid, uint64_t target_va);
 NTSTATUS yghv_protect_remove_page_for_pid(uint32_t pid, uint64_t target_va);
 yghv_protect_page_t *yghv_protect_find_page(uint64_t gpa);
+yghv_protect_page_t *yghv_protect_find_page_bare(uint64_t gpa);   /* 9.282: lock-free, island-safe */
 int yghv_protect_arm_page(yghv_protect_page_t *p);
 int yghv_protect_disarm_page(yghv_protect_page_t *p);
 uint64_t yghv_protect_guest_va_to_pa(uint64_t cr3, uint64_t va);
@@ -138,6 +141,12 @@ yghv_npf_result_t yghv_protect_on_npf_write(svm_vcpu_t *vcpu, uint64_t gpa);
 yghv_npf_result_t yghv_protect_on_npf_write_bare(uint64_t guest_cr3, uint32_t cpl, uint64_t gpa, uint64_t *rearm_gpa_out, int *flip_out);
 int yghv_protect_arm_page_bare(uint64_t gpa);
 void yghv_protect_reopen_page_bare(uint64_t gpa);
+void yghv_protect_fake_init(void);
+int  yghv_protect_fake_mode_get(void);
+void yghv_protect_fake_mode_set(int on);
+int  yghv_protect_fake_bare(uint64_t gpa, uint64_t *rearm_out);
+void yghv_protect_fake_restore(uint64_t gpa);
+void yghv_protect_fake_diag(UINT64 out[5]);
 uint64_t yghv_protect_control_walk_gpa(void);
 void yghv_protect_on_process_exit(uint32_t pid);
 void yghv_protect_rearm(svm_vcpu_t *vcpu);

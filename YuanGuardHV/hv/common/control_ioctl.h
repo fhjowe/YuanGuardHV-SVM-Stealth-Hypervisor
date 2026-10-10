@@ -46,6 +46,8 @@
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x810, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 #define IOCTL_YGHV_REMOVE_PAGE_FOR_PID \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x811, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+#define IOCTL_YGHV_SET_FAKE_MODE \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x812, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
@@ -64,6 +66,11 @@ typedef struct {
     ULONG pid;
     ULONG_PTR target_va;
 } yghv_ioctl_va_pid_t;
+
+/* 9.275 C6: fake-write shadow mode (0 = off, 1 = on). */
+typedef struct {
+    ULONG enable;
+} yghv_ioctl_fake_mode_t;
 
 typedef struct {
     ULONG active;

@@ -3,8 +3,11 @@
 #include "debug.h"
 /* YGHV_DEBUG_LOG is provided by build.bat; do not redefine locally. */
 
-typedef struct { npt_entry_t *pdpt_va[512]; npt_entry_t *pd_va[512]; } npt_cached_t;
-static npt_cached_t *g_cache = NULL;
+/* 9.280 (C6 v2): every table this mgr allocates keeps its DIRECT VA recorded
+ * (pdpt_va/pd_va for the identity map's p4==0 layout, pt_reg for split PTs).
+ * Table access NEVER goes through MmGetVirtualForPhysical (selectively broken
+ * on this build: 9.271-9.273). MmAllocateContiguousMemory keeps table PAs
+ * under 4GB; the direct-map-free design makes the alt-NPT clone safe. */
 
 static npt_entry_t *npt_alloc_table(void) {
     npt_entry_t*t=(npt_entry_t*)MmAllocateContiguousMemory(HV_PAGE_SIZE,(PHYSICAL_ADDRESS){.QuadPart=0xFFFFFFFF});
@@ -14,6 +17,7 @@ static uint64_t npt_va_to_pa(void*va){return MmGetPhysicalAddress(va).QuadPart;}
 
 static npt_entry_t *npt_get_pdpt(npt_mgr_t *m, uint32_t p4) {
     if (!m || !m->pml4_va || !m->pml4_va[p4].present) return NULL;
+    if (p4 < 512 && m->pdpt_va[p4]) return m->pdpt_va[p4];
     return (npt_entry_t*)MmGetVirtualForPhysical(
         (PHYSICAL_ADDRESS){ .QuadPart = (uint64_t)m->pml4_va[p4].pfn << 12 });
 }
@@ -21,24 +25,35 @@ static npt_entry_t *npt_get_pdpt(npt_mgr_t *m, uint32_t p4) {
 static npt_entry_t *npt_get_pd(npt_mgr_t *m, uint32_t p4, uint32_t p2) {
     npt_entry_t *pdpt = npt_get_pdpt(m, p4);
     if (!pdpt || !pdpt[p2].present) return NULL;
+    if (p4 == 0 && p2 < 512 && m->pd_va[p2]) return m->pd_va[p2];
     return (npt_entry_t*)MmGetVirtualForPhysical(
         (PHYSICAL_ADDRESS){ .QuadPart = (uint64_t)pdpt[p2].pfn << 12 });
 }
 
 static npt_entry_t *npt_get_pt(npt_mgr_t *m, uint32_t p4, uint32_t p2, uint32_t p1) {
     npt_entry_t *pd = npt_get_pd(m, p4, p2);
+    uint32_t i;
+    uint64_t pt_pa;
     if (!pd || !pd[p1].present || pd[p1].large_page) return NULL;
+    pt_pa = (uint64_t)pd[p1].pfn << 12;
+    for (i = 0; i < m->pt_reg_count; i++)
+        if (m->pt_reg[i].pa == pt_pa) return m->pt_reg[i].va;
     return (npt_entry_t*)MmGetVirtualForPhysical(
-        (PHYSICAL_ADDRESS){ .QuadPart = (uint64_t)pd[p1].pfn << 12 });
+        (PHYSICAL_ADDRESS){ .QuadPart = (LONGLONG)pt_pa });
+}
+
+static void npt_reg_pt(npt_mgr_t *m, uint64_t pa, npt_entry_t *va) {
+    if (m->pt_reg_count < 256) {
+        m->pt_reg[m->pt_reg_count].pa = pa;
+        m->pt_reg[m->pt_reg_count].va = va;
+        m->pt_reg_count++;
+    }
 }
 
 int npt_init(npt_mgr_t*m,uint64_t mp){
     RtlZeroMemory(m,sizeof(*m));
-    g_cache=(npt_cached_t*)ExAllocatePoolWithTag(NonPagedPool,sizeof(npt_cached_t),YGHV_TAG);
-    if(!g_cache)return STATUS_INSUFFICIENT_RESOURCES;
-    RtlZeroMemory(g_cache,sizeof(npt_cached_t));
     m->pml4_va=npt_alloc_table();
-    if(!m->pml4_va){ExFreePool(g_cache);g_cache=NULL;return STATUS_INSUFFICIENT_RESOURCES;}
+    if(!m->pml4_va)return STATUS_INSUFFICIENT_RESOURCES;
     m->pml4_pa=npt_va_to_pa(m->pml4_va);
     if(mp)return npt_identity_map_range(m,0,mp);
     return STATUS_SUCCESS;
@@ -53,16 +68,20 @@ int npt_identity_map_range(npt_mgr_t*m,uint64_t s,uint64_t e){
             npt_entry_t*d=npt_alloc_table();
             if(!d)return STATUS_INSUFFICIENT_RESOURCES;
             m->pml4_va[p4].all=npt_va_to_pa(d)|NPT_4K_PAGE_FLAGS;
-            g_cache->pdpt_va[p4]=d;
+            if(p4<512)m->pdpt_va[p4]=d;
         }
-        npt_entry_t*d=g_cache->pdpt_va[p4];
+        npt_entry_t*d=(p4<512)?m->pdpt_va[p4]:NULL;
+        if(!d){
+            d=(npt_entry_t*)MmGetVirtualForPhysical((PHYSICAL_ADDRESS){.QuadPart=(uint64_t)m->pml4_va[p4].pfn<<12});
+            if(!d)continue;
+        }
         if(!d[p2].present){
             npt_entry_t*e2=npt_alloc_table();
             if(!e2)return STATUS_INSUFFICIENT_RESOURCES;
             d[p2].all=npt_va_to_pa(e2)|NPT_4K_PAGE_FLAGS;
-            if(p4==0&&p2<512)g_cache->pd_va[p2]=e2;
+            if(p4==0&&p2<512)m->pd_va[p2]=e2;
         }
-        npt_entry_t*e2=(p4==0&&p2<512)?g_cache->pd_va[p2]:NULL;
+        npt_entry_t*e2=(p4==0&&p2<512)?m->pd_va[p2]:NULL;
         if(!e2){
             e2=(npt_entry_t*)MmGetVirtualForPhysical((PHYSICAL_ADDRESS){.QuadPart=d[p2].pfn<<12});
             if(!e2)continue;
@@ -96,6 +115,7 @@ int npt_split_2mb_to_4kb(npt_mgr_t*m,uint64_t g){
         pt[i].all=(base_pa+((uint64_t)i<<12))|common;
     }
     pd[p1].all=npt_va_to_pa(pt)|NPT_4K_PAGE_FLAGS;
+    npt_reg_pt(m,pd[p1].pfn<<12,pt);
     return STATUS_SUCCESS;
 }
 
@@ -171,6 +191,22 @@ uint64_t npt_translate(npt_mgr_t*m,uint64_t g){
     return ((uint64_t)pt[p0].pfn<<12)|(g&0xFFF);
 }
 
+/* 9.275: raw-entry writeback (C6 fake-write shadow restore). Armed pages are
+ * always 4K (split before arm), so a large-page PDE here is an error. */
+int npt_write_entry(npt_mgr_t*m,uint64_t g,uint64_t v){
+    npt_entry_t *pd, *pt;
+    uint32_t p4=(uint32_t)NPT_PML4_INDEX(g),p2=(uint32_t)NPT_PDPT_INDEX(g),p1=(uint32_t)NPT_PD_INDEX(g),p0=(uint32_t)NPT_PT_INDEX(g);
+    if(!m||!m->pml4_va)return STATUS_INVALID_PARAMETER;
+    pd=npt_get_pd(m,p4,p2);
+    if(!pd)return STATUS_NOT_FOUND;
+    if(pd[p1].large_page)return STATUS_NOT_FOUND;
+    if(!pd[p1].present)return STATUS_NOT_FOUND;
+    pt=npt_get_pt(m,p4,p2,p1);
+    if(!pt)return STATUS_NOT_FOUND;
+    pt[p0].all=v;
+    return STATUS_SUCCESS;
+}
+
 uint64_t npt_read_entry(npt_mgr_t*m,uint64_t g){
     npt_entry_t *pd, *pt;
     uint32_t p4=(uint32_t)NPT_PML4_INDEX(g),p2=(uint32_t)NPT_PDPT_INDEX(g),p1=(uint32_t)NPT_PD_INDEX(g),p0=(uint32_t)NPT_PT_INDEX(g);
@@ -228,20 +264,26 @@ int npt_exclude_self(npt_mgr_t*m){
 }
 
 int npt_cleanup(npt_mgr_t*m){
-    uint32_t i,j,k;
-    if(g_cache){
+    /* 9.280: free via the recorded direct VAs (no MmGetVirtualForPhysical). */
+    uint32_t i;
+    if(m->pml4_va){
         for(i=0;i<512;i++){
-            npt_entry_t *pdpt=g_cache->pdpt_va[i];
+            npt_entry_t *pdpt=(i<512)?m->pdpt_va[i]:NULL;
+            uint32_t j;
             if(!pdpt)continue;
             for(j=0;j<512;j++){
-                if(pdpt[j].present){
-                    npt_entry_t *pd=(npt_entry_t*)MmGetVirtualForPhysical(
-                        (PHYSICAL_ADDRESS){ .QuadPart = (uint64_t)pdpt[j].pfn << 12 });
+                if(pdpt[j].present&&!pdpt[j].large_page){
+                    uint32_t k;
+                    /* PD VAs: recorded only for p4==0 (identity map scope) */
+                    npt_entry_t *pd=m->pd_va[j];
                     if(!pd)continue;
                     for(k=0;k<512;k++){
                         if(pd[k].present&&!pd[k].large_page){
-                            npt_entry_t *pt=(npt_entry_t*)MmGetVirtualForPhysical(
-                                (PHYSICAL_ADDRESS){ .QuadPart = (uint64_t)pd[k].pfn << 12 });
+                            uint32_t r;
+                            npt_entry_t *pt=NULL;
+                            uint64_t pt_pa=(uint64_t)pd[k].pfn<<12;
+                            for(r=0;r<m->pt_reg_count;r++)
+                                if(m->pt_reg[r].pa==pt_pa){pt=m->pt_reg[r].va;break;}
                             if(pt)MmFreeContiguousMemory(pt);
                         }
                     }
@@ -250,8 +292,8 @@ int npt_cleanup(npt_mgr_t*m){
             }
             MmFreeContiguousMemory(pdpt);
         }
-        ExFreePool(g_cache);
-        g_cache=NULL;
+        for(i=0;i<m->pt_reg_count;i++)
+            if(m->pt_reg[i].va)MmFreeContiguousMemory(m->pt_reg[i].va);
     }
     if(m->pml4_va)MmFreeContiguousMemory(m->pml4_va);
     RtlZeroMemory(m,sizeof(*m));
