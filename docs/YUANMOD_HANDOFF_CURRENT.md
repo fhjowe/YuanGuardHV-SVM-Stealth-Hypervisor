@@ -5649,3 +5649,35 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **下一轮（等用户允许加载）**：run_c18 四 gate + diag（预期 restores 随 fake
   周期增长、gate1 readback=写入值（影子幻觉）、gate2 BLOCKED 不再裸死）。
 - 提交：本记录。
+
+### 9.285 2026-10-11 C6 v4 核级 alt 驻留（镜像 206c7e/md5 356c5b6b；本地提交未推送；未加载）
+
+- **v2/v3 的残余问题闭环**：v3 读路径修复后，run_c18×206c7c 确认轮 gate1 判据
+  成立（WPM 写被吞、readback=目标旧值 ✓ 真页无损），gate4 ✓，**无蓝屏、卸载
+  干净**——但 gate2 子进程第一次读 AVE、gate3 readback err=0x12B、目标写入
+  序列过期（0x2D vs ~75）→ **NCr3 切换在 Zen3 上延迟生效/不可靠**（c7d 补
+  VmcbClean=0 后 readback=旧值依旧 + restores 计数在 v2 重写中失效）。
+- **v4 架构：核级 alt 驻留（core-level alt residency）**：
+  1. fake 命中 → `NCr3 = alt` + `VmcbClean = 0` + **不设 TF、不写 rearm 槽**
+     → **整段拷贝在 alt 上影子化**（所有 store 落影子、读回落子、其余恒等）；
+  2. **窗口边界 = 下一次 CR3 写（上下文切换）**：CR3 写退出处理尾部检测
+     `NCr3 == alt_pa` → `NCr3 = main_pa` + TlbControl=1——切换出去的线程的
+     影子写自然废弃，新线程看到真映射；
+  3. #DB 恢复纯 ALLOW 重武装（假写路径无 #DB）；
+  4. `yghv_protect_fake_alt_active()` 供 CR3 写退出判断。
+- v4 消除的 v2/v3 缺陷：per-store #DB 竞争（slot 覆写/泄漏）、TF 跨内核态
+  泄漏、restores 计数失效、NCr3 双向切换的 clean-bit 时序。
+- 遗留风险：①alt 驻留窗口内（至下一次上下文切换，通常 ms 级）该核上**其他**
+  进程对武装页的写也落影子（每个武装页独立 scratch，互不污染，但写会被吞）
+  ——窗口短 + 默认关，可接受；②若线程长期不切换（独占核 spin），窗口拉长
+  ——同上可接受；③Ncr3 切换的 TLB 语义按 APM（不同值=冲刷）——v2 的失败
+  可能正是 clean-bit 吞写（v4 保留 VmcbClean=0）。
+- 构建：206 + default 双绿，marker 验证。镜像 md5 `356c5b6b`（SHA256
+  `3ddc3d64…`）归档 `D:\aaaaaavm\yuanguard_hv_step206c7e_20261011.sys`。
+  run_c18 哈希门 = 356C5B6B。**本地提交（24bb0da），未推送，未加载。**
+- **下一轮（等用户允许加载）**：run_c18 四 gate + gate1 后 diag——判据：
+  gate1 WROTE+readback=写入值（影子读幻觉）+ gate2 current=目标序列（真页
+  完好）+ gate3 readback=写入值（真落地）+ 卸载干净 + **无挂死**（v4 无
+  per-store 循环）。gate2 的 AVE 现在会被 try/catch 捕获打印（mmf-write
+  加固后），子进程不再裸死。
+- 提交：本记录。
