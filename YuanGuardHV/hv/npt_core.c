@@ -292,8 +292,10 @@ int npt_cleanup(npt_mgr_t*m){
             }
             MmFreeContiguousMemory(pdpt);
         }
-        for(i=0;i<m->pt_reg_count;i++)
-            if(m->pt_reg[i].va)MmFreeContiguousMemory(m->pt_reg[i].va);
+        /* 9.283: do NOT free pt_reg here — every split PT is reachable from
+         * its PD and was already freed by the PD walk above; freeing them
+         * again is a double free (0x19/0x22 in ExRemovePoolTag at unload,
+         * dump 101126-35203-01). pt_reg exists for VA lookup only. */
     }
     if(m->pml4_va)MmFreeContiguousMemory(m->pml4_va);
     RtlZeroMemory(m,sizeof(*m));
