@@ -1287,10 +1287,16 @@ SvHandleVmExit (
                         /* C6 v2: switch this core's NCr3 to the alt NPT —
                          * a DIFFERENT nCr3 value architecturally flushes the
                          * NPT TLB, so the scratch mapping is visible and the
-                         * store lands in the page's shadow buffer. */
+                         * store lands in the page's shadow buffer.
+                         * 9.285: VmcbClean=0 — the CPU caches nCr3 across
+                         * VMRUNs unless the clean bits are invalidated; the
+                         * c6e/c7c runs proved the bare NCr3 write was
+                         * swallowed (1.47M/7.1e8 re-faults, restores=0). */
                         UINT64 altPa = yghv_protect_fake_alt_pa();
-                        if (altPa)
+                        if (altPa) {
                             VpData->GuestVmcb.ControlArea.NCr3 = altPa;
+                            VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                        }
                     }
                     VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
                     // 9.254: KEEP the saved RIP. For an NPF exit the trapped
@@ -1542,9 +1548,11 @@ SvHandleVmExit (
                  * saved real NPT entry instead of plain re-arm. */
                 if (slot & 1ULL) {
                     /* C6 v2: switch NCr3 back to main (different value =
-                     * architectural NPT TLB flush) before resuming. */
+                     * architectural NPT TLB flush) before resuming.
+                     * 9.285: VmcbClean=0 (see the FAKE branch). */
                     VpData->GuestVmcb.ControlArea.NCr3 =
                         yghv_protect_fake_main_pa();
+                    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
                     VpData->GuestVmcb.ControlArea.TlbControl = 1;
                     yghv_protect_fake_restore(slot & ~1ULL);
                 } else {
