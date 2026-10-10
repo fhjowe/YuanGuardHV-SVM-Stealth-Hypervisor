@@ -232,6 +232,11 @@ public static class YghvMmf
         v.View = v.Map = v.File = IntPtr.Zero;
     }
 
+    /* 9.284: CSE-protected — a read right after a DENY-injected #PF can
+     * still catch an in-flight AV; without the attribute the mmf-write
+     * child dies unhandled before printing BLOCKED (run_c18 gate2). */
+    [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
+    [System.Security.SecurityCritical]
     public static long ReadVal(IntPtr view)
     {
         return Marshal.ReadInt64(view);
@@ -982,6 +987,9 @@ try {
                         [UInt32]8, [ref]$read)) {
                     Write-Host ("wpm-write: readback=0x{0:X}" -f
                         [BitConverter]::ToUInt64($rb, 0))
+                } else {
+                    Write-Host ("wpm-write: readback FAILED err=0x{0:X}" -f
+                        [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
             } finally {
                 [YghvMem]::CloseHandle($h) | Out-Null
