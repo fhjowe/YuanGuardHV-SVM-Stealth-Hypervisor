@@ -5743,3 +5743,28 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   readback 应=写入值（NCr3 残留已清，readback 不再 0x12B）**→ C6 v5 完整
   PASS。
 - 提交：本记录。
+
+### 9.289 2026-10-11 C6.1 INVLPGA 精化（镜像 206c9；本地提交未推送；未加载）
+
+- **v5 轮判读**：gate1 PASS（readback=旧值 = 真页完好 ✓ 假写生效）、gate2
+  子进程存活（TryRead ✓）、gate4 ✓——但 diag attempts=ok=2.4M、restores=0
+  （v4 无 #DB ✓ 预期）——**假写仍在自然 TLB 逐出后才生效**（1.05M/2.4M 次重
+  故障模式不变）→ **Zen3 的 NPT 翻译不随 TlbControl=1 或 nCr3 切换失效**
+  （本轮的决定性硬件事实）。
+- **C6.1（INVLPGA 精化，根修）**：①asm helper `SvInvlpgaByVa(gva, asid)`；
+  ②protect.c `yghv_protect_fake_invpga_armeds(asid)`（#if 206 门控）：对每个
+  武装页的已知 GVA（target_va = mmf 视图 VA，attach 形态内核写用的正是它）
+  执行 INVLPGA；③调用点 ×2：fake 分支（NCr3=alt **之前**——冲掉 main 的过期
+  RO 翻译 → 影子立即可见）+ CR3 写恢复（NCr3=main **之前**——冲掉 alt 的
+  scratch 翻译）。
+- **附带事故与恢复**：python 转义事故清空了 protect.h（0 字节）→ git 恢复
+  （172 行，resync/diag decl 完好）。**教训：跨工具链编辑 .h 必须先备份或
+  用 Edit 工具**。
+- 构建：206 + default 双绿，marker 验证。镜像 md5 见归档
+  `D:\aaaaaavm\yuanguard_hv_step206c9_20261011.sys`。run_c18 哈希门 =
+  EE32957A。
+- **下一轮（等用户允许加载）**：run_c18 四 gate——预期 gate1 的 readback=
+  **写入值**（INVLPGA 后影子立即可见，store 立即落影子，readback 走 alt 读
+  到 WPM 自己的字节）+ 零重故障旋（diag attempts ≈ 10 量级而非百万）+ gate2
+  current=写入值（同核 alt 驻留读影子）或目标序列（已切回）+ gate3 真落地。
+- 提交：本记录。
