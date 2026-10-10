@@ -5554,3 +5554,27 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   旧值+vr 序号 3、gate2 BLOCKED、gate3 A/B、gate4 看门狗；遥测 vr 序号 3 +
   restores 计数随 fake 周期增长。
 - 提交：本记录。
+
+### 9.281 2026-10-11 206c6f 0x50 判读 + C6 假写路线关闭（回退 206c7a；本地提交未推送）
+
+- **run_c18×206c6f 蓝屏**：0x50（NONPAGED_AREA）@ 00:42:14——启动后 2.5 分钟、
+  config-fake 1 之后、gate1 的第一次 fake NCr3 切换窗口。崩溃 VA =
+  0xFFFFB85C2E03F400（非分页池区段，未页对齐——某 memcpy/store 的数据访问），
+  IRQL 5。**双 NPT 理论正确（nCr3 切换 = 架构保证冲刷），但实现/交互层面仍有
+  无法从 minidump 定位的问题**（无栈 minidump；MEMORY.DMP 被系统因磁盘空间
+  自动删除）。
+- **工程决策：C6 假写路线关闭。** 假写特性累计代价：0xD1 蓝屏、0xE2 蓝屏、
+  两次 13h/0.5h 挂死、0x50 蓝屏——共 4 次机器级事故，收益仅"让 WPM 假成功"。
+  **定性：本平台不可行**（需要内核调试器在场的受控环境才能定位 alt NPT/切换
+  交互问题）。WPM 旁路保持文档化已知限制（README 已记录），真实产品的反
+  WPM 需求交给未来带 KD 的环境。
+- **回退执行**：源码级 checkout 到 aa4fba2（9.274 = C4/C5 全 PASS 稳定态）的
+  全部相关文件（npt_core/npt.h/protect.c/protect.h/svm_simplevm206.cpp/
+  control_ioctl.h/control_device.c/yghv_ctl.ps1/YghvCtl.java/README）——
+  移除 C6 全部代码（fake 机制/0x812/diag/双 NPT/npt VA 重构），保留 C4/C5
+  完整语义 + 环扩容 + 0x810/0x811 跨进程保护。重建 206c7a（SHA256
+  `c4655f13…`，md5 `4f1874e7`）+ default 回归绿 + marker 验证。
+- **当前稳定镜像 = 206c7a（= 206c5i 语义重建）**。run_c16（回归）可用。
+- **下一步**：真实产品目标流程化（Minecraft/Forge 目标选择+页选取，控制面
+  已就绪），或 C6 重新立项（前置 = KD 在场的受控环境）。
+- 提交：本记录。
