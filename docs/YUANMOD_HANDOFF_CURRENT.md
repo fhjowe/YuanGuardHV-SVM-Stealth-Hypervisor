@@ -5517,3 +5517,40 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   序号 3）+ gate2/3/4 维持 → C6 v1 PASS。gate3 若同时 FAIL = config 开关
   链路问题（查 0x812 case）。
 - 提交：本记录。
+
+### 9.280 2026-10-05 C6 v2 双 NPT 切换实现（镜像 206c6f/md5 d8df0d94；本地提交未推送；未实机验证）
+
+- **run_c18×206c6e 诊断收官**（挂死 13h 后恢复）：`attempts=7.1亿 ok=7.1亿
+  restores=0 reject=0`——重申修复后每个 NPF 都触发假写，但 **#DB 恢复永不发生
+  = store 永不完成 = Zen3 上 TlbControl=1 不冲刷 NPT（GPA→HPA）翻译**。位翻转
+  类修改（ALLOW 路径）能工作纯属 walk-cache 未缓存该条目的侥幸。**结论：NPT
+  的 PA 变更/权限变更在架构上必须 INVLPGA 或 nCR3 切换，TlbControl 不可靠。**
+- **v2 架构（双 NPT + nCr3 切换）**：
+  1. `npt_mgr_t` 扩展：pdpt_va[512]/pd_va[512]/pt_reg[256] 直接记录表 VA
+     （identity map 仅 p4==0，cache 全覆盖；split PT 逐个登记）——**所有表
+     访问摆脱 MmGetVirtualForPhysical**（9.271-9.273 的选择性失效原语）；
+     npt_cleanup 同步重写（按记录 VA 释放）；g_cache 移除；
+  2. `g_npt_alt`：boot 时（DriverEntry，PASSIVE）npt_init 512GB 恒等克隆
+     （~514 表页 ≈2MB）；
+  3. fake 分支（bare verdict）：cpl=0 → 返回 FAKE（不再动主 NPT）→ cpp 设
+     `NCr3 = g_npt_alt.pml4_pa`——**不同 nCr3 值写入 = APM 架构保证的 NPT
+     TLB 冲刷** → store 落入该页的影子 scratch；
+  4. #DB（下一指令边界）：`NCr3 = g_npt.pml4_pa` 切回主 NPT + fake_restore
+     计数——主 NPT 条目全程 RO 不动，无 disarm/re-arm 记账；
+  5. arm/disarm 镜像：fake 模式下 arm → alt 内 split+scratch 映射
+     （`yghv_protect_fake_scratch_for`，每武装页独立 4KB 影子）；disarm →
+     alt 内恒等 RW；watchdog/stop 路径同函数自动覆盖；
+  6. 每 store 两次有保证的冲刷，拷贝必然收敛（v1 活锁的架构性根除）。
+- 已知限制（v1 遗留，文档化）：①cpl=0 外来写（含 APC/异常派发）全部落影子
+  ——目标进程的合法内核中介写被"假成功"吞掉（实验旗标默认关的代价，产品化
+  需按页/按调用方区分）；②多武装页共享影子窗口时跨核写各自落各自 scratch
+  （每页独立 scratch，无碰撞）；③alt NCr3 窗口内的中断处理跑在 alt 上
+  （恒等部分无差异，武装页写落影子——窗口=1 条指令）。
+- 构建：206 + default 双绿，marker 验证。镜像 SHA256 `319f3d66…`（md5
+  `1f6c71eb`）→ 复编译后 `d8df0d94`（表 VA 重构后终版）归档
+  `D:\aaaaaavm\yuanguard_hv_step206c6f_20261005.sys`。run_c18 哈希门 =
+  D8DF0D94。**本地提交（4a3679c），未推送，未加载测试。**
+- **下一轮（等用户允许加载）**：run_c18 四 gate——预期 gate1 WROTE+readback=
+  旧值+vr 序号 3、gate2 BLOCKED、gate3 A/B、gate4 看门狗；遥测 vr 序号 3 +
+  restores 计数随 fake 周期增长。
+- 提交：本记录。
