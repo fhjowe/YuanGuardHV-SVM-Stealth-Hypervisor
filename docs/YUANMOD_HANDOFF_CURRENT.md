@@ -5626,3 +5626,26 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
   = 写入值或目标旧值均可；真页不变判据 = gate2 的 mmf-write current）+ 本次
   验证卸载不再 0x19。
 - 提交：本记录。
+
+### 9.284–9.285 2026-10-11 run_c18×206c7c 判读（假写核心目标达成）+ VMCB clean bits 根因修复（镜像 206c7d/md5 c1d51e0e；本地提交未推送；未加载）
+
+- **run_c18×206c7c（确认轮，无蓝屏、卸载 140ms 干净）**：gate1 **WPM WROTE +
+  readback=0xC4C4…29 = 目标旧值**——**真页无损，假写的核心目标达成**（WPM 的写
+  未落真页）。diag：attempts=ok=**1.47M**，restores=**0**，reject=0。
+- **1.47M 次重故障后自行终止的模式**：store 从未落影子（restores=0 = #DB 从未
+  发生 = 指令从未完成），1.47M 次后循环停止 = **自然 TLB 逐出偶然加载了
+  NCr3=alt**——**Zen3 上 TlbControl=1 不冲刷 NPT 翻译，且 VMCB clean bits 缓存
+  吞掉了 NCr3 字段写入**（写 0xB0 不清 NCr3 组 clean bit → VMRUN 沿用缓存的
+  main）。gate2 的 current=0x…2D 过期序列 = 目标写在 alt 核上落影子被吞的
+  佐证；gate2 子进程第一次读 AVE = cpl=3 读 fault 反射注入（符合设计，但子进程
+  的 ReadVal 无 CSE 帧保护）。
+- **修复（9.284/9.285）**：①测试工具：ReadVal 加 CSE、wpm-write readback 失败
+  显式打印、mmf-write/mmf-loop 全路径 AVE 上报、run_c18 gate1 判据修正
+  （readback==写入值 = 影子幻觉 ✓，真页判据 = gate2 current）；②**驱动：
+  fake 分支 + #DB 恢复写 NCr3 后补 `VmcbClean = 0`**（强制 VMRUN 全量重读
+  VMCB——合成路线 v94 的 trampoline 同法已验证）。
+- 构建：206 + default 双绿，marker 验证。镜像 md5 `c1d51e0e`（SHA256 见归档）
+  `D:\aaaaaavm\yuanguard_hv_step206c7d_20261011.sys`。run_c18 哈希门 = C1D51E0E。
+- **下一轮（等用户允许加载）**：run_c18 四 gate + diag（预期 restores 随 fake
+  周期增长、gate1 readback=写入值（影子幻觉）、gate2 BLOCKED 不再裸死）。
+- 提交：本记录。
