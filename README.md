@@ -81,24 +81,27 @@ yuanguard/
 │   │   ├── vmexit.c              # VMEXIT 分发（合成路线）
 │   │   ├── vmmcall.c             # VMMCALL 处理与认证
 │   │   ├── multi_core.c          # 每核系统线程
-│   │   ├── protect.c             # 保护逻辑 + 岛内裸判桥（on_npf_write_bare 等）
+│   │   ├── protect.c             # 保护逻辑 + 岛内裸判桥 + **周期同步守卫**（C 线）
 │   │   ├── control_device.c      # IOCTL 控制设备
 │   │   ├── loader_stealth.c      # 加载隐藏（门控，默认关）
 │   │   ├── svm_trampoline.S      # 进入/退出 guest 的汇编蹦床
-│   │   └── common/               # 头文件（vmcb/svm_defs/npt/msr/cpuid/…）
+│   │   └── common/               # 头文件（vmcb/svm_defs/npt/msr/cpuid/protect/crx/…）
 │   ├── tools/
-│   │   ├── yghv_ctl.ps1          # PowerShell 客户端
+│   │   ├── yghv_ctl.ps1          # PowerShell 客户端（34 命令，主客户端）
 │   │   ├── yghv_stealth_check.ps1# 只读痕迹自查
-│   │   └── yghv_client/          # Java/JNI 客户端（YghvCtl）
+│   │   ├── build_simplesvm.bat   # 构建 vendored SimpleSvm
+│   │   └── yghv_client/          # Java/JNI 客户端（YghvCtl，18 命令）
 │   ├── tests/                    # 静态校验（编译自动执行）
 │   ├── unload_driver.ps1         # 无重启卸载驱动（NtUnloadDriver）
 │   ├── start_kd.ps1 / run_kd.bat # VM+KD 调试通道
 │   └── yuanguard_test.cer        # 测试签名证书（仅测试环境）
 ├── docs/                         # 全程实验/决策/审计记录
+│   └── KERNEL_API_CHECKLIST.md   # ★ 写内核代码前必读（API 契约核对清单）
 └── reference/                    # EPT 参考实现（研究用途，独立于正式构建）
 ```
 
-> `bin/`、`*.sys`、`*.obj`、日志与 `svm_trampoline.asm` 均被 `.gitignore` 排除，不入库。
+> `bin/`、`*.sys`、`*.obj`、`*.map`、日志与 `svm_trampoline.asm` 均被 `.gitignore` 排除，不入库。
+> **发布镜像通过 GitHub Release 附件分发**（见 [功能里程碑](#功能里程碑) 的 v0.3.0 链接）。
 
 ---
 
@@ -121,7 +124,13 @@ yuanguard/
 | **206-C3** | 控制面加固：目标退出看门狗（根治泄漏→风暴）、NONE 静默重开、last-hit 查询（fn 0x80F） | ✅ |
 | **206-C4** | 跨进程保护：外部控制器按 pid 武装目标页（fn 0x810/0x811），目标写 ALLOW、外部进程写 DENY→确定性 AV | ✅ |
 | **206-C5** | 实进程试点（notepad 真实目标 + scan-pid/wpm-write）+ WPM 内核中介旁路定性实证 + 遥测环扩容 | ✅ |
+| **206-C6** | 假写路线：六条 NPT 冲刷路径全部证伪（Zen3 硬件事实）→ **换设计为周期同步守卫** | ✅ |
+| **C 线（周期同步守卫）** | **不翻转 NPT 权限**，后台轮询快照比对 + 漂移回滚；延迟 92s → **2.3s**（40×）；64 页 @20 polls/s 仅 **0.38% 单核** | ✅ |
+| **缺陷 C** | `DriverUnload` 补 `yghv_trace_close()`（progress.log 句柄泄漏，A/B 因果证明） | ✅ |
 | 旧 B 路线 | 整机进 guest 的 APIC 虚拟化实验 | ⛔ 已由 206 通路取代（历史见 docs） |
+
+> **发布**：[v0.3.0](https://github.com/YuanNeoMax/YuanGuardHV-SVM-Stealth-Hypervisor/releases/tag/v0.3.0)
+> 为当前版本（周期同步守卫，镜像 `206c25_mmcopy`）。
 
 ---
 
@@ -141,17 +150,23 @@ yuanguard/
 - 管理员权限，且内核已开启测试签名（`bcdedit /set testsigning on` 或使用已签名驱动）；
 - 测试证书 `yuanguard_test.cer`。
 
-### 本机开发/测试环境（2026-08 实测）
+### 本机开发/测试环境（2026-10 实测）
 
 | 项 | 值 |
 |---|---|
-| CPU | AMD Ryzen 5 5500（6C/12T） |
+| CPU | AMD Ryzen 5 5500（**Zen3 Cezanne，Family 19h Model 50h**） |
 | 内存 | 16 GB |
 | 宿主系统 | Windows 10 专业工作站版 22H2（10.0.19045，64 位） |
+| 加载条件 | `testsigning=Yes` + `nointegritychecks=Yes`（内核不校验驱动签名） |
 | 测试虚拟机 | Windows 10 Pro 19045.2965（VMware 17.6.4） |
 | 构建工具链 | clang-cl（LLVM）+ MSVC link 14.44.35207 + WDK 10.0.19041/10.0.26100 + signtool |
 
-> 注：VM 内 AMD SVM 指令暴露受限（VMware `vhv.enable` 嵌套限制），VM+KD 通道已判定不可用，实机验证走裸机/KVM 路线。
+> - **CPU 型号是权威事实**：`INVLPGB`/`TLBSYNC` 是 Zen4+ 指令，**本机 Zen3 没有**
+>   （CPUID 实测确认，见 9.298）。
+> - **VM 内 AMD SVM 指令暴露受限**（VMware `vhv.enable` 嵌套限制），VM+KD 通道
+>   已判定不可用，实机验证走**裸机**路线。
+> - **单机交互式内核调试不可行**（内核断点挂起整机 + 本机 NIC 不支持 KDNET），
+>   唯一路径是第二台物理机。详见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.296。
 
 ---
 
@@ -165,10 +180,13 @@ build.bat
 流程（`build.bat`）：
 
 1. 先自动运行 `tests\run_static_checks.ps1`（接口一致性 + 命令一致性 + 安全红线），失败即中止；
-2. clang-cl 编译 `hv\*.c` + `svm_trampoline.S`；
-3. MSVC link 链接为 `bin\yuanguard_hv.sys`（WDM kernel driver）；
+2. clang-cl 编译 `hv\*.c` / `hv\*.cpp` + `svm_trampoline.S`；
+3. MSVC link 链接为 `bin\yuanguard_hv.sys`（WDM kernel driver），**同时产出 `bin\yuanguard_hv.map`**；
 4. signtool 用 `yuanguard_test.cer` 签名；
 5. 打印 SHA256 哈希。
+
+> **`/MAP` 的用途**：崩溃取证时把 `模块+偏移` 一次映射到函数名。前三次蓝屏都要手工反汇编
+> 才能定位（例：`0x12E13 → memmove`）。用法见 `docs/KERNEL_API_CHECKLIST.md` 第九节。
 
 可用环境变量门控（`set YGHV_XXX=1` 后构建）：
 
@@ -237,7 +255,7 @@ sc.exe stop  yuang206c2      # 在线卸载（实测 ~50-130ms），无需重启
 powershell -NoProfile -ExecutionPolicy Bypass -File YuanGuardHV\tools\yghv_ctl.ps1 <command>
 ```
 
-常用命令：
+常用命令（**共 34 个**，完整列表见 `yghv_ctl.ps1` 或 `tools/yghv_client/README.md`）：
 
 | 命令 | 说明 |
 |---|---|
@@ -247,12 +265,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File YuanGuardHV\tools\yghv_ctl.p
 | `protect-page <pid> <hex_va>` / `unprotect-page <pid> <hex_va>` | **跨进程武装**（fn 0x810/0x811，206-C4：外部控制器对已注册目标按 pid 武装） |
 | `start` / `stop` | 启动/停止保护 |
 | `install-hook <name\|hex_va> [hook_id]` / `remove-hook <hook_id>` | 挂钩管理 |
-| `config [auto-disarm <0\|1> \| deny-status <hex>]` | 配置 |
+| `config` | 读配置（含 `auto_disarm` / `deny_status` / `sync` / `sync_ms`） |
+| `config auto-disarm <0\|1>` / `config deny-status <hex>` | 配置裁决行为 |
+| **`config sync <0\|1> [interval_ms]`** | **配置周期同步守卫**（9.303 起并入 config，一次调用即可） |
+| `config-fake [0\|1\|2]` / `config-fake-tlb [0..4]` | 假写模式 / TLB 冲刷策略选择器（诊断用） |
+| **`config-sync [0\|1] [interval_ms]`** | 同步守卫开关 + 诊断读数（`mode/polls/hits/pages/refused/tsc_cycles`） |
+| `clear` | 清空所有目标/页/钩子 |
 | `set-auto-start` / `unset-auto-start` / `harden-service` / `unharden-service` | 服务加固 |
 | `selftest` / `selftest-abort` / `exit-test` | 自检 / 看门狗测试（武装后脏死）/ 退出测试 |
-| `protect <pid> [maxPages]` / `unprotect` / `scan <pid> [maxPages]` | 一键保护 / 停止 / 只读扫描 |
-| `mmf-open <path>` / `mmf-loop <path> <sec> [info]` / `mmf-write <path>` | 跨进程保护实验介质（文件映射共享页：目标写循环 / 攻击者单写，输出 BLOCKED/LANDED） |
-| `scan-pid <pid> [count]` / `wpm-write <pid> <hex_va> <hex_val>` | 实进程试点（VirtualQueryEx 枚举私有页 / WriteProcessMemory 内核中介写） |
+| `scan-pid <pid> [count]` | 只读枚举目标私有页（VirtualQueryEx） |
+| `wpm-write <pid> <hex_va> <hex_val>` | 内核中介写（WriteProcessMemory，C6 靶子） |
+| **`wpm-read <pid> <hex_va>`** | **纯读**（无副作用；验证回滚必须用它，`wpm-write` 会扰动被测页） |
+| `mmf-open <path>` | 打开文件映射并读回探针 |
+| `mmf-loop <path> <sec> [info]` | 目标侧写循环（每 400ms 自写） |
+| **`mmf-hold <path> <sec> [info] [size_bytes]`** | **不自写目标**（映射后只睡；多页测试用 `size_bytes`） |
+| `mmf-write <path>` | 攻击者侧单写（输出 BLOCKED/LANDED） |
+
+> **`protect <pid>` / `unprotect` / `scan <pid>` 已不存在** —— 早期版本有，现由
+> `set-target` + `protect-page` 组合取代。Java 客户端的 `protect <pid>` 仍仅对调用
+> 进程自身 PID 生效（ADD_PAGE 绑定调用者 CR3）；**跨进程武装用 PowerShell 的
+> `protect-page <pid> <hex_va>`（fn 0x810）**。
 
 ### Java/JNI 客户端（`tools\yghv_client`）
 
@@ -262,20 +294,25 @@ build.bat          # 编译（含 JNI native）
 run.bat state      # 用法与 PowerShell 客户端一致
 ```
 
-> **REV-019 注意（已部分取代）**：Java 客户端的 `protect <pid>` 仍仅对调用进程自身 PID 生效（ADD_PAGE 绑定调用者 CR3）。**206-C4 起用 PowerShell 客户端的 `protect-page <pid> <hex_va>`（fn 0x810）跨进程武装**：目标先经 `set-target <pid>` 注册，控制器即可从外部武装目标地址空间的页。`scan <pid>` / `scan-pid <pid>` 为只读。
+> Java 客户端只覆盖部分命令（18 个），**新增功能一律以 PowerShell 客户端为准**；
+> `command_parity.ps1` 会强制 PowerShell 命令与 README 一致。
 
 ---
 
 ## 测试
 
 - **静态校验**（构建自动执行）：`tests\run_static_checks.ps1`
-  - `ioctl_parity.ps1`：C 头文件 ↔ PowerShell/Java 客户端 IOCTL 编号一致；
-  - `command_parity.ps1`：README ↔ 两客户端命令一致；
+  - `ioctl_parity.ps1`：C 头文件 ↔ PowerShell/Java 客户端 IOCTL 编号一致（当前 C=21 / PS=21 / Java=21）；
+  - `command_parity.ps1`：README ↔ 客户端命令一致（当前 PS=34 / Java=18）；
   - `safety_checks.ps1`：安全红线静态检查。
 - **VMEXIT 验证链**：VMMCALL 心跳（10000 轮）、NPT translate/perm/range/split 单测、NPF 注入恢复。
 - **实机回归**：物理机加载 → 双核心跳 → 保护测试 → 卸载（不重启）。
+- **C 线四步验证**（2026-10，推荐流程）：最小面（不 arm）→ 单页 → 16 页 → 64 页上限。
+  脚本样例见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.304。
 - **痕迹自查**：`tools\yghv_stealth_check.ps1`（只读，输出 `[VISIBLE]`/`[CLEAN]` 清单）。
 - **调试通道**：`start_kd.ps1` / `run_kd.bat`（VM 串口命名管道连 KD）。
+  ⚠️ 单机交互式内核调试**原理上不可行**（内核断点挂起整机），本机 NIC 亦不支持 KDNET ——
+  详见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.296。
 
 ---
 
@@ -283,11 +320,13 @@ run.bat state      # 用法与 PowerShell 客户端一致
 
 | 文档 | 内容 |
 |---|---|
-| `docs/YUANMOD_HANDOFF_CURRENT.md` | 全程交接与决策记录（最高优先级） |
+| `docs/YUANMOD_HANDOFF_CURRENT.md` | 全程交接与决策记录（最高优先级，当前至 9.304） |
+| **`docs/KERNEL_API_CHECKLIST.md`** | **★ 写内核代码前必读** —— 三次蓝屏换来的 API 契约核对清单 |
+| `docs/YUANMOD_NEXT_WINDOW_PROMPT.md` | 新窗口接手提示词（基线/雷区/候选） |
 | `docs/TASKS.md` | 任务清单与 P0 复核结论 |
 | `docs/YGHV_OS_AS_GUEST_RESEARCH_20260814.md` | OS-as-guest 研究 |
 | `docs/YGHV_OS_AS_GUEST_SUMMARY_20260815.md` | OS-as-guest 阶段性总结 |
-| `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md` | SimpleSvm/HelloAmdHv 构型复审 + C0/C1 实机验证方案 |
+| `docs/YGHV_SIMPLEVM_LEVERAGE_20260918.md` | SimpleSvm/HelloAmdHv 构型复审 + C0/C1 实机验证方案（含本机 CPU 权威记录） |
 | `docs/YGHV_STEALTH_AUDIT_20260813.md` | 隐藏矩阵与反侦查审计 |
 | `docs/YGHV_FULL_REVIEW_20260814.md` | 全面代码审查报告（YGHV-REV-001..043） |
 | `docs/YGHV_HOOK_LOCK_AND_0x5AA_REDESIGN_20260813.md` | hook lock 与 0x5AA 重设计 |
@@ -297,12 +336,15 @@ run.bat state      # 用法与 PowerShell 客户端一致
 ## 已知限制与路线图
 
 1. **OS-as-guest 已打通（206 线，2026-10）**：早期"平台级硬冻结"结论经 C0 原版 SimpleSvm 实机对照推翻（errata 1363/1235 属 Family 17h 编号系，本机 Zen3 不适用）。当前形态 = vendored 上游 SimpleSvm 逐字进场 + coexist 全核虚拟化，真实 Windows 以 guest 态运行，页写保护全链硬件实证（206-C1–C5 全 PASS，判读史见 `docs/YUANMOD_HANDOFF_CURRENT.md` 9.244–9.274）。历史 APIC 虚拟化 B 路线实验保留在 docs/ 作存档。
-2. **WPM 内核中介写旁路（C6 待细化）**：`WriteProcessMemory` 类内核 API 经 `MmCopyVirtualMemory`+`KeStackAttachProcess` 以"目标 CR3 + cpl=0"完成写，现行裁决（is_target_cr3 ‖ cpl==0 → ALLOW）无法区分它与内核合法写——已在实机定性实证（run_c17）。候选规则 = cpl==0 且 CR3==某 target CR3 → DENY，前置条件 = 证明 APC/异常派发不以目标 CR3 写用户内存（否则误杀合法路径）。
-3. **DENY 的 AV 报告地址为 VA 0**：精确 GVA 重建在实测平台不可实现（`MmGetVirtualForPhysical` 选择性失效 + 直接映射基址不可无故障验证，206c5g/h 两轮蓝屏学费已记录并回退）。DENY 语义本身无损（确定性递 AV、零风暴），CR2=0/ec P=0 为最终行为。
-4. **隐形是尽力而为**：内核驱动在真实 Windows 中加载，绝对隐形不现实；`loader_stealth` 默认关闭且未经 kd `!driver` 复核；不承诺绕过任何具体反作弊产品（ACE 仅尽力优化，不作验收标准）。
-5. **NPT 安全地基部分未验证**：ASID 多管理、向 guest 注入 #PF 等因 VMware 嵌套限制未完整验证。
-6. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
-7. **路线图**：**C6 内核中介写裁决细化** → 真实产品目标（Minecraft/Forge）目标选择/页选取流程化 → R1 私有内存剔除 → `loader_stealth` 并入默认（先 kd 复核）→ MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
+2. **★ Zen3 NPT TLB 限制（硬件事实，已绕开）**：NPT（GPA→HPA）翻译**不响应任何已探索的软件冲刷机制** —— `TlbControl=1`（只冲 guest TLB）、`TlbControl=2`（FLUSH ALL，实测无效）、`nCR3` 变更（attempts == consulted == 29,697,622）、`INVLPGA`（打错层，只管 GVA→GPA）、`INVLPGB`（Zen3 无此指令）全部证伪。**处置：换设计** —— 周期同步守卫**根本不翻转 NPT 权限**（页面始终 present+WRITABLE），硬件从不需要失效翻译，限制自然不适用。详见 9.297–9.304。
+3. **同步守卫无法区分写入来源（设计取舍）**：目标进程**自己**的合法写入同样被回滚 —— 这是"不依赖 TLB"换来的代价。实测：目标持续自写仍被钉在单一值（70% 采样同值）。
+4. **轮询间隔下限受系统定时器粒度约束**：实测 `NtQueryTimerResolution` 为 `min=15.62ms`，请求 1ms 实际得到 ~9.5–15.6ms，**实用下限约 16ms**。
+5. **WPM 内核中介写旁路**：`WriteProcessMemory` 类内核 API 经 `MmCopyVirtualMemory`+`KeStackAttachProcess` 以"目标 CR3 + cpl=0"完成写，现行裁决（is_target_cr3 ‖ cpl==0 → ALLOW）无法区分它与内核合法写——已在实机定性实证（run_c17）。**此项不再是主线阻塞**（C 线走的是同步守卫路线）。
+6. **DENY 的 AV 报告地址为 VA 0**：精确 GVA 重建在实测平台不可实现（`MmGetVirtualForPhysical` 选择性失效 + 直接映射基址不可无故障验证，206c5g/h 两轮蓝屏学费已记录并回退）。DENY 语义本身无损（确定性递 AV、零风暴），CR2=0/ec P=0 为最终行为。
+7. **隐形是尽力而为**：内核驱动在真实 Windows 中加载，绝对隐形不现实；`loader_stealth` 默认关闭且未经 kd `!driver` 复核；不承诺绕过任何具体反作弊产品（ACE 仅尽力优化，不作验收标准）。
+8. **单机交互式内核调试不可行**：内核断点 = 挂起整个 OS（含调试器自身），且本机 NIC 不支持 KDNET。**唯一路径 = 第二台物理机**（详见 9.296）。
+9. **仓库卫生**：`reference/` 参考实现、历史日志归档等清理项未完成。
+10. **路线图**：真实产品目标（Minecraft/Forge）目标选择/页选取流程化 → R1 私有内存剔除 → `loader_stealth` 并入默认（先 kd 复核）→ MSR/IO/处理器层隐藏（需裸机/KVM）→ 产品化整合。
 
 ---
 
