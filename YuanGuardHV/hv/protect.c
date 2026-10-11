@@ -162,6 +162,428 @@ static volatile LONG g_fake_alt_active;  /* a core is running on the alt NPT */
 static PVOID yghv_protect_fake_scratch_for(uint64_t gpa);
 void SvInvlpgaByVa(UINT64 gva, UINT32 asid);   /* 9.289: asm, 206-only */
 
+/* 9.299 (C line): the sync guard lives further down but arm_page_locked
+ * (above it) needs to register pages with it. */
+int  yghv_protect_sync_arm(uint64_t gpa);
+void yghv_protect_sync_disarm(uint64_t gpa);
+static int yghv_protect_sync_arm_locked(uint64_t gpa);   /* caller holds lock */
+
+/* 9.297 (A'): runtime TLB-flush strategy for the fake-write path.
+ * 9.290 concluded "Zen3 NPT translations do not follow TlbControl=1 / nCr3 /
+ * INVLPGA" — but that evidence came from experiments that (a) used
+ * TlbControl=1, which by APM flushes only the *guest* TLB (GVA->GPA), not the
+ * NPT (GPA->HPA); (b) used INVLPGA, which also only touches GVA->GPA.
+ * Neither addresses the nested-page-table layer that actually caches the
+ * armed page's translation. TlbControl=2 (FLUSH entire TLB) was never tried
+ * on this path. This selector lets one build sweep the strategies at runtime:
+ *   0 = legacy   : TlbControl=1 + INVLPGA + nCR3=alt   (current behaviour)
+ *   1 = flushall : TlbControl=2 + INVLPGA + nCR3=alt
+ *   2 = noinvl   : TlbControl=2 + nCR3=alt  (no INVLPGA)
+ *   3 = invlonly : TlbControl=1 + INVLPGA + nCR3=alt, no VmcbClean=0
+ * Readable/writable via IOCTL_YGHV_SET_FAKE_TLB. */
+static volatile LONG g_fake_tlb_mode;
+static volatile LONG g_fake_tlb_seen;   /* times the selector was consulted */
+
+int yghv_protect_fake_tlb_get(void) {
+    return (int)InterlockedCompareExchange(&g_fake_tlb_mode, 0, 0);
+}
+
+void yghv_protect_fake_tlb_set(int mode) {
+    if (mode < 0) mode = 0;
+    if (mode > 4) mode = 4;
+    InterlockedExchange(&g_fake_tlb_mode, mode);
+    InterlockedExchange(&g_fake_tlb_seen, 0);
+}
+
+LONG yghv_protect_fake_tlb_seen(void) {
+    return InterlockedCompareExchange(&g_fake_tlb_seen, 0, 0);
+}
+
+/* Called from the island NPF path (cpp) — pure memory, no locks. Returns the
+ * TlbControl value to write and whether INVLPGA should run. */
+int yghv_protect_fake_tlb_plan(int *use_invlpga) {
+    int m = (int)InterlockedCompareExchange(&g_fake_tlb_mode, 0, 0);
+    InterlockedIncrement(&g_fake_tlb_seen);
+    switch (m) {
+    case 1: if (use_invlpga) *use_invlpga = 1; return 2;   /* FLUSH_ALL */
+    case 2: if (use_invlpga) *use_invlpga = 0; return 2;   /* FLUSH_ALL, no INVLPGA */
+    case 3: if (use_invlpga) *use_invlpga = 1; return 1;   /* legacy + INVLPGA */
+    case 4: if (use_invlpga) *use_invlpga = 0; return 2;   /* 9.297: reopen main + FLUSH_ALL */
+    default: if (use_invlpga) *use_invlpga = 1; return 1;  /* legacy */
+    }
+}
+
+/* 9.297 (A'): mode 4 asks whether TlbControl=2 (FLUSH ALL) can make a *main*
+ * NPT permission flip visible. Instead of switching nCR3 to the alt table
+ * (which relies on the nCr3-change flush), this reopens the armed page in the
+ * MAIN npt and relies purely on FLUSH_ALL. If the store then lands (spin
+ * stops) the NPT TLB does honour FLUSH_ALL and the whole alt-NPT design is
+ * unnecessary; if it still spins, the NPT TLB ignores FLUSH_ALL too and the
+ * limitation is architectural. */
+int yghv_protect_fake_reopen_main(uint64_t gpa) {
+    int st;
+    if (!g_protect.active)
+        return 0;
+    st = npt_set_page_perm(&g_npt, gpa & ~(uint64_t)0xFFFULL,
+                           NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+    return st == 0;
+}
+
+/* ==================================================================== */
+/* 9.299 (C line): SYNC GUARD — snapshot + poll, no NPT permission flip. */
+/*                                                                       */
+/* Why: 9.297/9.298 established that Zen3's NPT (GPA->HPA) TLB does not  */
+/* follow TlbControl=1, TlbControl=2, nCR3 changes or INVLPGA, and that   */
+/* INVLPGB does not exist on Zen3. Any design that flips an NPT           */
+/* permission and expects the change to be visible immediately is dead.   */
+/*                                                                       */
+/* The sync guard does not flip anything. The armed page stays            */
+/* present+writable in the NPT for its entire armed life, so the hardware */
+/* never needs to invalidate a translation and the limitation cannot      */
+/* apply. A background thread polls: it snapshots the page's real content */
+/* and, when the content changes, restores the snapshot. Detection        */
+/* latency is the poll interval; the page is transiently modified, which  */
+/* is the cost of not being able to block the store.                      */
+/* ==================================================================== */
+
+/* 9.302: raised from 16 to match YGHV_PROTECT_MAX_PAGES. With 16, arming more
+ * than 16 pages silently left the rest armed-but-unguarded: their writes would
+ * land permanently with no rollback and no error. Memory cost of the raise is
+ * 64 slots x 32B = 2KB of statics plus at most 64 x 4KB = 256KB of snapshots,
+ * allocated lazily only for pages actually armed. */
+#define YGHV_SYNC_MAX 64          /* pages the guard tracks at once */
+#define YGHV_SYNC_DEFAULT_MS 50
+
+typedef struct {
+    uint64_t gpa;
+    uint8_t *snapshot;            /* HV_PAGE_SIZE nonpaged copy */
+    volatile LONG active;
+    volatile LONG64 restores;     /* times this page was rolled back */
+} yghv_sync_slot_t;
+
+static yghv_sync_slot_t g_sync[YGHV_SYNC_MAX];
+static volatile LONG g_sync_mode;             /* 0 = off, 1 = on */
+static volatile LONG g_sync_polls;
+static volatile LONG g_sync_hits;
+static volatile LONG g_sync_refused;   /* 9.302: arm refused (slot table full) */
+static volatile LONG g_sync_ms = YGHV_SYNC_DEFAULT_MS;
+static HANDLE g_sync_thread;
+static KEVENT g_sync_stop;
+static volatile LONG g_sync_stop_flag;
+static volatile LONG g_sync_running;
+static PVOID g_sync_scratch;          /* one 4KB read buffer, allocated lazily */
+
+int yghv_protect_sync_mode_get(void) {
+    return (int)InterlockedCompareExchange(&g_sync_mode, 0, 0);
+}
+
+void yghv_protect_sync_mode_set(int on) {
+    uint64_t gpas[YGHV_SYNC_MAX];
+    uint32_t n = 0, t;
+
+    InterlockedExchange(&g_sync_mode, on ? 1 : 0);
+    if (!on) {
+        /* 9.301: turning the guard OFF must also drop every slot, not just
+         * flip the flag. Otherwise the slots stay "active" (inflating the
+         * reported page count), and a later re-enable would adopt a STALE
+         * snapshot — one taken before the page was last written — as the
+         * baseline, so the guard would immediately "restore" content the
+         * target had legitimately changed in the meantime. */
+        for (t = 0; t < YGHV_SYNC_MAX; t++)
+            InterlockedExchange(&g_sync[t].active, 0);
+        return;
+    }
+
+    /* Snapshot every page already armed, so the guard has a baseline the
+     * moment it is switched on. Collect under the lock, then arm OUTSIDE it —
+     * sync_arm takes the same FastMutex and re-acquiring it in one thread
+     * would deadlock (that was the 0xE2 crash). */
+    ExAcquireFastMutex(&g_protect_lock);
+    for (t = 0; t < g_protect.target_count && n < YGHV_SYNC_MAX; t++) {
+        uint32_t i;
+        for (i = 0; i < g_protect.targets[t].page_count && n < YGHV_SYNC_MAX; i++) {
+            if (g_protect.targets[t].pages[i].armed)
+                gpas[n++] = g_protect.targets[t].pages[i].gpa;
+        }
+    }
+    ExReleaseFastMutex(&g_protect_lock);
+
+    for (t = 0; t < n; t++)
+        (void)yghv_protect_sync_arm(gpas[t]);
+}
+
+/* 9.302: out[6] = arm attempts the guard had to REFUSE (slot table full).
+ * Previously that failure was silent — a page could be armed for protection
+ * yet carry no guard slot, so writes to it would land permanently. Surfacing
+ * the count makes the condition observable instead of a silent hole. */
+void yghv_protect_sync_diag(UINT64 out[7]) {
+    out[0] = (UINT64)InterlockedCompareExchange(&g_sync_mode, 0, 0);
+    out[1] = (UINT64)InterlockedCompareExchange(&g_sync_polls, 0, 0);
+    out[2] = (UINT64)InterlockedCompareExchange(&g_sync_hits, 0, 0);
+    out[3] = (UINT64)InterlockedCompareExchange(&g_sync_ms, 0, 0);
+    out[4] = (UINT64)InterlockedCompareExchange(&g_sync_running, 0, 0);
+    out[5] = (UINT64)InterlockedCompareExchange(&g_sync_refused, 0, 0);
+    {
+        int i, n = 0;
+        for (i = 0; i < YGHV_SYNC_MAX; i++)
+            if (InterlockedCompareExchange(&g_sync[i].active, 0, 0))
+                n++;
+        out[6] = (UINT64)n;
+    }
+}
+
+void yghv_protect_sync_set_interval(int ms) {
+    if (ms < 1) ms = 1;
+    if (ms > 5000) ms = 5000;
+    InterlockedExchange(&g_sync_ms, ms);
+}
+
+/* 9.299 FIX-2: MmGetVirtualForPhysical only maps physical pages the SYSTEM
+ * already has a direct mapping for (its own page tables, pool, ...). A target
+ * process's user page has no such mapping, so dereferencing the VA it returns
+ * is an access violation — the 0x3B/c0000005 crash at yghv_c_line+0x12bd2 was
+ * memcpy faulting on exactly that (and it only appeared once the FIX-1
+ * deadlock was removed, because before that the poll never ran).
+ * MmCopyMemory takes a physical address directly and needs no mapping. */
+static int yghv_sync_read_page(uint64_t gpa, void *dst, SIZE_T len) {
+    MM_COPY_ADDRESS src;
+    SIZE_T done = 0;
+    src.PhysicalAddress.QuadPart = (LONGLONG)(gpa & ~(uint64_t)0xFFFULL);
+    return NT_SUCCESS(MmCopyMemory(dst, src, len,
+                                   MM_COPY_MEMORY_PHYSICAL, &done)) &&
+           done == len;
+}
+
+/* 9.299 FIX-4 (simplified): the slot stores NO process pointer.
+ *
+ * Holding an EPROCESS reference in the slot meant the guard, the watchdog and
+ * cleanup could all free the same pointer — a use-after-free class I am not
+ * going to hand-roll. Instead the poll looks the owner up fresh, under
+ * g_protect_lock (the lock that already protects target->process lifetime),
+ * takes its own reference, drops the lock, and only then attaches.
+ *
+ * Taking g_protect_lock HERE is safe: the guard thread is independent and
+ * holds nothing. (The 0xE2 deadlock was a caller that ALREADY held the lock
+ * re-acquiring it; that path uses the _locked variant.)
+ *
+ * Reading needs no process at all — MmCopyMemory takes a physical address.
+ * Only the write-back needs a context, and KeStackAttachProcess requires
+ * PASSIVE_LEVEL, so the attach must happen after the mutex is released.
+ */
+static int yghv_sync_write_page(uint64_t gpa, const void *src, SIZE_T len) {
+    KAPC_STATE apc;
+    PEPROCESS owner = NULL;
+    uint64_t va_off = 0;
+    uint32_t t, p;
+    int ok = 0;
+
+    /* Phase 1 (lock held): resolve the owner and pin it. */
+    ExAcquireFastMutex(&g_protect_lock);
+    for (t = 0; t < g_protect.target_count; t++) {
+        yghv_protect_target_t *tg = &g_protect.targets[t];
+        if (!tg->process)
+            continue;
+        for (p = 0; p < tg->page_count; p++) {
+            if ((tg->pages[p].gpa & ~(uint64_t)0xFFFULL) ==
+                (gpa & ~(uint64_t)0xFFFULL)) {
+                owner = tg->process;
+                va_off = tg->pages[p].target_va & ~(uint64_t)0xFFFULL;
+                break;
+            }
+        }
+        if (owner)
+            break;
+    }
+    if (owner && va_off) {
+        ObReferenceObject(owner);      /* pin past the lock */
+    } else {
+        owner = NULL;
+    }
+    ExReleaseFastMutex(&g_protect_lock);
+
+    if (!owner)
+        return 0;
+
+    /* Phase 2 (no lock, PASSIVE): attach and write. */
+    KeStackAttachProcess(owner, &apc);
+    __try {
+        RtlCopyMemory((PVOID)(ULONG_PTR)va_off, src, len);
+        ok = 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = 0;
+    }
+    KeUnstackDetachProcess(&apc);
+
+    ObDereferenceObject(owner);
+    return ok;
+}
+
+/* Take (or retake) a snapshot of the real page behind a gpa. */
+static void yghv_sync_snapshot_locked(yghv_sync_slot_t *s) {
+    if (!s->snapshot)
+        return;
+    (void)yghv_sync_read_page(s->gpa, s->snapshot, HV_PAGE_SIZE);
+}
+
+/* 9.299 FIX: ExAcquireFastMutex is NOT recursive. arm_page_locked() already
+ * holds g_protect_lock when it registers a page with the guard, so sync_arm
+ * must have a variant that assumes the caller holds it. The public sync_arm
+ * takes the lock and delegates; the arm path calls the _locked form directly.
+ * (The original version acquired the mutex in both, which self-deadlocked on
+ * the first protect-page-after-sync-enable and took the box down with a guest
+ * triple fault — see the 0xE2/0x20601 dump.) */
+static int yghv_protect_sync_arm_locked(uint64_t gpa) {
+    int i, free_slot = -1;
+    gpa &= ~(uint64_t)0xFFFULL;
+    for (i = 0; i < YGHV_SYNC_MAX; i++) {
+        if (InterlockedCompareExchange(&g_sync[i].active, 0, 0) &&
+            g_sync[i].gpa == gpa) {
+            yghv_sync_snapshot_locked(&g_sync[i]);   /* refresh */
+            return 1;
+        }
+        if (free_slot < 0 && !InterlockedCompareExchange(&g_sync[i].active, 0, 0))
+            free_slot = i;
+    }
+    if (free_slot < 0) {
+        InterlockedIncrement(&g_sync_refused);   /* 9.302: make it observable */
+        return 0;                                /* table full */
+    }
+    if (!g_sync[free_slot].snapshot) {
+        g_sync[free_slot].snapshot =
+            ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
+        if (!g_sync[free_slot].snapshot)
+            return 0;
+    }
+    g_sync[free_slot].gpa = gpa;
+    g_sync[free_slot].restores = 0;
+    yghv_sync_snapshot_locked(&g_sync[free_slot]);
+    InterlockedExchange(&g_sync[free_slot].active, 1);
+    return 1;
+}
+
+int yghv_protect_sync_arm(uint64_t gpa) {
+    int r;
+    ExAcquireFastMutex(&g_protect_lock);
+    r = yghv_protect_sync_arm_locked(gpa);
+    ExReleaseFastMutex(&g_protect_lock);
+    return r;
+}
+
+void yghv_protect_sync_disarm(uint64_t gpa) {
+    int i;
+    gpa &= ~(uint64_t)0xFFFULL;
+    for (i = 0; i < YGHV_SYNC_MAX; i++) {
+        if (InterlockedCompareExchange(&g_sync[i].active, 0, 0) &&
+            g_sync[i].gpa == gpa) {
+            InterlockedExchange(&g_sync[i].active, 0);
+            
+        }
+    }
+}
+
+/* Poll body: for each tracked page, read it through MmCopyMemory, compare
+ * against the snapshot, and write the snapshot back on any difference.
+ * Called from the guard thread at PASSIVE. */
+static void yghv_sync_poll_once(void) {
+    int i;
+    UCHAR *cur = NULL;
+    InterlockedIncrement(&g_sync_polls);
+
+    /* One scratch buffer for all pages — no per-poll allocation. */
+    if (!g_sync_scratch) {
+        g_sync_scratch = ExAllocatePoolWithTag(NonPagedPool, HV_PAGE_SIZE, YGHV_TAG);
+        if (!g_sync_scratch)
+            return;
+    }
+    cur = (UCHAR *)g_sync_scratch;
+
+    for (i = 0; i < YGHV_SYNC_MAX; i++) {
+        if (!InterlockedCompareExchange(&g_sync[i].active, 0, 0))
+            continue;
+        if (!g_sync[i].snapshot)
+            continue;
+        if (!yghv_sync_read_page(g_sync[i].gpa, cur, HV_PAGE_SIZE))
+            continue;                       /* unreadable this round; try later */
+        if (RtlCompareMemory(cur, g_sync[i].snapshot, HV_PAGE_SIZE) != HV_PAGE_SIZE) {
+            if (yghv_sync_write_page(g_sync[i].gpa, g_sync[i].snapshot, HV_PAGE_SIZE)) {
+                InterlockedIncrement64(&g_sync[i].restores);
+                InterlockedIncrement(&g_sync_hits);
+            }
+        }
+    }
+}
+
+static VOID yghv_sync_guard_thread(PVOID ctx) {
+    LARGE_INTEGER delay;
+    UNREFERENCED_PARAMETER(ctx);
+    InterlockedExchange(&g_sync_running, 1);
+    LOG_ERROR("sync guard: thread up (interval=%d ms)",
+              (int)InterlockedCompareExchange(&g_sync_ms, 0, 0));
+    while (!InterlockedCompareExchange(&g_sync_stop_flag, 0, 0)) {
+        LARGE_INTEGER t;
+        int ms = (int)InterlockedCompareExchange(&g_sync_ms, 0, 0);
+        if (InterlockedCompareExchange(&g_sync_mode, 0, 0))
+            yghv_sync_poll_once();
+        t.QuadPart = -(LONGLONG)ms * 10000LL;   /* ms -> 100ns units */
+        KeWaitForSingleObject(&g_sync_stop, Executive, KernelMode, FALSE, &t);
+    }
+    InterlockedExchange(&g_sync_running, 0);
+    LOG_ERROR("sync guard: thread exit (polls=%d hits=%d)",
+              (int)InterlockedCompareExchange(&g_sync_polls, 0, 0),
+              (int)InterlockedCompareExchange(&g_sync_hits, 0, 0));
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+void yghv_protect_sync_init(void) {
+    NTSTATUS st;
+    KeInitializeEvent(&g_sync_stop, NotificationEvent, FALSE);
+    InterlockedExchange(&g_sync_stop_flag, 0);
+    st = PsCreateSystemThread(&g_sync_thread, THREAD_ALL_ACCESS, NULL, NULL,
+                              NULL, yghv_sync_guard_thread, NULL);
+    if (!NT_SUCCESS(st)) {
+        LOG_ERROR("sync guard: thread create failed 0x%x", st);
+        g_sync_thread = NULL;
+        return;
+    }
+    LOG_ERROR("sync guard: created");
+}
+
+void yghv_protect_sync_stop(void) {
+    int i;
+    /* 9.299 FIX-3: the cleanup below must run even if the thread was never
+     * created (sync_init can fail) — otherwise any slot that took an EPROCESS
+     * reference leaks it, and the snapshot pool leaks with it. So only the
+     * thread join is conditional. */
+    if (g_sync_thread) {
+        InterlockedExchange(&g_sync_stop_flag, 1);
+        KeSetEvent(&g_sync_stop, IO_NO_INCREMENT, FALSE);
+        {
+            PVOID obj = NULL;
+            if (NT_SUCCESS(ObReferenceObjectByHandle(g_sync_thread, THREAD_ALL_ACCESS,
+                                                     *PsThreadType, KernelMode,
+                                                     &obj, NULL))) {
+                KeWaitForSingleObject(obj, Executive, KernelMode, FALSE, NULL);
+                ObDereferenceObject(obj);
+            }
+            ZwClose(g_sync_thread);
+        }
+        g_sync_thread = NULL;
+    }
+    InterlockedExchange(&g_sync_mode, 0);
+    if (g_sync_scratch) {
+        ExFreePoolWithTag(g_sync_scratch, YGHV_TAG);
+        g_sync_scratch = NULL;
+    }
+    for (i = 0; i < YGHV_SYNC_MAX; i++) {
+        InterlockedExchange(&g_sync[i].active, 0);
+        if (g_sync[i].snapshot) {
+            ExFreePoolWithTag(g_sync[i].snapshot, YGHV_TAG);
+            g_sync[i].snapshot = NULL;
+        }
+    }
+    LOG_ERROR("sync guard: stopped");
+}
+
 static uint64_t yghv_pt_read(uint64_t table_pa, uint64_t index) {
     uint64_t *va;
     if (!table_pa) return 0;
@@ -231,11 +653,19 @@ NTSTATUS yghv_protect_init(void) {
     g_protect.config.auto_disarm = 1;
     g_protect.config.deny_status = 0xC0000022;
     yghv_protect_refresh_cr3_list_locked();
+    /* 9.299 (C line): start the polling guard thread. It idles until
+     * IOCTL_YGHV_SET_SYNC switches the master mode on, so an unused guard
+     * costs one sleeping thread and no polling. */
+    yghv_protect_sync_init();
     return STATUS_SUCCESS;
 }
 
 void yghv_protect_cleanup(void) {
     uint32_t i, t;
+    /* 9.299 (C line): join the guard thread FIRST — it dereferences page
+     * snapshots and reads g_protect targets, so it must be gone before the
+     * structures below are torn down. */
+    yghv_protect_sync_stop();
     ExAcquireFastMutex(&g_protect_lock);
     for (i = 0; i < YGHV_PROTECT_MAX_HOOKS; i++) {
         if (g_protect_hooks[i].installed)
@@ -548,7 +978,27 @@ int yghv_protect_arm_page(yghv_protect_page_t *p) {
 
 static int yghv_protect_arm_page_locked(yghv_protect_page_t *p) {
     ULONG i;
-    int st = npt_split_2mb_to_4kb(&g_npt, p->gpa);
+    int st;
+
+    /* 9.299 (C line): in sync mode the page must stay present+WRITABLE in the
+     * NPT for its whole armed life. Nothing is flipped, so the hardware never
+     * has to invalidate a translation and the Zen3 NPT-TLB limitation (9.297 /
+     * 9.298) cannot apply. Detection moves to the polling guard thread. */
+    if (InterlockedCompareExchange(&g_sync_mode, 0, 0)) {
+        st = npt_split_2mb_to_4kb(&g_npt, p->gpa);
+        if (st)
+            return st;
+        st = npt_set_page_perm(&g_npt, p->gpa,
+                               NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
+        if (st)
+            return st;
+        p->armed = 1;
+        /* 9.299 FIX: _locked form — the caller already holds g_protect_lock. */
+        (void)yghv_protect_sync_arm_locked(p->gpa);
+        return 0;
+    }
+
+    st = npt_split_2mb_to_4kb(&g_npt, p->gpa);
     if (st)
         return st;
     st = npt_set_page_perm(&g_npt, p->gpa, NPT_PERM_PRESENT);
@@ -577,7 +1027,19 @@ int yghv_protect_disarm_page(yghv_protect_page_t *p) {
 
 static int yghv_protect_disarm_page_locked(yghv_protect_page_t *p) {
     ULONG i;
-    int st = npt_set_page_perm(&g_npt, p->gpa,
+    int st;
+
+    /* 9.299 (C line): drop the page from the polling guard. */
+    yghv_protect_sync_disarm(p->gpa);
+
+    if (InterlockedCompareExchange(&g_sync_mode, 0, 0)) {
+        /* Sync mode never flipped anything, so there is no permission to put
+         * back — just clear the armed flag. */
+        p->armed = 0;
+        return 0;
+    }
+
+    st = npt_set_page_perm(&g_npt, p->gpa,
         NPT_PERM_PRESENT | NPT_PERM_WRITABLE);
     if (!st) {
         p->armed = 0;

@@ -854,6 +854,54 @@ try {
                 Write-Host ("config-fake: {0} OK" -f $val)
             }
         }
+        'config-fake-tlb' {
+            # 9.297 (A'): runtime TLB-flush strategy for the fake-write path.
+            # No arg = read back {mode, times_consulted}.
+            # Modes: 0=legacy(TlbControl=1+INVLPGA) 1=TlbControl=2+INVLPGA
+            #        2=TlbControl=2 no-INVLPGA      3=TlbControl=1+INVLPGA
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x813)) -OutputLength 16
+                $names = @('legacy(TC=1+INVLPGA)', 'flushall(TC=2+INVLPGA)',
+                           'flushall-noINVLPGA', 'legacy-noVmcbClean',
+                           'reopen-main+TC=2')
+                $m = [BitConverter]::ToUInt64($out, 0)
+                $nm = if ($m -lt $names.Count) { $names[$m] } else { '?' }
+                Write-Host ("config-fake-tlb: mode={0} [{1}] consulted={2}" -f
+                    $m, $nm, [BitConverter]::ToUInt64($out, 8))
+            } else {
+                $val = [uint32]::Parse($Arg1)
+                if ($val -gt 4) { throw 'config-fake-tlb: must be 0..4' }
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x813)) `
+                    -InBytes ([BitConverter]::GetBytes($val)) | Out-Null
+                Write-Host ("config-fake-tlb: set {0} OK" -f $val)
+            }
+        }
+        'config-sync' {
+            # 9.299 (C line): SYNC GUARD — snapshot + poll, no NPT permission
+            # flip. The page stays writable so the hardware never needs to
+            # invalidate a translation; a guard thread detects drift by
+            # comparison and rolls the page back.
+            # No arg = read {mode, polls, hits, interval_ms, running, pages}.
+            # 1 arg = enable/disable; 2 args = also set the interval (ms).
+            if ($null -eq $Arg1) {
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x814)) -OutputLength 56
+                Write-Host ("config-sync: mode={0} polls={1} hits={2} interval_ms={3} running={4} refused={5} pages={6}" -f
+                    [BitConverter]::ToUInt64($out, 0), [BitConverter]::ToUInt64($out, 8),
+                    [BitConverter]::ToUInt64($out, 16), [BitConverter]::ToUInt64($out, 24),
+                    [BitConverter]::ToUInt64($out, 32), [BitConverter]::ToUInt64($out, 40), [BitConverter]::ToUInt64($out, 48))
+            } else {
+                $en = [uint32]::Parse($Arg1)
+                if ($en -gt 1) { throw 'config-sync: enable must be 0 or 1' }
+                $ms = 50
+                if ($null -ne $Arg2) { $ms = [uint32]::Parse($Arg2) }
+                $cfg = New-Object byte[] 8
+                [BitConverter]::GetBytes($en).CopyTo($cfg, 0)
+                [BitConverter]::GetBytes($ms).CopyTo($cfg, 4)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x814)) `
+                    -InBytes $cfg | Out-Null
+                Write-Host ("config-sync: set enable={0} interval_ms={1} OK" -f $en, $ms)
+            }
+        }
         'mmf-open' {
             if ($null -eq $Arg1) { throw 'mmf-open: usage: mmf-open <path>' }
             $size = [uint32]4096
@@ -904,6 +952,34 @@ try {
                 [YghvMmf]::UnmapFile($map)
             }
             Write-Host 'mmf-loop: done'
+        }
+        'mmf-hold' {
+            # 9.302 (A phase): a PASSIVE target — maps the section, publishes
+            # pid + VA, then just sleeps. It never writes the page itself.
+            # Needed because mmf-loop writes every 400ms, which makes it
+            # impossible to tell "the guard rolled my write back" from "the
+            # target's own next write overwrote it". With a holder that never
+            # writes, a read after our write is unambiguous.
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'mmf-hold: usage: mmf-hold <path> <seconds> [info_path]'
+            }
+            $path = $Arg1
+            $secs = [int]$Arg2
+            $map = [YghvMmf]::MapFile($path, [uint32]4096)
+            $pidVal = [YghvCtlNative]::GetCurrentProcessId()
+            # Seed a recognisable, constant pattern ONCE so the page has a
+            # known baseline (the guard snapshots it at arm time).
+            $seed = [long]0x00C4C40000000000
+            try { [YghvMmf]::WriteVal($map.View, $seed) } catch {}
+            $line = ("mmf-hold: pid={0} va=0x{1:X} seed=0x{2:X}" -f $pidVal, $map.View.ToInt64(), $seed)
+            Write-Host $line
+            if ($null -ne $Arg3) { Set-Content -LiteralPath $Arg3 -Value $line -Encoding ASCII }
+            try {
+                Start-Sleep -Seconds $secs
+            } finally {
+                [YghvMmf]::UnmapFile($map)
+            }
+            Write-Host 'mmf-hold: done'
         }
         'mmf-write' {
             # Attacker side: same section, foreign CR3. One store; while the
@@ -1022,6 +1098,36 @@ try {
                 } else {
                     Write-Host ("wpm-write: readback FAILED err=0x{0:X}" -f
                         [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+                }
+            } finally {
+                [YghvMem]::CloseHandle($h) | Out-Null
+            }
+        }
+        'wpm-read' {
+            # 9.299 (C line): pure read of a target's 8 bytes — NO write.
+            # Needed to verify the sync guard's rollback: a write-based probe
+            # (wpm-write with value 0) perturbs the page it is trying to
+            # measure, and reads back before the 50ms poll can act.
+            if ($null -eq $Arg1 -or $null -eq $Arg2) {
+                throw 'wpm-read: usage: wpm-read <pid> <hex_va>'
+            }
+            $pidVal = [uint32]::Parse($Arg1)
+            $va = [Convert]::ToUInt64(($Arg2 -replace '^0[xX]', ''), 16)
+            $h = [YghvMem]::OpenProcess(0x0410, 0, $pidVal)   # PROCESS_VM_READ
+            if ($h -eq [IntPtr]::Zero) {
+                throw ("wpm-read: OpenProcess {0} failed, err {1}" -f
+                    $pidVal, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+            }
+            try {
+                $rb = New-Object byte[] 8
+                $read = [UInt32]0
+                if ([YghvMem]::ReadProcessMemory($h, [IntPtr][Int64]$va, $rb,
+                    [UInt32]8, [ref]$read)) {
+                    Write-Host ("wpm-read: pid={0} va=0x{1:X} value=0x{2:X}" -f
+                        $pidVal, $va, [BitConverter]::ToUInt64($rb, 0))
+                } else {
+                    Write-Host ("wpm-read: pid={0} va=0x{1:X} READ FAILED err=0x{2:X}" -f
+                        $pidVal, $va, [Runtime.InteropServices.Marshal]::GetLastWin32Error())
                 }
             } finally {
                 [YghvMem]::CloseHandle($h) | Out-Null

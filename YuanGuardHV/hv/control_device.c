@@ -394,6 +394,47 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         status = STATUS_BUFFER_TOO_SMALL;
         break;
     }
+    case IOCTL_YGHV_SET_FAKE_TLB: {
+        /* 9.297 (A'): runtime TLB-flush strategy for the fake-write path.
+         * Zero-length input = read back {mode, times_consulted}. 4-byte input
+         * sets the mode (0..3). See protect.c for the strategy table. */
+        if (in_len == 0 && out_len >= 16) {
+            UINT64 *out = (UINT64 *)buf;
+            out[0] = (UINT64)yghv_protect_fake_tlb_get();
+            out[1] = (UINT64)yghv_protect_fake_tlb_seen();
+            info = 16;
+            break;
+        }
+        if (in_len >= sizeof(ULONG)) {
+            ULONG *in = (ULONG *)buf;
+            yghv_protect_fake_tlb_set((int)in[0]);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
+    case IOCTL_YGHV_SET_SYNC: {
+        /* 9.299 (C line): sync guard — snapshot + poll, no NPT flip.
+         * Zero-length input reads {mode, polls, hits, interval_ms, running, pages}.
+         * 8-byte input {ULONG enable, ULONG interval_ms} sets them. */
+        if (in_len == 0 && out_len >= 56) {
+            UINT64 *out = (UINT64 *)buf;
+            yghv_protect_sync_diag(out);
+            info = 56;
+            break;
+        }
+        if (in_len >= 8) {
+            ULONG *in = (ULONG *)buf;
+            yghv_protect_sync_set_interval((int)in[1]);
+            /* Master switch; per-page snapshots are taken inside the setter. */
+            yghv_protect_sync_mode_set(in[0] ? 1 : 0);
+            status = STATUS_SUCCESS;
+            break;
+        }
+        status = STATUS_BUFFER_TOO_SMALL;
+        break;
+    }
     default:
         status = STATUS_INVALID_DEVICE_REQUEST;
         break;

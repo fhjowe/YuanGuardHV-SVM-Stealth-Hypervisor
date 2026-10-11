@@ -150,6 +150,21 @@ LONG yghv_protect_fake_alt_active(void);
 void yghv_protect_fake_ncr3_resync(void);
 void yghv_protect_fake_invpga_all(UINT32 asid);   /* 9.289 C6.1 */
 void yghv_protect_fake_diag(UINT64 out[5]);
+/* 9.297 (A'): runtime TLB-flush strategy for the fake-write path. */
+int  yghv_protect_fake_tlb_get(void);
+void yghv_protect_fake_tlb_set(int mode);
+LONG yghv_protect_fake_tlb_seen(void);
+int  yghv_protect_fake_tlb_plan(int *use_invlpga);
+int  yghv_protect_fake_reopen_main(uint64_t gpa);
+/* 9.299 (C line): snapshot + poll guard — no NPT permission flip. */
+int  yghv_protect_sync_mode_get(void);
+void yghv_protect_sync_mode_set(int on);
+void yghv_protect_sync_diag(UINT64 out[7]);
+void yghv_protect_sync_set_interval(int ms);
+int  yghv_protect_sync_arm(uint64_t gpa);
+void yghv_protect_sync_disarm(uint64_t gpa);
+void yghv_protect_sync_init(void);
+void yghv_protect_sync_stop(void);
 uint64_t yghv_protect_control_walk_gpa(void);
 void yghv_protect_on_process_exit(uint32_t pid);
 void yghv_protect_rearm(svm_vcpu_t *vcpu);

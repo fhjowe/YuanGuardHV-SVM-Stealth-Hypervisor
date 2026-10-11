@@ -55,6 +55,11 @@ UINT64 yghv_protect_fake_main_pa(void);
 void yghv_protect_reopen_page_bare(UINT64 gpa);
 UINT64 yghv_protect_guest_va_to_pa(UINT64 cr3, UINT64 va);
 UINT64 yghv_protect_control_walk_gpa(void);
+/* 9.297 (A'): runtime TLB-flush strategy for the fake path (see protect.c).
+ * plan() returns the TlbControl value; *use_invlpga says whether to INVLPGA. */
+int yghv_protect_fake_tlb_plan(int *use_invlpga);
+int yghv_protect_fake_tlb_get(void);
+int yghv_protect_fake_reopen_main(UINT64 gpa);
 }
 static volatile UINT64 g_S206LastProtectHit = 0;
 /* 9.258 (206-C3): control-plane read of the last protection verdict hit. */
@@ -1276,9 +1281,21 @@ SvHandleVmExit (
                 yghv_protect_find_page_bare(gpa) != NULL &&
                 yghv_protect_fake_bare(gpa, &rearmGpa)) {
                 UINT64 altPa = yghv_protect_fake_alt_pa();
-                VpData->GuestVmcb.ControlArea.TlbControl = 1;
-                if (altPa)
+                /* 9.297 (A'): same runtime selector as the write path. */
+                {
+                    int use_invlpga = 1;
+                    int tlb_ctl = yghv_protect_fake_tlb_plan(&use_invlpga);
+                    VpData->GuestVmcb.ControlArea.TlbControl = (UINT8)tlb_ctl;
+                }
+                if (altPa) {
                     VpData->GuestVmcb.ControlArea.NCr3 = altPa;
+                    /* 9.297 (A'): the write path got VmcbClean=0 in 9.285
+                     * ("the bare write was cache-swallowed") but the read
+                     * path never did. Without it the NCr3 switch can be
+                     * swallowed here, so the readback never sees the
+                     * scratch copy. Mirrored from the write path. */
+                    VpData->GuestVmcb.ControlArea.VmcbClean = 0;
+                }
                 VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = gpa | 1ULL;
                 VpData->GuestVmcb.StateSaveArea.Rflags |= 0x100ULL; /* TF */
                 break;
@@ -1307,7 +1324,24 @@ SvHandleVmExit (
                     core's NCr3 to the alt NPT below and the WHOLE copy runs
                     shadowed until the next CR3 write (context switch) */)
                 {
-                    VpData->GuestVmcb.ControlArea.TlbControl = 1;
+                    /* 9.297 (A'): pick the TLB strategy at runtime. plan()
+                     * returns the TlbControl value and whether to INVLPGA.
+                     * Default (mode 0) reproduces the pre-9.297 behaviour
+                     * exactly: TlbControl=1 + INVLPGA. */
+                    int use_invlpga = 1;
+                    int tlb_ctl = yghv_protect_fake_tlb_plan(&use_invlpga);
+                    VpData->GuestVmcb.ControlArea.TlbControl = (UINT8)tlb_ctl;
+                    /* 9.297 (A'): mode 4 — reopen the armed page in the MAIN
+                     * npt and rely purely on TlbControl=2 (FLUSH ALL). If the
+                     * store lands, FLUSH_ALL does reach the NPT TLB and the
+                     * alt-NPT design is unnecessary; if it still spins, the
+                     * NPT TLB ignores FLUSH_ALL and the limit is architectural. */
+                    if (yghv_protect_fake_tlb_get() == 4) {
+                        yghv_protect_fake_reopen_main(gpa);
+                        VpData->GuestVmcb.ControlArea.GuestPaOfGhcb = 0;
+                        g_S206LastProtectHit = gpa;
+                        break;
+                    }
                     if (vr == 3 /* YGHV_NPF_FAKE */) {
                         /* C6 v4: switch this core's NCr3 to the alt NPT — a
                          * DIFFERENT nCr3 value architecturally flushes the
@@ -1316,12 +1350,16 @@ SvHandleVmExit (
                          * 9.285: VmcbClean=0 forces the CPU to reload the
                          * field (the bare write was cache-swallowed). */
                         /* 9.289 (C6.1): INVLPGA the armed pages' known
-                         * GVAs first -- Zen3 does not flush NPT translations
-                         * on TlbControl or nCr3 change, so the stale
-                         * gpa->real translation would keep the store
-                         * spinning until a natural TLB eviction. */
-                        yghv_protect_fake_invpga_armeds(
-                            VpData->GuestVmcb.ControlArea.GuestAsid);
+                         * GVAs first -- 9.290 concluded Zen3 does not flush
+                         * NPT translations on TlbControl or nCr3 change.
+                         * 9.297 (A'): that conclusion is under review — INVLPGA
+                         * invalidates GVA->GPA (guest page tables), NOT the
+                         * nested GPA->HPA layer that caches this page. The
+                         * selector lets us test TlbControl=2 (FLUSH ALL) and
+                         * the no-INVLPGA variants without a rebuild. */
+                        if (use_invlpga)
+                            yghv_protect_fake_invpga_armeds(
+                                VpData->GuestVmcb.ControlArea.GuestAsid);
                         UINT64 altPa = yghv_protect_fake_alt_pa();
                         if (altPa) {
                             VpData->GuestVmcb.ControlArea.NCr3 = altPa;

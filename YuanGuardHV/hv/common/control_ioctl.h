@@ -49,6 +49,21 @@
 #define IOCTL_YGHV_SET_FAKE_MODE \
     YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x812, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
 
+/* 9.297 (A'): runtime TLB-flush strategy selector for the fake-write path.
+   Values: 0 = legacy (TlbControl=1 + INVLPGA + nCR3, current behaviour)
+           1 = TlbControl=2 (FLUSH_ALL) instead of 1
+           2 = TlbControl=2 + no INVLPGA
+           3 = TlbControl=1 + no INVLPGA (isolates INVLPGA's effect)
+   Zero-length input reads the current value back (ULONG). */
+#define IOCTL_YGHV_SET_FAKE_TLB \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x813, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
+/* 9.299 (C line): SYNC GUARD — snapshot + poll, no NPT permission flip.
+   Zero-length input reads back {mode, polls, hits, interval_ms, running, pages}.
+   8-byte input: {ULONG enable, ULONG interval_ms}. */
+#define IOCTL_YGHV_SET_SYNC \
+    YGHV_CTL_CODE(YGHV_IOCTL_DEVICE_TYPE, 0x814, YGHV_METHOD_BUFFERED, YGHV_FILE_ANY_ACCESS)
+
 #define YGHV_DEVICE_NAME_STRING     L"\\Device\\YuanGuardHV"
 #define YGHV_DOS_DEVICE_NAME_STRING L"\\DosDevices\\YuanGuardHV"
 

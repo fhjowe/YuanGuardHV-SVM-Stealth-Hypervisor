@@ -29,6 +29,13 @@ public class YghvCtl {
     private static final int FN_ADD_PAGE_FOR_PID = 0x810;
     private static final int FN_REMOVE_PAGE_FOR_PID = 0x811;
     private static final int FN_SET_FAKE_MODE = 0x812;
+    /* 9.297 (A'): runtime TLB-flush strategy for the fake-write path.
+       PowerShell-only command (config-fake-tlb); the constant is declared
+       here to keep the C/PS/Java IOCTL parity check green. */
+    private static final int FN_SET_FAKE_TLB = 0x813;
+    /* 9.299 (C line): sync guard — snapshot + poll, no NPT flip.
+       PowerShell-only command (config-sync); declared for IOCTL parity. */
+    private static final int FN_SET_SYNC = 0x814;
 
     private static native long openHandle();
     private static native void closeHandle(long handle);
