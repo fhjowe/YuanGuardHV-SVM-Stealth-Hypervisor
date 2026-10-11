@@ -4931,6 +4931,16 @@ void DriverUnload(struct _DRIVER_OBJECT *d) {
         ZwClose(g_watchdog_thread);
         g_watchdog_thread = NULL;
     }
+    /* 9.292 (defect C): close the progress.log handle on the NORMAL unload path.
+     * DriverEntry's every failure path calls yghv_trace_close(), but
+     * DriverUnload never did — so an unloaded driver left an open
+     * \SystemRoot\yghv_progress.log handle owned by the kernel (Restart
+     * Manager reports HOLDER pid=4 = System), pinning the file against
+     * archive/rotation and accumulating one leaked handle per load/unload
+     * cycle. Placed AFTER the 206 telemetry flushes (they write through
+     * g_trace_file) and after the watchdog join, immediately before the
+     * final LOG_INFO. */
+    yghv_trace_close();
     LOG_INFO("DriverUnload");
 }
 
