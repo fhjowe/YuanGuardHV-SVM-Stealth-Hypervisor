@@ -1,0 +1,219 @@
+# 内核 API 契约核对清单（写代码前必过）
+
+> 来源：2026-10-11 本轮**三次蓝屏**的根因分析。
+> 三次都是同一个模式：**我按"看起来对"的直觉写了内核代码，没有核对 API 契约**。
+> 这份清单是给下一个窗口（和未来的我）的**写前检查表**。
+> 位置：`D:\yuanguard\docs\` 同级参考，也见 `YUANMOD_HANDOFF_CURRENT.md` 9.304。
+
+---
+
+## 一、锁：`ExAcquireFastMutex` **不可递归**
+
+**事故**：`yghv_protect_sync_arm` 在 `arm_page_locked` 里被调用，而后者已被
+`yghv_protect_start_locked` 持锁 → 同线程二次获取 → 永久自旋 → guest 三重故障
+→ `0xE2 MANUALLY_INITIATED_CRASH`（`BUGCHECK_P1=0x20601`）。
+
+**规则**：
+- `ExAcquireFastMutex` / `ExAcquireFastMutexUnsafe` **都不可递归**。
+  同线程重复获取 = 死锁，**没有检测、没有报错**。
+- **新增任何取锁函数前，先查调用链上是否已持锁。**
+- 命名约定（本项目既有）：`xxx_locked()` = **假定调用者已持锁**；
+  `xxx()` = 自己加锁后委托。
+- 拆分范式：
+  ```c
+  static int foo_locked(...);              /* 调用者持锁 */
+  int foo(...) {                           /* 公开入口 */
+      ExAcquireFastMutex(&g_lock);
+      int r = foo_locked(...);
+      ExReleaseFastMutex(&g_lock);
+      return r;
+  }
+  ```
+
+**推论**：**从持锁函数里调用"会自己加锁"的函数**，是新代码最易犯的死锁。
+
+---
+
+## 二、物理地址：**跨进程不唯一**
+
+**事故**：`yghv_sync_write_page` 用 slot 的 `gpa` 去 `g_protect.targets`
+反查 `target_va`，再 attach 到那个 target 写回。**但 gpa 是物理地址，
+多个进程可映射同一物理页** → 可能拿到 A 进程的 VA 却 attach 到 B 进程
+→ `memmove` 目标无效 → `0x7E`。
+
+**规则**：
+- **物理地址不是全局唯一标识**。用它反查虚拟地址时，必须同时确认**属主进程**。
+- 更根本：**（进程, VA）才是成对有效的标识**。能不用 gpa 就不用。
+
+---
+
+## 三、用户页访问：`MmGetVirtualForPhysical` **只管系统页**
+
+**事故**：用它取目标**用户页**的 VA，然后解引用 → `movups` 访问违规
+→ `0x3B SYSTEM_SERVICE_EXCEPTION`。
+
+**规则**：
+- `MmGetVirtualForPhysical` 只映射**系统已有直接映射的物理页**
+  （自己的页表、非分页池…）。**用户进程的页没有这种映射。**
+- 读任意物理内存 → `MmCopyMemory(..., MM_COPY_MEMORY_PHYSICAL, ...)`
+  （**注意参数是 `MM_COPY_ADDRESS`，不是 `PHYSICAL_ADDRESS`**）
+- 跨进程读写 → `MmCopyVirtualMemory(源进程, 源VA, 目标进程, 目标VA, 长度, KernelMode, &已拷)`
+  —— **不需要 attach**，返回 NTSTATUS，不依赖 gpa 唯一性。
+- **本项目既有正确写法**：`protect.c:yghv_protect_resolve_va_for` 用
+  `MmCopyVirtualMemory`；`protect.c:yghv_pt_read` 用 `MmGetVirtualForPhysical`
+  读**页表页**（系统页，正确）。
+
+---
+
+## 四、SEH：**`/EHs-c-` 下 `__try/__except` 完全不生成处理器**
+
+**事故**：我给 `RtlCopyMemory` 包了 `__try/__except` 以为能接住访问违规，
+实际 fault 直接变 bugcheck。
+
+**证据**：
+```
+CFLAGS = /nologo /O2 /kernel /GR- /EHs-c- /Zl /GS-
+二进制里搜不到 __C_specific_handler
+```
+`/EHs-c-` 关闭了 C++ 异常，MSVC 不再为 `__try` 生成 SEH 处理器。
+**`__try/__except` 在这个构建下是装饰性的。**
+
+**规则**：
+- **不要指望 `__try/__except` 兜底**。要防 fault，用**返回状态的 API**
+  （`MmCopyVirtualMemory` 而非裸 `RtlCopyMemory`）。
+- 若确实需要 SEH，得改编译选项（会牵动全局，不轻动）。
+- **验证方法**：`grep __C_specific_handler` 二进制；搜不到就说明 SEH 没编进去。
+
+---
+
+## 五、非对齐结构字段：**不要直接解引用**
+
+**事故**：`KEY_VALUE_PARTIAL_INFORMATION.Data` 是**柔性数组**，位于结构偏移 20，
+**未 16 字节对齐**。`*(ULONG*)Data` 被编译器向量化成 `movaps` → `#GP` → `0x7E`。
+
+**规则**：
+- 结构里的柔性数组（`Data[1]`、`Buffer[1]`）**不要直接解引用**。
+- 用 `RtlCopyMemory` 拷到**对齐的局部变量**再读。
+- **同时校验 `Type` 和 `DataLength`** —— 注册表值可能类型不符或长度不足。
+- 通用：`#pragma pack` 的结构、协议解析、驱动间通信结构，都要检查对齐。
+
+---
+
+## 六、注册表：`ZwCreateKey` **不创建中间路径**
+
+**事故**：硬编码 `...\Services\yuanguard\Parameters`，但测试服务名是 `yghva6`
+→ 父键不存在 → 创建失败 → 持久化静默失效。
+
+**规则**：
+- 驱动应该用 `DriverEntry` 传入的 `RegistryPath`（`PUNICODE_STRING`），
+  **不要硬编码服务名**。
+- 本项目 `main.c` 原本把它丢了（`(void)r`），9.304 起改为
+  `yghv_protect_set_registry_path(r)`。
+- **`ZwCreateKey` 失败是静默的** —— 要检查返回值，别 best-effort 到底。
+
+---
+
+## 七、IRQL 与 attach
+
+**规则**：
+- `KeStackAttachProcess` **要求 PASSIVE_LEVEL**。
+- `ExAcquireFastMutex` 把 IRQL 抬到 **APC_LEVEL**。
+- → **attach 必须在锁外**。范式：锁内取 (进程, VA) 并 `ObReferenceObject`，
+  放锁，再 attach/操作，最后 `ObDereferenceObject`。
+- 更好：直接用 `MmCopyVirtualMemory`，**不需要 attach**。
+
+---
+
+## 八、进程生命周期
+
+**事故（静态审查发现，未崩）**：slot 存 `PEPROCESS` 裸拷贝，
+而 watchdog 会 `ObDereferenceObject` + `RtlZeroMemory` → 悬垂指针。
+
+**规则**：
+- **任何跨调用保存的 `PEPROCESS` 都必须自己 `ObReferenceObject`**，
+  并在用完后 `ObDereferenceObject`。
+- **更简单**：不保存指针，每次用时在锁内取 + 取引用。
+- `cleanup` 里的释放顺序：**先停线程（join），再拆结构**。
+- **清理函数即使"看起来没事"也要走完**（不要 `if (!x) return;` 早退导致泄漏）。
+
+---
+
+## 九、编译与调试基础设施
+
+**已加**（9.304）：`build.bat` 链接 `/MAP`。
+```bat
+set "LINKS=%LINKS% /MAP:"%BIN_DIR%\yuanguard_hv.map""
+```
+**用处**：崩溃时 `模块+偏移` 一次查表就能定位函数。
+```powershell
+# 用 map 把 RVA 映射到函数
+$m = Get-Content bin\yuanguard_hv.map
+$prev=$null
+foreach($line in $m){
+  if($line -match '^\s+0001:([0-9a-f]{8})\s+(\S+)\s+([0-9a-f]{16})\s+f'){
+    $rva = [Convert]::ToInt64($Matches[1],16) + 0x1000
+    if($rva -gt $TARGET_RVA){ "落在: $($prev.Sym)"; break }
+    $prev = [pscustomobject]@{ Sym=$Matches[2]; Rva=$rva }
+  }
+}
+```
+**本轮前三次崩溃都没有 map**，全靠手工反汇编 + 读 `.pdata` 定位，极其费时。
+
+---
+
+## 十、测试纪律（**测试 bug 会伪装成驱动故障**）
+
+**本轮 5 个测试 bug**，全都曾让我误判：
+1. **用 `scan-pid` 的任意进程页做被测对象** → 那些页目标自己在改 →
+   触发回滚路径 → 那正是崩溃点。**必须用受控页**（mmf 映射）。
+2. **目标寿命 < arm 耗时** → 目标先死，后续全空读 → 误判 FAIL。
+   （64 页 arm 要 140 秒，每次 `protect-page` 约 2.19 秒 = PS 进程启动开销）
+3. **`$R` / `$r` 变量名冲突** —— **PowerShell 变量名不区分大小写**！
+4. **`$Pages-1`** 被解析成数组减法 → 要写 `($Pages - 1)`。
+5. **`param()` 未声明 `$Arg4`** → 第 4 个位置参数被拒。
+
+**规则**：
+- **判据异常时，先怀疑测试脚本，再怀疑驱动。**
+- 被测对象必须**行为可控**（不自写、寿命足够、地址明确）。
+- 长时间操作前**先估算耗时**并据此设置目标寿命。
+- **PowerShell 变量名大小写敏感度 = 不敏感**，避免单字母大小写配对。
+
+---
+
+## 十一、加载驱动前的检查顺序（实操流程）
+
+1. **静态**：锁纪律 → IRQL → 生命周期 → 内存/对齐 → 编译（看有无 implicit）
+2. **最小面**：加载 + 线程 + IOCTL + 卸载（**不 arm 任何页**）
+3. **单页**：受控页，跑够时间
+4. **多页**：受控页 ×N
+5. **上限**：容量上限 ×N
+6. 每步都用**带挂起保护的脚本**（`Invoke-Guarded` + 有界 `sc stop`）
+
+**本轮的教训**：跳过 1–4 直接上多页 = 连续三次蓝屏。
+
+---
+
+## 十二、崩溃取证流程（已验证有效）
+
+```powershell
+# 1. 读 BugCheck 事件
+Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001} -MaxEvents 3
+
+# 2. 分析 dump（落盘，避免输出被截断）
+kd -z C:\Windows\Minidump\<newest>.dmp -y srv*C:\symbols*https://msdl.microsoft.com/download/symbols -c "!analyze -v; q"
+
+# 3. 关键字段：BUGCHECK_CODE / P1..P4 / SYMBOL_NAME / MODULE_NAME / PROCESS_NAME
+# 4. 用 map 把 MODULE+offset 映射到函数
+# 5. 用 dumpbin /disasm 看崩溃镜像的机器码
+# 6. 用 IAT 解析确认 call qword ptr [xxx] 调的是谁（见 iat_map.ps1）
+```
+
+**`BUGCHECK_P1` 往往直接编码了原因**：
+- `0xE2 P1=0x20601` → `svm_simplevm206.cpp` 的 SHUTDOWN 路径（guest 三重故障）
+- `0x3B/0x7E P1=0xc0000005` → 访问违规
+- `0xD1 P1=0` → 空指针
+
+---
+
+**本文件位置建议**：`D:\yuanguard\docs\KERNEL_API_CHECKLIST.md`
+（或在 `YUANMOD_NEXT_WINDOW_PROMPT.md` 里引用）

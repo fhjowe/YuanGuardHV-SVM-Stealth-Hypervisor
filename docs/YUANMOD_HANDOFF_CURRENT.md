@@ -6598,3 +6598,28 @@ PROCESS_NAME: MuMuNxMain.exe
 
 - **教训（第五次）**：测试脚本的 bug 会伪装成驱动故障。**判据异常时先怀疑测试**。
 - 提交：本记录（未推送）。
+
+
+#### 9.304.6 镜像谱系补充（206c21 - 206c25）
+
+| 镜像 | md5 | 大小 | 性质 |
+|---|---|---|---|
+| `206c21_cfg` | `E0A8874E` | 99712B | sync 参数并入 config（9.303） |
+| `206c22_persist` | `ADF7B9F9` | 101760B | 注册表持久化首版 —— ⚠️ 硬编码服务名，静默失败 |
+| `206c23_tsc` | `1EC9FDA4` | 101760B | + TSC 计时（perf 测量用） |
+| `206c24_persist2` | `FA93D9E8` | 101760B | ⚠️ **会蓝屏**（注册表读取未对齐，0x7E）**勿加载** |
+| `206c25_mmcopy` | `77943784` | 101760B | ★ **当前可用**（MmCopyVirtualMemory 重写，四步验证全 PASS） |
+
+- **当前推荐**：`206c25_mmcopy`
+- 稳定基线仍为 `206c11`（不含 C 线功能）
+- ⚠️ 已知会蓝屏的镜像（仅留作取证，**禁止加载**）：
+  `206c14_sync` / `206c15_syncfix` / `206c24_persist2`
+
+#### 9.304.7 本轮临时文件归档
+
+- 证据：`D:\aaaaaavm\d_round_backup_20261011\e_round_evidence`（21 文件，100KB）
+- 崩溃取证：`D:\aaaaaavm\d_round_backup_20261011\bsod_forensics`
+  （`bsod2/3/4_analysis.log` + `c24_disasm.txt` 1.3MB）
+- MuMu 回滚：`D:\aaaaaavm\mumu_autostart_backup.txt`
+- 已清理 42 个可再生文件（302KB）
+- **新增文档**：`docs/KERNEL_API_CHECKLIST.md`（三次蓝屏的 API 契约教训清单）

@@ -65,6 +65,12 @@ D:\yuanguard，分支 main，HEAD 含 9.290（**本地领先 origin/main 约 20+
 - 蓝屏取证流程：minidump → kd !analyze -v（符号直连，已实测）→ 栈/模块
   定位 → 判读入库。**切勿直接改代码猜原因**。
 
+**⚠️ 写内核代码前必读**：`docs/KERNEL_API_CHECKLIST.md`
+—— 2026-10-11 三次蓝屏换来的 API 契约核对清单（锁不可递归 / 物理地址跨进程
+不唯一 / MmGetVirtualForPhysical 只管系统页 / `/EHs-c-` 下 SEH 失效 /
+非对齐柔性数组 / ZwCreateKey 不建中间路径 / attach 需 PASSIVE / 进程引用计数 /
+/map 用法 / 测试纪律 / 崩溃取证流程）。**本轮的三个 bug 都在那里面写着。**
+
 【本机雷区（全部实测）】
 - **⚠️ ExAcquireFastMutex 不可递归**（9.299 蓝屏根因）：任何取 `g_protect_lock` 的
   新函数，若其调用链上已持锁 → 同线程二次获取 → 永久自旋 → guest 三重故障
