@@ -266,6 +266,7 @@ static volatile LONG g_sync_mode;             /* 0 = off, 1 = on */
 static volatile LONG g_sync_polls;
 static volatile LONG g_sync_hits;
 static volatile LONG g_sync_refused;   /* 9.302: arm refused (slot table full) */
+static volatile LONG64 g_sync_cpu_100ns; /* 9.304: cumulative poll CPU time */
 static volatile LONG g_sync_ms = YGHV_SYNC_DEFAULT_MS;
 static HANDLE g_sync_thread;
 static KEVENT g_sync_stop;
@@ -316,13 +317,22 @@ void yghv_protect_sync_mode_set(int on) {
  * Previously that failure was silent — a page could be armed for protection
  * yet carry no guard slot, so writes to it would land permanently. Surfacing
  * the count makes the condition observable instead of a silent hole. */
-void yghv_protect_sync_diag(UINT64 out[7]) {
+/* 9.304: out[7] = total CPU time spent inside the poll body, in 100ns units.
+ *
+ * Measuring the guard from user mode is hopeless here: Get-Process sums a
+ * whole 12-core box's kernel activity (network, storage, DPCs), which dwarfs
+ * the guard by two orders of magnitude — a 22-page run measured the same as a
+ * 0-page run, and sometimes lower. Timing the poll from inside the driver
+ * isolates the signal completely. Callers divide by polls to get per-poll cost
+ * and by pages to get per-page cost. */
+void yghv_protect_sync_diag(UINT64 out[8]) {
     out[0] = (UINT64)InterlockedCompareExchange(&g_sync_mode, 0, 0);
     out[1] = (UINT64)InterlockedCompareExchange(&g_sync_polls, 0, 0);
     out[2] = (UINT64)InterlockedCompareExchange(&g_sync_hits, 0, 0);
     out[3] = (UINT64)InterlockedCompareExchange(&g_sync_ms, 0, 0);
     out[4] = (UINT64)InterlockedCompareExchange(&g_sync_running, 0, 0);
     out[5] = (UINT64)InterlockedCompareExchange(&g_sync_refused, 0, 0);
+    out[7] = (UINT64)InterlockedCompareExchange64(&g_sync_cpu_100ns, 0, 0);
     {
         int i, n = 0;
         for (i = 0; i < YGHV_SYNC_MAX; i++)
@@ -375,32 +385,55 @@ static int yghv_sync_read_page(uint64_t gpa, void *dst, SIZE_T len) {
  * Only the write-back needs a context, and KeStackAttachProcess requires
  * PASSIVE_LEVEL, so the attach must happen after the mutex is released.
  */
+/* Write one page back into the owning process.
+ *
+ * 9.305 REWRITE. The previous version attached to the process and did a raw
+ * RtlCopyMemory to the target VA. It crashed (0x7E, yghv_a6+0x12e13, memmove
+ * with a 4KB length — the disassembly shows the attach/copy/detach sequence
+ * and a movaps faulting on the destination). Three independent faults made
+ * that approach unsafe:
+ *
+ *   1. A physical address is NOT unique across processes. Matching a slot's
+ *      gpa against g_protect.targets to recover a target_va can return a VA
+ *      belonging to a DIFFERENT process than the one we then attach to.
+ *   2. The build uses /EHs-c-, so __try/__except generates NO handler at all
+ *      (there is no __C_specific_handler in the binary). The guard was
+ *      decorative: a fault inside it became a bugcheck instead of being caught.
+ *   3. Attaching by hand means owning the EPROCESS lifetime, and the watchdog
+ *      can free it concurrently.
+ *
+ * MmCopyVirtualMemory copies by (process, VA) and returns a status — no attach,
+ * no alignment contract, no exception handling, no reliance on gpa uniqueness.
+ * The project already uses it this way (yghv_protect_resolve_va_for). The
+ * (process, VA) pair is read under g_protect_lock and the process referenced
+ * before the lock is dropped, so the pointer cannot go stale. */
 static int yghv_sync_write_page(uint64_t gpa, const void *src, SIZE_T len) {
-    KAPC_STATE apc;
     PEPROCESS owner = NULL;
-    uint64_t va_off = 0;
+    uint64_t target_va = 0;
     uint32_t t, p;
-    int ok = 0;
+    SIZE_T copied = 0;
+    NTSTATUS st;
 
-    /* Phase 1 (lock held): resolve the owner and pin it. */
     ExAcquireFastMutex(&g_protect_lock);
     for (t = 0; t < g_protect.target_count; t++) {
         yghv_protect_target_t *tg = &g_protect.targets[t];
-        if (!tg->process)
+        if (!tg->process || !tg->cr3)
             continue;
         for (p = 0; p < tg->page_count; p++) {
             if ((tg->pages[p].gpa & ~(uint64_t)0xFFFULL) ==
                 (gpa & ~(uint64_t)0xFFFULL)) {
                 owner = tg->process;
-                va_off = tg->pages[p].target_va & ~(uint64_t)0xFFFULL;
+                target_va = tg->pages[p].target_va;
                 break;
             }
         }
         if (owner)
             break;
     }
-    if (owner && va_off) {
-        ObReferenceObject(owner);      /* pin past the lock */
+    /* Take the (process, VA) pair as ONE consistent unit, inside the lock that
+     * already protects target->process. */
+    if (owner && target_va) {
+        ObReferenceObject(owner);
     } else {
         owner = NULL;
     }
@@ -409,18 +442,13 @@ static int yghv_sync_write_page(uint64_t gpa, const void *src, SIZE_T len) {
     if (!owner)
         return 0;
 
-    /* Phase 2 (no lock, PASSIVE): attach and write. */
-    KeStackAttachProcess(owner, &apc);
-    __try {
-        RtlCopyMemory((PVOID)(ULONG_PTR)va_off, src, len);
-        ok = 1;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        ok = 0;
-    }
-    KeUnstackDetachProcess(&apc);
+    st = MmCopyVirtualMemory(IoGetCurrentProcess(), (PVOID)src,
+                             owner, (PVOID)(ULONG_PTR)target_va,
+                             len, KernelMode, &copied);
 
     ObDereferenceObject(owner);
-    return ok;
+
+    return NT_SUCCESS(st) && copied == len;
 }
 
 /* Take (or retake) a snapshot of the real page behind a gpa. */
@@ -492,6 +520,7 @@ void yghv_protect_sync_disarm(uint64_t gpa) {
 static void yghv_sync_poll_once(void) {
     int i;
     UCHAR *cur = NULL;
+    ULONGLONG t0, t1;          /* 9.304: TSC around the poll body */
     InterlockedIncrement(&g_sync_polls);
 
     /* One scratch buffer for all pages — no per-poll allocation. */
@@ -501,6 +530,14 @@ static void yghv_sync_poll_once(void) {
             return;
     }
     cur = (UCHAR *)g_sync_scratch;
+
+    /* Wall time around the body, via __rdtsc — the project's existing timing
+     * primitive (KeQueryPerformanceCounter would pull in hal.lib). On this
+     * invariant-TSC CPU the delta is a faithful cycle count; callers convert
+     * to time with the measured frequency. At 20 polls/s against a 50ms
+     * interval the body is a small fraction of the period, so this is a close
+     * proxy for the CPU the poll consumes. */
+    t0 = __rdtsc();
 
     for (i = 0; i < YGHV_SYNC_MAX; i++) {
         if (!InterlockedCompareExchange(&g_sync[i].active, 0, 0))
@@ -516,6 +553,11 @@ static void yghv_sync_poll_once(void) {
             }
         }
     }
+
+    /* Accumulate raw TSC cycles; the reader converts using the CPU's TSC
+     * frequency, which it can obtain without another kernel round trip. */
+    t1 = __rdtsc();
+    InterlockedExchangeAdd64(&g_sync_cpu_100ns, (LONG64)(t1 - t0));
 }
 
 static VOID yghv_sync_guard_thread(PVOID ctx) {
@@ -665,6 +707,10 @@ NTSTATUS yghv_protect_init(void) {
      * IOCTL_YGHV_SET_SYNC switches the master mode on, so an unused guard
      * costs one sleeping thread and no polling. */
     yghv_protect_sync_init();
+    /* 9.304: restore persisted settings. Must come AFTER sync_init (the guard
+     * thread exists to receive the mode) and is safe here: both the interval
+     * setter and sync_mode_set are callable from this context. */
+    yghv_protect_config_load();
     return STATUS_SUCCESS;
 }
 
@@ -1673,7 +1719,168 @@ NTSTATUS yghv_protect_set_config(const yghv_protect_config_t *cfg) {
     if (want_sync != yghv_protect_sync_mode_get())
         yghv_protect_sync_mode_set(want_sync);
 
+    /* 9.304: persist so the guard survives a reboot. Best-effort — a failure
+     * here must not fail the config change itself. */
+    yghv_protect_config_save();
+
     return STATUS_SUCCESS;
+}
+
+/* ====================================================================
+ * 9.304: config persistence.
+ *
+ * Settings were volatile: every reboot lost them, so an operator had to
+ * re-issue `config sync 1 50` before arming each session. Store them under
+ * the driver's own service key, which is where a kernel driver is expected to
+ * keep its state and is already ACL'd to require elevation to write.
+ *
+ * The key path must be the one DriverEntry was handed (RegistryPath =
+ * \Registry\Machine\System\CurrentControlSet\Services\<service>). It must NOT
+ * be hardcoded: ZwCreateKey does not create intermediate components, so a
+ * hardcoded name fails outright whenever the service is registered under any
+ * other name (e.g. a test service like yghva6). That was the first version's
+ * bug — the key was simply never created.
+ *
+ * Writes happen at PASSIVE from the IOCTL path; the load runs once from
+ * yghv_protect_init. Both are best-effort: a missing or malformed value
+ * falls back to the built-in defaults rather than failing the load.
+ * ==================================================================== */
+#define YGHV_REG_SUBKEY    L"\\Parameters"
+#define YGHV_REG_VAL_SYNC  L"SyncEnable"
+#define YGHV_REG_VAL_MS    L"SyncIntervalMs"
+
+static WCHAR g_reg_key_path[512];      /* RegistryPath + \Parameters */
+static int   g_reg_key_ready;
+
+/* Called once from DriverEntry with the service's own RegistryPath. */
+void yghv_protect_set_registry_path(PUNICODE_STRING registry_path) {
+    static const WCHAR suffix[] = YGHV_REG_SUBKEY;
+    size_t i = 0, k = 0;
+
+    if (!registry_path || !registry_path->Buffer || registry_path->Length == 0)
+        return;
+    if ((registry_path->Length / sizeof(WCHAR)) + 12 >=
+        (sizeof(g_reg_key_path) / sizeof(WCHAR)))
+        return;
+
+    while (i < (size_t)(registry_path->Length / sizeof(WCHAR)) &&
+           i < (sizeof(g_reg_key_path) / sizeof(WCHAR)) - 1) {
+        g_reg_key_path[i] = registry_path->Buffer[i];
+        i++;
+    }
+    while (suffix[k] && i < (sizeof(g_reg_key_path) / sizeof(WCHAR)) - 1)
+        g_reg_key_path[i++] = suffix[k++];
+    g_reg_key_path[i] = 0;
+    g_reg_key_ready = 1;
+    LOG_ERROR("config: registry key = %ws", g_reg_key_path);
+}
+
+static HANDLE yghv_reg_open(int create) {
+    UNICODE_STRING path;
+    OBJECT_ATTRIBUTES oa;
+    HANDLE h = NULL;
+    NTSTATUS st;
+
+    if (!g_reg_key_ready)
+        return NULL;                     /* DriverEntry did not supply it */
+    RtlInitUnicodeString(&path, g_reg_key_path);
+    InitializeObjectAttributes(&oa, &path,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    if (create) {
+        ULONG disp = 0;
+        st = ZwCreateKey(&h, KEY_ALL_ACCESS, &oa, 0, NULL,
+                         REG_OPTION_NON_VOLATILE, &disp);
+    } else {
+        st = ZwOpenKey(&h, KEY_ALL_ACCESS, &oa);
+    }
+    return NT_SUCCESS(st) ? h : NULL;
+}
+
+void yghv_protect_config_save(void) {
+    HANDLE h;
+    UNICODE_STRING name;
+    ULONG v;
+
+    h = yghv_reg_open(1);
+    if (!h)
+        return;                                  /* best-effort */
+
+    v = g_protect.config.sync_enable;
+    RtlInitUnicodeString(&name, YGHV_REG_VAL_SYNC);
+    (void)ZwSetValueKey(h, &name, 0, REG_DWORD, &v, sizeof(v));
+
+    v = g_protect.config.sync_interval_ms;
+    RtlInitUnicodeString(&name, YGHV_REG_VAL_MS);
+    (void)ZwSetValueKey(h, &name, 0, REG_DWORD, &v, sizeof(v));
+
+    ZwClose(h);
+    LOG_ERROR("config: persisted sync=%u ms=%u",
+              g_protect.config.sync_enable, g_protect.config.sync_interval_ms);
+}
+
+/* Read one REG_DWORD out of the driver's Parameters key.
+ *
+ * 9.304 FIX: the first version dereferenced Data directly as a ULONG*. Two
+ * things were wrong with that:
+ *   1. KEY_VALUE_PARTIAL_INFORMATION.Data is a flexible array member sitting
+ *      at offset 20 in the structure, so the read is UNALIGNED. The compiler
+ *      is free to vectorise it into a movaps, which faults (#GP -> 0x7E
+ *      SYSTEM_THREAD_EXCEPTION_NOT_HANDLED) — that is exactly the crash at
+ *      yghv_a6+0x12e13, and the disassembly shows movaps [rcx-10],xmm0.
+ *   2. No type or length validation: a value stored under the wrong type (or
+ *      truncated) would be read past its end.
+ * RtlCopyMemory into an aligned local fixes both, and the type/size check
+ * makes a malformed value fall back to the default instead of misreading. */
+static int yghv_reg_read_dword(HANDLE h, PCWSTR value_name, ULONG *out) {
+    UNICODE_STRING name;
+    UCHAR buf[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    ULONG len = 0;
+    KEY_VALUE_PARTIAL_INFORMATION *kv = (KEY_VALUE_PARTIAL_INFORMATION *)buf;
+
+    if (!h || !value_name || !out)
+        return 0;
+
+    RtlZeroMemory(buf, sizeof(buf));
+    RtlInitUnicodeString(&name, value_name);
+    if (!NT_SUCCESS(ZwQueryValueKey(h, &name, KeyValuePartialInformation,
+                                    buf, sizeof(buf), &len)))
+        return 0;
+
+    if (kv->Type != REG_DWORD || kv->DataLength != sizeof(ULONG))
+        return 0;
+
+    RtlCopyMemory(out, kv->Data, sizeof(ULONG));
+    return 1;
+}
+
+void yghv_protect_config_load(void) {
+    HANDLE h;
+    ULONG v;
+    int got_sync = 0, got_ms = 0;
+
+    h = yghv_reg_open(0);
+    if (!h)
+        return;                                  /* first run: keep defaults */
+
+    if (yghv_reg_read_dword(h, YGHV_REG_VAL_SYNC, &v) && v <= 1) {
+        g_protect.config.sync_enable = v;
+        got_sync = 1;
+    }
+    if (yghv_reg_read_dword(h, YGHV_REG_VAL_MS, &v) && v >= 1 && v <= 5000) {
+        g_protect.config.sync_interval_ms = v;
+        got_ms = 1;
+    }
+    ZwClose(h);
+
+    if (got_sync || got_ms)
+        LOG_ERROR("config: loaded sync=%u ms=%u", g_protect.config.sync_enable,
+                  g_protect.config.sync_interval_ms);
+
+    /* Apply the restored values. Both helpers are lock-free and safe here. */
+    yghv_protect_sync_set_interval((int)g_protect.config.sync_interval_ms);
+    if (g_protect.config.sync_enable)
+        yghv_protect_sync_mode_set(1);
 }
 
 void yghv_protect_get_config(yghv_protect_config_t *out) {

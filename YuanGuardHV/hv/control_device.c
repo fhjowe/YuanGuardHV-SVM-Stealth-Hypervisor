@@ -418,10 +418,10 @@ static NTSTATUS yghv_control_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp) {
         /* 9.299 (C line): sync guard — snapshot + poll, no NPT flip.
          * Zero-length input reads {mode, polls, hits, interval_ms, running, pages}.
          * 8-byte input {ULONG enable, ULONG interval_ms} sets them. */
-        if (in_len == 0 && out_len >= 56) {
+        if (in_len == 0 && out_len >= 64) {
             UINT64 *out = (UINT64 *)buf;
             yghv_protect_sync_diag(out);
-            info = 56;
+            info = 64;
             break;
         }
         if (in_len >= 8) {

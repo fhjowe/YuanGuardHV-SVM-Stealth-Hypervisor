@@ -36,7 +36,9 @@ param(
     [Parameter(Position = 0)][string]$Command = 'state',
     [Parameter(Position = 1)]$Arg1 = $null,
     [Parameter(Position = 2)]$Arg2 = $null,
-    [Parameter(Position = 3)]$Arg3 = $null
+    [Parameter(Position = 3)]$Arg3 = $null,
+    # 9.305: Arg4 added for mmf-hold's optional mapping size (multi-page tests).
+    [Parameter(Position = 4)]$Arg4 = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -912,11 +914,11 @@ try {
             # No arg = read {mode, polls, hits, interval_ms, running, pages}.
             # 1 arg = enable/disable; 2 args = also set the interval (ms).
             if ($null -eq $Arg1) {
-                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x814)) -OutputLength 56
-                Write-Host ("config-sync: mode={0} polls={1} hits={2} interval_ms={3} running={4} refused={5} pages={6}" -f
+                $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x814)) -OutputLength 64
+                Write-Host ("config-sync: mode={0} polls={1} hits={2} interval_ms={3} running={4} refused={5} pages={6} tsc_cycles={7}" -f
                     [BitConverter]::ToUInt64($out, 0), [BitConverter]::ToUInt64($out, 8),
                     [BitConverter]::ToUInt64($out, 16), [BitConverter]::ToUInt64($out, 24),
-                    [BitConverter]::ToUInt64($out, 32), [BitConverter]::ToUInt64($out, 40), [BitConverter]::ToUInt64($out, 48))
+                    [BitConverter]::ToUInt64($out, 32), [BitConverter]::ToUInt64($out, 40), [BitConverter]::ToUInt64($out, 48), [BitConverter]::ToUInt64($out, 56))
             } else {
                 $en = [uint32]::Parse($Arg1)
                 if ($en -gt 1) { throw 'config-sync: enable must be 0 or 1' }
@@ -989,17 +991,22 @@ try {
             # target's own next write overwrote it". With a holder that never
             # writes, a read after our write is unambiguous.
             if ($null -eq $Arg1 -or $null -eq $Arg2) {
-                throw 'mmf-hold: usage: mmf-hold <path> <seconds> [info_path]'
+                throw 'mmf-hold: usage: mmf-hold <path> <seconds> [info_path] [size_bytes]'
             }
             $path = $Arg1
             $secs = [int]$Arg2
-            $map = [YghvMmf]::MapFile($path, [uint32]4096)
+            # 9.305: optional mapping size, so a multi-page test can arm several
+            # CONTROLLED pages instead of scan-pid's arbitrary process pages.
+            # Arming those made the guard roll back live code/data — that is how
+            # the 0x7E crash was reached, and it was a test-design error.
+            $mapSize = if ($null -ne $Arg4) { [uint32]::Parse($Arg4) } else { [uint32]4096 }
+            $map = [YghvMmf]::MapFile($path, $mapSize)
             $pidVal = [YghvCtlNative]::GetCurrentProcessId()
             # Seed a recognisable, constant pattern ONCE so the page has a
             # known baseline (the guard snapshots it at arm time).
             $seed = [long]0x00C4C40000000000
             try { [YghvMmf]::WriteVal($map.View, $seed) } catch {}
-            $line = ("mmf-hold: pid={0} va=0x{1:X} seed=0x{2:X}" -f $pidVal, $map.View.ToInt64(), $seed)
+            $line = ("mmf-hold: pid={0} va=0x{1:X} seed=0x{2:X} size=0x{3:X}" -f $pidVal, $map.View.ToInt64(), $seed, $mapSize)
             Write-Host $line
             if ($null -ne $Arg3) { Set-Content -LiteralPath $Arg3 -Value $line -Encoding ASCII }
             try {

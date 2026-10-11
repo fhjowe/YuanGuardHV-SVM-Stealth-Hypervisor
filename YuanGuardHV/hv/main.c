@@ -4977,6 +4977,9 @@ NTSTATUS DriverEntry(struct _DRIVER_OBJECT*d,PUNICODE_STRING r){
     KeSetSystemAffinityThread((KAFFINITY)1);
     yghv_init_auth_cookie();
     yghv_trace_init();
+    /* 9.304: hand the service's own registry path to the persistence layer
+     * BEFORE protect_init, which loads the saved settings. */
+    yghv_protect_set_registry_path(r);
     sv = yghv_protect_init();
     if (sv) {
         LOG_ERROR("yghv_protect_init failed 0x%x", sv);

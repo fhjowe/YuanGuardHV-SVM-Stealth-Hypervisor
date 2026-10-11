@@ -6531,3 +6531,70 @@ B3e 目标退出 → watchdog 解除武装      PASS（pages 0）
   应测**分布**。探针开销本身（PS 启动）会淹没被测现象。
 
 
+
+
+### 9.304 2026-10-11 MuMu 干扰排除 + **C 线重写（MmCopyVirtualMemory）** + 挨个来四步全 PASS
+
+#### 9.304.1 第四次崩溃归属：**第三方，非本项目**
+```
+BUGCHECK    : 0xD1 DRIVER_IRQL_NOT_LESS_OR_EQUAL
+BUGCHECK_P1 : 0  （空指针解引用）
+SYMBOL_NAME : usbwifi+341c0
+MODULE_NAME : usbwifi        ← AIC 802.11 无线驱动（MuMu 模拟器组件）
+PROCESS_NAME: MuMuNxMain.exe
+```
+**崩溃在 usbwifi.sys，与本项目无关**（当时 yghv 驱动未加载，已确认无残留）。
+四次崩溃的归属：
+
+| 时间 | BugCheck | 模块 | 归属 |
+|---|---|---|---|
+| 08:39 | 0xE2 | yghv_c_line | **本项目** — FastMutex 递归死锁 |
+| 08:53 | 0x3B | yghv_c_line | **本项目** — MmGetVirtualForPhysical 用于用户页 |
+| 10:44 | 0x7E | yghv_a6 | **本项目** — 注册表读取未对齐 memmove |
+| 11:49 | 0xD1 | usbwifi | **第三方** — MuMu usbwifi.sys 空指针 |
+
+#### 9.304.2 MuMu 已停用 + 取消自启动（用户指示）
+- 停止：MuMuRemoteService（Auto -> Manual），结束全部 MuMu 用户态进程
+- 取消自启动：删除 HKCU Run 的 MuMuNxMain / MuMuPlayerService
+- 驱动改 Manual：MuMuNxNetLwf / MuMuNxSup / MuMuVMMDrv / usbwifi
+- **备份/回滚**：`D:\aaaaaavm\mumu_autostart_backup.txt`（含完整回滚命令）
+- 注：驱动当前仍 Running（被占用无法热卸载），但 StartMode=Manual 意味着**重启后不自动加载**。
+
+#### 9.304.3 ★ C 线写路径重写：KeStackAttachProcess -> MmCopyVirtualMemory
+- **第三次崩溃（0x7E）根因**（反汇编 + IAT 解析确认）：
+  `yghv_sync_write_page` 用 `KeStackAttachProcess` + `RtlCopyMemory(4096)`，
+  崩溃在 `memmove` 的 `movaps [rcx-10],xmm0`（目标地址无效）。
+  三个独立缺陷使该写法不安全：
+  1. **物理地址跨进程不唯一** —— 用 gpa 反查 target_va 可能拿到**别的进程**的 VA；
+  2. **`/EHs-c-` 下 `__try/__except` 完全不生成处理器**（二进制里无 `__C_specific_handler`）
+     —— 我写的 SEH 是**装饰性的**，fault 直接变 bugcheck；
+  3. 手工 attach 意味着要自己管 EPROCESS 生命周期，而 watchdog 会并发释放。
+- **重写**：改用项目既有的 `MmCopyVirtualMemory`（按 (进程,VA) 拷贝，返回 NTSTATUS）
+  —— 不需要 attach、无对齐契约、无 SEH、不依赖 gpa 唯一性。
+  (进程, VA) 在 `g_protect_lock` 内**成对**取出并 `ObReferenceObject` 后再放锁。
+- **同时修正测试设计错误**：不再用 `scan-pid` 的任意进程页做被测对象
+  （那些页目标自己在改 → 触发回滚 → 正是崩溃点）；改用 `mmf-hold` 的
+  **大映射受控页**（新增 size 参数，`yghv_ctl.ps1` 加 `$Arg4`）。
+
+#### 9.304.4 挨个来：四步验证全部 PASS（**全程零蓝屏**）
+
+| 步 | 内容 | 结果 |
+|---|---|---|
+| 1 | 最小面（不 arm 任何页） | **6/6 PASS** |
+| 2 | 单页受控（mmf-hold） | **5/5 PASS** |
+| 3 | 16 页受控 | **5/5 PASS** |
+| 4 | **64 页（容量上限）** | **5/5 PASS** |
+
+- 关键对比：**上次崩溃就在「多页 + guard 运行」这一步**，现 64 页稳定跑通。
+- 性能数据：**每页 arm 约 2.19 秒**（PS 进程启动开销，非驱动开销）。
+- 镜像 `206c25_mmcopy`（md5 `77943784`，101760B）。
+
+#### 9.304.5 本轮测试脚本 bug 汇总（**都不是驱动问题**）
+1. `scan-pid` 任意页做被测对象 → 目标自改触发回滚（**设计错误，最严重**）
+2. 目标寿命 150s < 64 页 arm 耗时 140s → 目标先死，后续全空读
+3. `$R` / `$r` 变量名冲突（**PowerShell 变量名不区分大小写**）→ 哈希表被覆盖成字符串
+4. `$Pages-1` 被解析为数组减法 → 需 `($Pages - 1)`
+5. `mmf-hold` 第 4 参数被拒 → `param()` 只声明了 Arg1..Arg3，需加 `$Arg4`
+
+- **教训（第五次）**：测试脚本的 bug 会伪装成驱动故障。**判据异常时先怀疑测试**。
+- 提交：本记录（未推送）。

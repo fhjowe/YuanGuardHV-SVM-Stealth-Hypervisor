@@ -164,9 +164,12 @@ int  yghv_protect_fake_reopen_main(uint64_t gpa);
 /* 9.299 (C line): snapshot + poll guard — no NPT permission flip. */
 int  yghv_protect_sync_mode_get(void);
 void yghv_protect_sync_mode_set(int on);
-void yghv_protect_sync_diag(UINT64 out[7]);
+void yghv_protect_sync_diag(UINT64 out[8]);
 void yghv_protect_sync_set_interval(int ms);
 int  yghv_protect_sync_interval_get(void);
+void yghv_protect_set_registry_path(PUNICODE_STRING registry_path);
+void yghv_protect_config_save(void);
+void yghv_protect_config_load(void);
 int  yghv_protect_sync_arm(uint64_t gpa);
 void yghv_protect_sync_disarm(uint64_t gpa);
 void yghv_protect_sync_init(void);

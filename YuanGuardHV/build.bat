@@ -77,6 +77,10 @@ if "%YGHV_V101_4VEC%"=="1" set "CFLAGS=%CFLAGS% /DYGHV_V101_4VEC=1"
 
 set "LINKS=/nologo /SUBSYSTEM:NATIVE /DRIVER:WDM /ENTRY:DriverEntry /MACHINE:X64"
 set "LINKS=%LINKS% /OPT:NOREF,NOICF"
+rem 9.304: emit a MAP file. Three BSODs this session had to be triaged by hand
+rem (disassembling raw bytes and reading .pdata) because no symbol map existed;
+rem with /MAP, "yghv+0x12e13" resolves to a named function in one lookup.
+set "LINKS=%LINKS% /MAP:"%BIN_DIR%\yuanguard_hv.map""
 set "LINKS=%LINKS% /LIBPATH:"%WDK_ROOT%\Lib\%WDK_VER%\km\x64""
 
 echo   WDK Version: %WDK_VER%
