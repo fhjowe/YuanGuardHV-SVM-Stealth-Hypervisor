@@ -508,10 +508,14 @@ function Read-YghvTargets {
 }
 
 function Read-YghvConfig {
-    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80B)) -OutputLength 8
+    # 9.303: the struct grew to 16 bytes (auto_disarm, deny_status,
+    # sync_enable, sync_interval_ms).
+    $out = Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80B)) -OutputLength 16
     return @{
         autoDisarm = [BitConverter]::ToUInt32($out, 0)
         denyStatus = [BitConverter]::ToUInt32($out, 4)
+        syncEnable = [BitConverter]::ToUInt32($out, 8)
+        syncMs     = [BitConverter]::ToUInt32($out, 12)
     }
 }
 
@@ -624,28 +628,52 @@ try {
         'config' {
             if ($null -eq $Arg1) {
                 $c = Read-YghvConfig
-                Write-Host ("config: auto_disarm={0} deny_status=0x{1:X}" -f
-                    $c.autoDisarm, $c.denyStatus)
+                Write-Host ("config: auto_disarm={0} deny_status=0x{1:X} sync={2} sync_ms={3}" -f
+                    $c.autoDisarm, $c.denyStatus, $c.syncEnable, $c.syncMs)
             } elseif ($Arg1.ToLower() -eq 'auto-disarm') {
                 $val = [uint32]::Parse($Arg2)
                 if ($val -gt 1) { throw 'config: auto-disarm must be 0 or 1' }
-                $cfg = New-Object byte[] 8
-                [BitConverter]::GetBytes($val).CopyTo($cfg, 0)
                 $cur = Read-YghvConfig
+                $cfg = New-Object byte[] 16
+                [BitConverter]::GetBytes($val).CopyTo($cfg, 0)
                 [BitConverter]::GetBytes([uint32]$cur.denyStatus).CopyTo($cfg, 4)
+                [BitConverter]::GetBytes([uint32]$cur.syncEnable).CopyTo($cfg, 8)
+                [BitConverter]::GetBytes([uint32]$cur.syncMs).CopyTo($cfg, 12)
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80A)) `
                     -InBytes $cfg | Out-Null
                 Write-Host ("config: auto_disarm={0} OK" -f $val)
             } elseif ($Arg1.ToLower() -eq 'deny-status') {
                 $val = [uint32]([Convert]::ToUInt64($Arg2, 16))
                 if ($val -eq 0) { throw 'config: deny-status must be non-zero' }
-                $cfg = New-Object byte[] 8
                 $cur = Read-YghvConfig
+                $cfg = New-Object byte[] 16
                 [BitConverter]::GetBytes([uint32]$cur.autoDisarm).CopyTo($cfg, 0)
                 [BitConverter]::GetBytes($val).CopyTo($cfg, 4)
+                [BitConverter]::GetBytes([uint32]$cur.syncEnable).CopyTo($cfg, 8)
+                [BitConverter]::GetBytes([uint32]$cur.syncMs).CopyTo($cfg, 12)
                 Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80A)) `
                     -InBytes $cfg | Out-Null
                 Write-Host ("config: deny_status=0x{0:X} OK" -f $val)
+            } elseif ($Arg1.ToLower() -eq 'sync') {
+                # 9.303: set the guard in the same call as the other options,
+                # so a session can configure-then-arm without a separate
+                # config-sync round trip.
+                #   config sync <0|1> [interval_ms]
+                $en = [uint32]::Parse($Arg2)
+                if ($en -gt 1) { throw 'config: sync must be 0 or 1' }
+                $cur = Read-YghvConfig
+                $ms = if ($null -ne $Arg3) { [uint32]::Parse($Arg3) } else { [uint32]$cur.syncMs }
+                if ($ms -lt 1) { throw 'config: sync interval must be >= 1 ms' }
+                $cfg = New-Object byte[] 16
+                [BitConverter]::GetBytes([uint32]$cur.autoDisarm).CopyTo($cfg, 0)
+                [BitConverter]::GetBytes([uint32]$cur.denyStatus).CopyTo($cfg, 4)
+                [BitConverter]::GetBytes($en).CopyTo($cfg, 8)
+                [BitConverter]::GetBytes($ms).CopyTo($cfg, 12)
+                Invoke-YghvIoctl -Code ([YghvCtlNative]::IoCtl(0x80A)) `
+                    -InBytes $cfg | Out-Null
+                $now = Read-YghvConfig
+                Write-Host ("config: sync={0} sync_ms={1} OK (readback sync={2} sync_ms={3})" -f
+                    $en, $ms, $now.syncEnable, $now.syncMs)
             } else {
                 throw ("config: unknown option {0}" -f $Arg1)
             }

@@ -6476,3 +6476,58 @@ OVERALL: PASS
   误报 FAIL。**辅助函数参数避免用 `$Pid`/`$Host`/`$Args` 等自动变量名。**
 
 
+### 9.303 2026-10-11 sync 参数并入 config（item 3）+ B3 剩余场景（item 1）（镜像 206c21）
+
+#### 9.303.1 item 3：`yghv_protect_config_t` 8 → 16 字节
+- **动机**：此前 `config-sync` 必须**单独一次 IOCTL**，与 `config` 分离 ——
+  一次会话要配置 guard 得走两条命令，且 `config` 读回看不到 guard 状态。
+- **改动**：结构扩展为 `{auto_disarm, deny_status, sync_enable, sync_interval_ms}`
+  → IOCTL 输入/输出 8 → 16 字节；PS 客户端 `Read-YghvConfig` 同步。
+- **新命令**：`config sync <0|1> [interval_ms]` —— 与其它选项**同一次调用**设置。
+- **关键实现细节**：`set_config` 里 **apply 必须在锁外** ——
+  `sync_mode_set` 自身要取 `g_protect_lock`，同线程二次获取就是 0xE2 那类
+  非递归死锁。故：锁内只写 config 字段，锁外调 `sync_set_interval` + `sync_mode_set`。
+- **`get_config` 报告 LIVE 值**：`sync_enable/sync_interval_ms` 取自
+  `sync_mode_get()` / 新增的 `sync_interval_get()`，而非 config 缓存 ——
+  即使之后被 `config-sync` 改过，读回也是真值。
+- **越界校验**：`sync_enable > 1` 拒绝；`interval_ms` 钳到 `[1, 5000]`。
+- 镜像 `206c21_cfg`（md5 `E0A8874E`，99712B）。
+
+#### 9.303.2 item 1：B3 剩余场景全部验证（A5，11/11 PASS）
+- 脚本 `D:\aaaaaavm\a5_config_b3.ps1`，结果 `a5_result.txt`：
+```
+C1 config 读回含 sync 字段          PASS
+C2 config sync 1 50 设置+读回一致    PASS
+C3 设置后 guard 真的开启（poll 递增）PASS
+C4 一次 config 配置后 arm 即生效     PASS
+C5 config sync 0 关闭且槽位释放      PASS
+C6 越界拒绝（sync=2 / ms=0）        PASS
+B3a guard ON  → 写入被回滚           PASS
+B3b guard OFF → 写入落地             PASS
+B3c 目标自写，guard OFF → 持续落地   PASS（值递增）
+B3d 目标自写，guard ON  → 被钉住     PASS（70% 采样同值）
+B3e 目标退出 → watchdog 解除武装      PASS（pages 0）
+```
+
+#### 9.303.3 ★ B3d 判据的修正：**分布，而非两次相等**
+- **初版 B3d 报 FAIL**，但**不是驱动缺陷，是我的判据错**。
+- **根因**：`wpm-read` 每次调用约 **1.84 秒**（PS 进程启动开销），两次采样
+  间隔太大；而目标写 2.3 次/秒、guard 每 50ms 回滚一次 —— 两次采样可能
+  恰好都落在"目标刚写完、尚未回滚"的窗口内，于是"两次不同"被误判为未钉住。
+- **定量诊断**（`D:\aaaaaavm\b3d_diag.ps1`，24 次快速采样）：
+  ```
+  目标写入速率 : 2.3 次/秒（实测，从目标日志计数）
+  采样分布     : 0xC4C4000000001B × 24/24 = 100%
+  guard        : polls +770, hits +118
+  => PINNED（页面确实被钉住）
+  ```
+- **正确判据**：**多次采样的众数占比**（≥60% 视为钉住），而非"两次采样相等"。
+  修正后 A5 全绿（10 采样中众数占 70%）。
+- **同时确证了设计取舍**：guard **无法区分写入来源** —— 目标进程**自己**的
+  合法写入同样被回滚（B3d 显示目标持续自写却被钉在单一值）。这是
+  "不依赖 TLB"换来的代价，已在 9.299.1 记录，现由 B3d 实证。
+- **测试方法教训（本轮第四次）**：**判据必须匹配被测系统的时标**。
+  用 1.8s 粒度的探针去测 50ms 粒度的机制，两次采样不足以判定；
+  应测**分布**。探针开销本身（PS 启动）会淹没被测现象。
+
+

@@ -338,6 +338,11 @@ void yghv_protect_sync_set_interval(int ms) {
     InterlockedExchange(&g_sync_ms, ms);
 }
 
+/* 9.303: read the live poll interval, so get_config can report the truth. */
+int yghv_protect_sync_interval_get(void) {
+    return (int)InterlockedCompareExchange(&g_sync_ms, 0, 0);
+}
+
 /* 9.299 FIX-2: MmGetVirtualForPhysical only maps physical pages the SYSTEM
  * already has a direct mapping for (its own page tables, pool, ...). A target
  * process's user page has no such mapping, so dereferencing the VA it returns
@@ -652,6 +657,9 @@ NTSTATUS yghv_protect_init(void) {
     g_protect.target_count = 1;
     g_protect.config.auto_disarm = 1;
     g_protect.config.deny_status = 0xC0000022;
+    /* 9.303: the guard starts OFF with the documented default period. */
+    g_protect.config.sync_enable = 0;
+    g_protect.config.sync_interval_ms = YGHV_SYNC_DEFAULT_MS;
     yghv_protect_refresh_cr3_list_locked();
     /* 9.299 (C line): start the polling guard thread. It idles until
      * IOCTL_YGHV_SET_SYNC switches the master mode on, so an unused guard
@@ -1628,10 +1636,19 @@ NTSTATUS yghv_protect_clear(void) {
 }
 
 NTSTATUS yghv_protect_set_config(const yghv_protect_config_t *cfg) {
+    int want_sync, want_ms;
     if (!cfg)
         return STATUS_INVALID_PARAMETER;
     if (cfg->auto_disarm > 1 || cfg->deny_status == 0)
         return STATUS_INVALID_PARAMETER;
+    if (cfg->sync_enable > 1)
+        return STATUS_INVALID_PARAMETER;
+
+    want_ms = (int)cfg->sync_interval_ms;
+    if (want_ms < 1) want_ms = 1;
+    if (want_ms > 5000) want_ms = 5000;
+    want_sync = (int)cfg->sync_enable;
+
     ExAcquireFastMutex(&g_protect_lock);
     /* Strict deny (auto_disarm=0) makes every write to an armed page inject
        #PF. Persistent workload guests have no #PF handler, so reject the
@@ -1642,9 +1659,20 @@ NTSTATUS yghv_protect_set_config(const yghv_protect_config_t *cfg) {
     }
     g_protect.config.auto_disarm = cfg->auto_disarm;
     g_protect.config.deny_status = cfg->deny_status;
-    LOG_ERROR("protect config: auto_disarm=%u deny_status=0x%x",
-        g_protect.config.auto_disarm, g_protect.config.deny_status);
+    g_protect.config.sync_enable = (ULONG)want_sync;
+    g_protect.config.sync_interval_ms = (ULONG)want_ms;
+    LOG_ERROR("protect config: auto_disarm=%u deny_status=0x%x sync=%d ms=%d",
+        g_protect.config.auto_disarm, g_protect.config.deny_status,
+        want_sync, want_ms);
     ExReleaseFastMutex(&g_protect_lock);
+
+    /* 9.303: apply the guard settings OUTSIDE the lock. sync_mode_set takes
+     * g_protect_lock itself, and re-acquiring a FastMutex in the same thread
+     * is the non-recursive deadlock that produced the 0xE2 crash. */
+    yghv_protect_sync_set_interval(want_ms);
+    if (want_sync != yghv_protect_sync_mode_get())
+        yghv_protect_sync_mode_set(want_sync);
+
     return STATUS_SUCCESS;
 }
 
@@ -1652,6 +1680,10 @@ void yghv_protect_get_config(yghv_protect_config_t *out) {
     ExAcquireFastMutex(&g_protect_lock);
     *out = g_protect.config;
     ExReleaseFastMutex(&g_protect_lock);
+    /* 9.303: report the guard's LIVE values, so the read-back is truthful even
+     * if config-sync changed them after the last config write. */
+    out->sync_enable = (ULONG)yghv_protect_sync_mode_get();
+    out->sync_interval_ms = (ULONG)yghv_protect_sync_interval_get();
 }
 
 BOOLEAN yghv_protect_check_target_exited(void) {

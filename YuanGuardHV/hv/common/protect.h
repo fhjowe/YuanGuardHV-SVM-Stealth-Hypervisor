@@ -26,6 +26,11 @@ typedef struct {
 typedef struct {
     ULONG auto_disarm;
     ULONG deny_status;
+    /* 9.303: the sync guard's settings live in the config so they can be set
+     * once alongside the other options and read back in the same call, rather
+     * than needing a separate config-sync round trip before arming. */
+    ULONG sync_enable;        /* 0 = off (default), 1 = on */
+    ULONG sync_interval_ms;   /* poll period; clamped to [1, 5000] */
 } yghv_protect_config_t;
 
 typedef struct {
@@ -161,6 +166,7 @@ int  yghv_protect_sync_mode_get(void);
 void yghv_protect_sync_mode_set(int on);
 void yghv_protect_sync_diag(UINT64 out[7]);
 void yghv_protect_sync_set_interval(int ms);
+int  yghv_protect_sync_interval_get(void);
 int  yghv_protect_sync_arm(uint64_t gpa);
 void yghv_protect_sync_disarm(uint64_t gpa);
 void yghv_protect_sync_init(void);
