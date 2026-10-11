@@ -44,8 +44,16 @@ D:\yuanguard，分支 main，HEAD 含 9.290（**本地领先 origin/main 约 20+
 【关键文件】
 - `docs/YUANMOD_HANDOFF_CURRENT.md`：全程判读史（**最近 9.244–9.290 是
   206/C4-C5/C6 线**，每轮含蓝屏判读）。
-- `YuanGuardHV/tools/yghv_ctl.ps1`：控制面客户端（30 命令，含跨进程
-  protect-page/mmf-*/scan-pid/wpm-write/config-fake/TryRead 等）。
+- `YuanGuardHV/tools/yghv_ctl.ps1`：控制面客户端（**34 命令**，含跨进程
+  protect-page/mmf-*/scan-pid/wpm-write/**wpm-read**/config-fake/
+  **config-sync**/**config sync**/TryRead 等）。
+  - 9.303 新增 `config sync <0|1> [interval_ms]`：sync 参数已并入
+    `config` 结构（16B），**一次调用即可配置 guard**，不必再走单独的
+    `config-sync` 往返；`config` 读回含 `sync=` / `sync_ms=`。
+  - `wpm-read <pid> <hex_va>`：**纯读**（无副作用），用于验证回滚 ——
+    `wpm-write` 会扰动被测页，验证回滚必须用纯读探针。
+  - `mmf-hold <path> <sec> [info]`：**不自写**目标（映射后只睡），
+    用于需要无歧义判据的测试；`mmf-loop` 每 400ms 自写，会污染判据。
 - `D:\aaaaaavm\run_c16_step206c4.ps1`：C4 回归脚本（按镜像名部署，哈希门）。
   （C6 假写验证脚本 = `D:\aaaaaavm\run_c18_step206c6.ps1`，勿混。）
 - `C:\aaaaaavm\kd_c6f.bat`：kd 转储取证模板（`C:\aaaaaavm\kd_last.bat <dump>`
