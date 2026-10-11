@@ -5789,3 +5789,690 @@ AMD-V SVM/NPT 隐形 Hypervisor（YuanGuardHV），替代原 YuanGuard 内核驱
 - **C6 冻结。** 重启恢复由用户操作（驱动已在脚本里卸载）。下一步：真实产品
   目标流程化，或推送 GitHub（等用户指示）。
 - 提交：本记录。
+
+### 9.291 2026-10-11 接手基线核实 + D 轮收尾加固（run_c18 判据假 FAIL 根因闭环；kd 代理死配置修复；部署残留清理）
+
+- **接手方式**：新窗口接手。**全程只读核实**（未加载驱动、未碰机器状态），
+  随后按用户裁决执行「D 轮收尾加固」。工作区核实干净，HEAD = `9ba1baa`
+  （9.290 文档提交），本地领先 origin/main = **28** 提交（提示词写"20+"，
+  实测 28）。
+- **核实通过项**：裸金属确认（`yghv`/`YUANGuardHV` 服务均 1060 不存在、
+  注册表无 `yuang*`、driverquery 无匹配驱动）；归档指纹三项全对
+  （206c7e=`356C5B6B`、206c8a=`267E14EA`、206c9=`EE32957A`）；206 镜像
+  marker 正确（含 `s206b coexist`、不含 `hook test start`）；kd.exe 在位；
+  `debug=No`/`testsigning=Yes`/`dbgsettings=Serial` → **KDNET 确未配置**，
+  与"C6 需 KD 环境"结论自洽。
+
+#### 缺陷 A（真实，已修）：run_c18 判据正则与目标实际取值不匹配 → 假 FAIL
+
+- **根因**：`run_c18_step206c6.ps1` 的 gate1 接受 `^5150C4C4`(写入值) 或
+  `^00C4C4`(旧值)；gate2 用 `current=0x00C4C4`。但目标 mmf-loop 实际写入
+  `0xC4C400000000XX`（前缀 **`C4C40000`**）。**双重错误**：① 旧值前缀写错
+  （`00C4C4` → 应为 `C4C40000`）；② gate2 的 `current=` 之后**紧跟读结果
+  标记**（`yghv_ctl.ps1:921` 实际格式 `current={OK|AVE 0x0} 0x<value>`），
+  故该正则**永不匹配**。9.287 的 gate2 PASS 走的是 `denyOk=BLOCKED` 分支，
+  掩盖了缺陷。
+- **实证**：末轮 `c18_step206c6.log` 第 37、45 行 —— gate1
+  `readback=0xC4C4000000002A`（旧值形态）被判 FAIL、gate2 `current=OK
+  0xC4C4000000002A` 被判 FAIL。**不是假写失败，是判据误判。** 脚本自判行
+  （第 339 行）`FAKE-SHADOWED=False CPL3-DENIED=False OFF-LANDED=False`。
+- **修正**：gate1 补 `^C4C40000` 旧值形态；gate2 改
+  `current=\S+\s+0x0*C4C40000`；同时清掉 gate1 重复的 Say 行
+  （9.287 遗留④ cosmetic）。
+- **验证**：离线回归脚本
+  `D:\aaaaaavm\d_round_backup_20261011\gate_regex_regression.ps1`
+  —— **12/12 PASS**，含「旧判据对照」两条，精确复现误判根因；「第三值
+  （杂散写落真页）」仍正确判 FAIL（未削弱严格性）。脚本 PSParser 语法 0 错误。
+- **未改（列建议项）**：行 49 ABORT 文案 `206c6e`、行 52 文案 `image 206c6c`
+  与哈希门 EE32957A(=206c9) 不一致（陈旧文案，会误导判读）；头部注释与
+  9.286 最终判据语义未同步。
+
+#### 缺陷 B（真实，已修）：kd 取证脚本代理死配置
+
+- **实测**：`127.0.0.1:7890` **无监听**（Test-NetConnection=False、
+  无监听端口枚举、`Invoke-WebRequest -Proxy` 报"目标计算机积极拒绝"）。
+  但 `msdl.microsoft.com:443` 与 `github.com:443` **直连均可达**，
+  直连符号服务器 `HTTP 200`。
+- **修正**：`C:\aaaaaavm\kd_last.bat` 与 `kd_c6f.bat` 的
+  `HTTP_PROXY/HTTPS_PROXY=127.0.0.1:7890` 改为注释（默认直连，保留一键
+  启用路径）。
+- **验证（实测跑通）**：直连拉符号 + `!analyze -v` —— `101126-35203-01.dmp`
+  37s 全栈还原、`100526-17187-01.dmp` 14s（符号已缓存），符号落盘
+  `C:\symbols` 26 文件 / 45.6MB。**kd 取证能力确认可用，且不再依赖失效代理。**
+
+#### 缺陷 C（新发现，未修）：DriverUnload 泄漏 progress-log 文件句柄
+
+- **现象**：`C:\Windows\yghv_progress.log`（9806B，mtime `02:23:57` = 末轮
+  `sc stop` 同一时刻）在**驱动已卸载、服务已删**后仍被独占持有。
+- **定位**：Restart Manager（`RmGetList`，需二次放大缓冲取 `ERROR_MORE_DATA`
+  后重试）报 **HOLDER pid=4 = System** → 句柄属**内核态**，非任何用户态进程。
+- **判读**：`DriverUnload` 路径未关闭 progress-log 的 `ZwCreateFile` 句柄。
+  属产品化前的资源泄漏缺陷（不致命，但反复加载会累积；且使日志无法归档/
+  轮转）。**需在内核代码侧修（DriverUnload 关句柄），非本机操作可解**；
+  重启可释放。
+- **本轮处置**：**未移动该文件**（内核持有，Move-Item 失败）。**更正**：
+  首轮清理脚本曾对该行打印 `MOVED`，实为脚本 bug 误报（`$h` 未重置，
+  沿用了上一轮 `hv3` 的哈希 `09AC0B25`；实际 `Get-FileHash` 与 `Move-Item`
+  均抛错）。已用残留目录清单 + `Test-Path` 双重确认其**从未被移动**。
+- **教训**：批量移动脚本里 `$h` 这类循环变量必须显式重置，否则失败项会
+  被上一轮值伪装成成功。
+
+#### 部署残留清理（已完成）
+
+- **移动（非硬删）** 6 个 `C:\*.sys` 至
+  `D:\aaaaaavm\d_round_backup_20261011\residue\`（带 md5 后缀命名）：
+  `yuanguard_hv_s205.sys.F358EE7E`、`yuanguard_hv_s206.sys.6EEB6BA7`、
+  `yuanguard_hv_s206b.sys.F0310334`、`yuanguard_hv_s206c2.sys.EE32957A`
+  （=206c9）、`yuanguard_hv.sys.DB931C62`、`yuanguard_hv3.sys.09AC0B25`。
+  每项均先断言 `FullName` 与预期路径**逐字相符**再移动。
+- **未动**：`C:\` 根另有 `min_drv.sys`、`SimpleSvm205k.sys`、`yf.sys`
+  —— 非 yuang* 命名、不属本次授权范围，**仅报告不动**（待用户指示）。
+
+#### 文档修正
+
+- `docs/YUANMOD_NEXT_WINDOW_PROMPT.md`【关键文件】三处路径错已修：
+  ① C4 回归脚本 `run_c16_step206c6.ps1` → **`run_c16_step206c4.ps1`**
+  （`step206c6` 那个名字实属 C6 假写脚本 `run_c18_step206c6.ps1`，易混，
+  已加注）；② kd 模板路径 `D:\aaaaaavm\` → **`C:\aaaaaavm\`**（`kd_c6f.bat`
+  与 `kd_last.bat`）；③ 补注两脚本的代理行已改为直连。
+
+#### 附带核实（与判读史对照）
+
+- 9.290 记"1.05M 次重故障"、9.289 记"2.4M"，**日志实测
+  `attempts=123022454 ok=123022454` = 1.23 亿次**（92s 自旋对得上
+  02:22:09→02:23:41）。量级记述偏小，已在 9.290 结论的定性不受影响
+  （"性能不可接受"成立且更强）。
+- 日志第 41 行 `target still alive: NO` —— **目标在 gate1 返回前已耗尽 90s
+  窗口**，此即 gate3 `OpenProcess err 87` 的直接前因（与"C6 冻结"一致）。
+- `YuanGuardHV\bin\yuanguard_hv.sys` = default 构建残留（md5 `BF8AE4A3`、
+  含 `hook test start`、不含 `s206b coexist`）—— **勿当 206 镜像用**；
+  206 线真身只在 `D:\aaaaaavm\` 归档。
+- 末轮 **无蓝屏**（运行窗口 02:21:51–02:24:02，无对应时间 minidump）。
+- 取证复核：`101126-35203-01.dmp` = `0x19 BAD_POOL_HEADER`，栈
+  `nt!KeBugCheckEx ← nt!ExRemovePoolTag ← nt!MmFreeContiguousMemory ←
+  yuanguard_hv_s206c2+0x5d49` —— 与 9.283 判读（npt_cleanup 双重释放）
+  一致，可复现。
+
+#### 本轮未做（等用户指示）
+
+- **未加载任何驱动、未跑 run_c18、未重启、未推送 GitHub**（铁律 1/6）。
+- **建议后续**：① 缺陷 C 的内核侧句柄修复；② run_c18 陈旧文案与头部注释
+  同步；③ 真实产品目标流程化（Minecraft/Forge）或 C6 KD 环境（KDNET）。
+
+- 提交：本记录 + 文档修正。
+
+### 9.292 2026-10-11 缺陷 C 内核修复：DriverUnload 未关 progress.log 句柄（镜像 206c10/md5 B6A60F05；未加载；待用户确认后验证）
+
+- **根因（代码级确认，非猜测）**：`main.c` 的 `DriverUnload()`（原 4851–4935）
+  **整个函数体从未调用 `yghv_trace_close()`**；而 `DriverEntry()` 的**每一条**
+  失败路径都调用了它（4973/4990/5013/5037/…/5566，共 30+ 处）。故**正常卸载
+  路径**必然泄漏 `g_trace_file`（`\SystemRoot\yghv_progress.log` 的内核句柄）
+  —— 与 9.291 的 Restart Manager 实测（HOLDER **pid=4 = System**，驱动已卸载、
+  服务已删后仍独占）**完全吻合**。
+- **修复**：在 `DriverUnload` 尾部、`LOG_INFO("DriverUnload")` **之前**插入
+  `yghv_trace_close();`。**位置论证**：① 必须晚于 206 遥测 flush
+  （`yghv_s206_flush_deny_log` / `yghv_s206_flush_addlog` 经 `g_trace_file`
+  写入，见 4862/4865）；② 晚于看门狗 join；③ 紧邻最终 `LOG_INFO` 以便
+  卸载日志仍可落盘。**git diff = +10 行 / -0 行，仅此一处改动。**
+- **泄漏面全面排查**：全仓 `ZwCreateFile`/`IoCreateFile` 共 4 处 ——
+  `control_device.c:33`、`protect.c:38`、`main.c:4656` 三处均用**局部 `h`**
+  且**同函数内 `ZwClose(h)`**（yghv_watchdog_log 自持句柄设计，注释已说明）；
+  唯一持久句柄 = `main.c:356` 的 `g_trace_file`。**结论：本次修复覆盖全部
+  持久文件句柄泄漏面。** 全局线程句柄（`g_watchdog_thread`/`g_hook_rendezvous_thread`/
+  `g_s203_threads`/`g_os_guest_*`）在 `DriverUnload` 均已 join + `ZwClose`。
+- **构建**：206 + coexist + GNPT **绿**，default **绿**（回归 0）；**marker
+  验证通过**（含 `s206b coexist`=True、含 `hook test start`=False、size 95104）。
+  镜像归档 `D:\aaaaaavm\yuanguard_hv_step206c10_20261011.sys`（md5 `B6A60F05`）。
+- **⚠️ 重要发现：构建非确定性（首次量化）**。同源连续两次构建 md5 不同
+  （`024CE027` vs `3A807DF0`）——**差异仅 322 字节**，定位为
+  **PE `TimeDateStamp`（offset 0xE8，4 字节）+ PE `CheckSum` + 签名区**
+  （Authenticode 含时间戳，重签名即变）。**语义等价、可复现**，但
+  **哈希门工作流须注意**：镜像哈希**每次构建都会变**，故
+  `run_c*` 脚本的部署哈希门必须按**当次构建**的实际 md5 更新，不能沿用旧值。
+  （对照：本次 206c10 与 206c9 差异 65151 字节 = 插入一次函数调用导致
+  `.text` 布局整体位移，属**正常链接重排**；已用「无修复源码重建 vs 206c9
+  仅差 325 字节」证明 206c9 确由当前源码构建、修复为唯一语义差异。）
+- **验证脚本（已就绪，待用户确认后运行）**：
+  `D:\aaaaaavm\d_round_backup_20261011\verify_defect_c.ps1` —— 部署 206c10
+  （哈希门 `B6A60F05`）→ `sc start` → `sc stop` → **断言
+  `C:\Windows\yghv_progress.log` 卸载后可独占打开**（修复前必被 pid=4 独占），
+  并含 Restart Manager 持有者复核。PSParser 语法 0 错误。**⚠️ 该脚本会加载
+  内核驱动 = 改变机器状态，须用户明确确认后才可运行。**
+- **本轮未加载驱动**（铁律 1）。**旧句柄仍在**：`C:\Windows\yghv_progress.log`
+  当前仍被 02:23 那次 206c9 卸载留下的内核句柄独占 —— **本次修复无法追溯
+  清除历史泄漏，需重启释放**。故严格验证须：**重启 → 跑 verify_defect_c.ps1
+  → 断言释放**（重启本身也需用户确认）。
+- 备份：`d_round_backup_20261011\main.c.before`（改前，md5 `2FB8C9465FD6`）与
+  `main.c.with_fix`（改后，md5 `EEFDC0456B0E96FCE18E1ABE35094038`）。
+- **下一步（用户定）**：① 重启后跑 verify_defect_c.ps1 确认修复；② 若确认，
+  可把 206c10 作为新稳定镜像基线；③ 或先做别的方向。
+- 提交：本记录 + main.c 修复（未推送）。
+
+
+### 9.293 2026-10-11 缺陷 C 验证 **PASS**（重启后自动验证；镜像 206c10/md5 B6A60F05；本地提交未推送）
+
+- **触发**：用户确认重启（06:31:37 排队 `shutdown /r /t 20`，实际启动 06:32:31）。
+- **自动化布置（因重启终结会话，验证须自启动自落盘）**：
+  - 计划任务 `YGHV_DefectC_Verify`（**AtStartup / SYSTEM / RunLevel=Highest**）→
+    `D:\aaaaaavm\run_defect_c_after_reboot.ps1`。
+  - **BSOD 安全门**：脚本**首行即 `schtasks /Change /DISABLE` 自身** —— 驱动为
+    hypervisor 且历史出过 0xCE，若开机加载蓝屏则下次开机不会重跑，避免重启循环。
+    任务现为 `Disabled`（自禁用生效，已核对）。
+  - 桌面兜底：`C:\Users\Administrator\Desktop\跑缺陷C验证.lnk`（任务失效时手动补跑）。
+- **验证结果（`defect_c_reboot_result.txt` / `defect_c_verify.log`）**：
+  ```
+  post-reboot: progress.log locked BEFORE load = False   ← 僵尸句柄随 System 进程重建消失
+  deployed hash: B6A60F05 (expect B6A60F05 = 206c10)
+  sc start in 111 ms → STATE 4 RUNNING
+  progress.log after load: size=394 mtime 06:33:25     ← 驱动确实写入 trace
+  sc stop in 292 ms  → STATE 1 STOPPED
+  ASSERT: progress.log locked after unload = False   holder = none
+  RESULT: PASS — progress.log released after unload (defect C FIXED)
+  exit code = 0
+  ```
+- **对照结论**：修复前 206c9 卸载后 `HOLDER pid=4(System)` 独占、不可移动；
+  修复后 206c10 **`holder = none`，文件可独占读写**。**缺陷 C 修复确认有效。**
+- **验证后机器状态（全部干净）**：`yuang206c10` 服务不存在；System 内无 yghv
+  模块；`C:\yuanguard_hv_s206c10.sys` 已删除；`progress.log` 可独占读写
+  （474B，mtime 06:33:27）；计划任务已自禁用。
+- **证据归档**：`D:\aaaaaavm\d_round_backup_20261011\defect_c_VERIFIED_evidence\`
+  （`defect_c_reboot_result.txt` 1185B + `defect_c_verify.log` 645B）。
+- **旁证（顺带核实，非本轮目标）**：本机 `nointegritychecks=Yes` +
+  `testsigning=Yes` + SecureBoot=False → **内核不校验驱动签名**，签名对本地
+  加载零影响。故 `build.bat` 现有签名行（`/fd SHA256 /a /f yuanguard_test.cer`，
+  实测 exit=0，signtool 自动到证书存储取配对私钥）**无需改动**。
+  **免测试模式分发**的唯一路径仍是 Microsoft attestation signing（需 EV 证书）。
+- **206c10 可升格为新稳定镜像基线**（用户定夺）。
+- 提交：本记录（未推送）。
+
+
+### 9.294 2026-10-11 缺陷 C **A/B 对照因果证明** + 解压残留清理（镜像 206c10/206c9；本地提交未推送）
+
+- **背景**：9.293 的验证是「历史证据（02:23 那次 206c9 卸载）+ 本轮实测（206c10）」
+  两次观察，**不在同一会话**。本条目补做**同会话连续 A/B 对照**，排除时间/环境差异。
+- **脚本**：`D:\aaaaaavm\ab_control_defect_c.ps1`（结果落盘 `ab_control_result.txt`）。
+  **顺序设计（关键）**：**必须先测 206c10，再测 206c9** —— 206c9 卸载后会留下
+  **永久内核句柄**锁住 `progress.log`；若先测 206c9，206c10 的断言会被残留句柄污染，
+  无法区分「206c10 泄漏」与「206c9 残留」。
+- **结果（同会话、同文件、连续两轮加载/卸载，唯一变量=镜像）**：
+  ```
+  baseline: locked = False
+  --- A1: 206c10 (WITH yghv_trace_close fix) ---
+    sc start 63 ms -> RUNNING ; progress.log 394B
+    sc stop  47 ms -> STOPPED
+    ASSERT locked-after-unload = False   holder = none        <== 释放
+  --- A2: 206c9 (WITHOUT fix) ---
+    sc start 77 ms -> RUNNING ; progress.log 394B
+    sc stop  44 ms -> STOPPED
+    ASSERT locked-after-unload = True    holder = pid=4 System <== 泄漏
+  VERDICT: PASS — A/B control CONFIRMS causal link   (exit 0)
+  ```
+- **持有者精查**（`whoholds.ps1`，修正 A/B 脚本返回值数组化问题）：
+  `HOLDER[0]: pid=4 app='System' type=1000 restartable=False`，
+  且 **PID 4 StartTime = 06:32:32 = 本次开机时刻** → 证明是**本轮新产生**的泄漏，
+  非历史残留。**缺陷 C 因果链闭合。**
+- **清理（用户授权 ABC）**：删除解压残留
+  `signtool_pkg`(59 项/6.2MB)、`signtest\pkg7z`、`signtest\overlay`(99 项/2.4MB)、
+  `signtest\overlay_sign`、`signtest\signtest_work`，以及 9 个签名测试产物
+  `.sys`。**原始压缩包全部保留**（`签名.7z`/`签名文件..zip`/`overlay.zip`/`驱动CE.zip`）。
+  保留审计脚本于 `D:\aaaaaavm\signtest\`（certkey_audit / fakesign_check / final_audit 等）。
+- **旁证**：被删的 9 个测试产物签名者**全部为 `CN=YuanGuardHV Test`**（非泄露证书）
+  —— 说明泄露证书**从未成功用于签名**，每次都回退到自签。
+- **⚠️ 当前状态**：A2 测试留下 206c9 的僵尸句柄，`progress.log` 现被 pid=4 独占
+  —— **需重启释放**（下次重启前勿做依赖该文件的断言）。
+- 提交：本记录（未推送）。
+
+
+### 9.295 2026-10-11 新稳定基线 **206c11**（验证性重建 + 可复现性证明；本地未提交）
+
+- **用户决策（ABC → B1）**：把「206c7e 功能 + 缺陷C修复」作为新稳定基线，**重建**而非
+  直接采用 206c10。
+- **重建前的关键核实（改变了 B1 的含义）**：C6 v5 / INVLPGA **没有独立编译开关**，
+  只有 `#if YGHV_BAREMETAL_STEP == 206` 门控（protect.c:829-842、818-820），
+  而 206 是当前主线步骤号 → **关不掉，206 构建必然包含**。但其**运行时**由
+  `g_fake_mode`（静态初值 0）门控：fake 关时 `yghv_protect_fake_scratch_for`
+  不调用、INVLPGA 分支不进入 → **代码存在但永不执行 = 零运行时影响**。
+  故 B1「干净基线」= **当前源码原样构建**（206 + coexist + GNPT + 缺陷C修复），
+  与 206c10 功能等价。
+- **构建**：`YGHV_BAREMETAL_STEP=206 YGHV_206B_COEXIST=1 YGHV_206B_GNPT=1`，
+  206 + default 双绿（29 warning 全为 WDK 头 intrinsic 提示，非本项目）。
+  **marker 验证（产物内字符串）**：含 `s206b coexist`=True ✓、含
+  `hook test start`=False ✓、含 `SSV1`（C6 v5 CPUID leaf）=True。
+- **可复现性证明（本轮硬证据）**：新构建 md5 `C73B4ABD` vs 206c10 md5 `B6A60F05`，
+  **同 size 95104B，差异 325 字节，逐段比对**：
+  ```
+  .text   ✓ 完全一致        <== 代码段零差异（语义等价的决定性证据）
+  .data   ✓ 完全一致
+  .pdata  ✓ 完全一致
+  INIT    ✓ 完全一致
+  .rdata  ✗ 2 字节（段内 0x3FF4 = 文件 0x14FF4，PE TimeDateStamp 的嵌入副本）
+  签名区  ✗ 318 字节（Authenticode 时间戳，每次签名必变）
+  PE 头   ✗ 5 字节（0xE8 TimeDateStamp 4B + 0x138 CheckSum 1B）
+  ```
+  **325 = PE头5 + .rdata 2 + 签名区318。全部为已知非确定性来源（9.292 已量化），
+  无任何代码差异。** 结论：当前源码可确定性复现该镜像。
+- **归档**：`D:\aaaaaavm\yuanguard_hv_step206c11_20261011.sys`
+  （md5 `C73B4ABD`，SHA256 `b945caddb6604541…`，95104B，签名 `CN=YuanGuardHV Test`）。
+- **新基线定义**：**206c11 = 206 主线 + 缺陷C修复；C6 v5/INVLPGA 代码在内但运行时休眠
+  （g_fake_mode=0）**。206c7e 降为「C6 v4 PASS 线」历史参考；206c8a/206c9/206c10
+  为 C6 诊断线归档。
+- **⚠️ 源码未提交**：缺陷C修复（main.c +10 行）与本次文档仍为工作树改动，
+  **未新建 commit**（按全局规矩：无用户明确指示不新建 commit/不推送）。
+- 下一步：① 若要 206c11 生效为部署基线，需重启（当前 progress.log 被 206c9 僵尸
+  句柄占用）；② 回到 9.290 遗留的 C6 性能问题（需 KD 环境）。
+
+
+### 9.296 2026-10-11 KD 环境可行性评估：**单机交互式内核调试不可行**（全程只读侦察；未改机器状态）
+
+- **背景**：9.290 结论「C6 假写功能达成但自旋延迟 92s，Zen3 的 NPT 翻译不随
+  TlbControl=1 / nCr3 切换 / INVLPGPA 失效」——**需 KD 单步 NPF 路径的 TLB 行为**
+  才能继续。用户选 A(KDNET) + C(minidump) 双线。
+- **A 线结论：不可行（实测 + 原理双重否定）**
+  1. **KDNET 实测不支持**：`kdnet.exe` 直接拒绝本机 NIC —
+     ```
+     Failed to parse the busparams:PCI  8 0 0        (Realtek PCIe GbE, Bus8 Dev0 Fn0)
+     Network debugging is not supported on any of the NICs in this machine.
+     Network debugging is not supported on any of this machine's USB controllers.
+     ```
+     （NIC = Realtek PCIe GbE Family Controller, drv 10.80.50.407；虽支持厂商列表含
+     "Realtek"，但**具体这颗芯片/驱动不在支持之列**。）
+  2. **串口自调试原理不可行**：内核断点 = **挂起整个目标 OS**；调试器若在同机，
+     自身一并被挂起 → 无法交互。Microsoft 文档原文亦为
+     "A kernel-mode debugging environment **typically has two computers**"。
+  3. **逐条排查**：USB3 调试（需两台机器+专用线）、1394（同上+已淘汰）、
+     本地 `kd -kl`（**只读，无断点/单步**）、Hyper-V VM（**vmms 未安装**）、
+     VMware VM（**嵌套层遮蔽 NPF 硬件行为**，README:154 已判定 VM+KD 不可用）、
+     **第二台物理机（唯一可行，需硬件）**。
+  4. **VMware 路线为何不可用（关键）**：`vhv.enable=TRUE` 提供的是**嵌套虚拟化**
+     —— VM 内 hypervisor 跑在 VMware 的 NPT 之上。要观测的正是 **Zen3 裸机 NPF
+     微架构行为**，嵌套层会把它遮住。与当初「VM+KD 通道已判定不可用」同源。
+- **VM 现状（侦察所得，供参考）**：`Windows 10 x64.vmx`（EFI/windows9-64/4vCPU/8GB）
+  **已配好串口调试通道** `serial0.fileName="\\.\pipe\yuanhv_debug"`（pipe/server/
+  startConnected/yieldOnMsrRead/tryNoRxLoss），共享目录 `D:\aaaaaavm`→
+  `\\vmware-host\Shared Folders\aaaaaavm`（读写）。**该通道对「非 SVM/NPF 依赖」的
+  功能调试仍可用**（如控制流、指令流、IRP 路径），仅对 NPF 硬件行为无效。
+- **C 线（minidump 事后分析）现状：配置完好、已就绪**
+  - `CrashDumpEnabled=7`（自动）、`MinidumpDir=C:\Windows\Minidump`、`AutoReboot=1`
+  - 现有 5 个 minidump（最近 `101126-35203-01.dmp` 2026-10-11 01:05）
+  - `C:\aaaaaavm\kd_last.bat`（通用）/ `kd_c6f.bat`（c6f 0x50 专用）——9.291 已改
+    **直连**（代理行注释掉），实测 37s 全栈还原。
+- **⚠️ 用户选 A 线时未预见此约束——评估应在推荐前完成（本次疏漏，已记录）。**
+- **A' 线（增强插桩，替代路径）**：侦察发现项目**已有完整 NPF 遥测**，且**运行期
+  可读**（非仅卸载落盘）：
+  ```
+  vmexit.c:634-637   g_npf_count++ / g_last_npf_gpa / g_last_npf_err / g_last_npf_rip
+  protect.c:868-898  g_fake_attempts / g_fake_ok / g_fake_restores / g_fake_alt_active
+  main.c:1419-1432   常驻线程**周期性**经 yghv_trace_u64 落盘（b0 diag npf / npf gpa /
+                     intr / apic mmio / exits / last exit）→ progress.log
+  ```
+  **9.290 的「1.05M 次重故障」正是这些计数器测出的。** 故查 TLB 行为**不必然需要
+  KD**——可通过**增强插桩**取得「同一 GVA 在 TlbControl 写入前后的 NPF 计数差」
+  等时序证据。**相对 KD 的优势**：无需改 BCD/装驱动、无蓝屏失联风险、
+  **不扰动时序**（单步本身会改变 TLB 状态）。**劣势**：间接推断，非直接观测。
+- **决策点（用户定）**：① A' 增强插桩（无需改机器状态，立即可做）；② 第二台物理机
+  （需硬件）；③ 接受 C6 冻结现状，转产品方向。
+- 提交：本记录（未推送）。
+
+
+### 9.297 2026-10-11 A' 线：NPT 冲刷策略对照实验 —— **TlbControl=2 被证伪**（镜像 206c12/206c13；本地未提交）
+
+- **动机**：9.290 的「Zen3 NPT 翻译不随 TlbControl/nCr3/INVLPGA 失效」结论，其证据
+  来自两类**打错层**的实验：`TlbControl=1` 按 APM 只冲刷 **guest TLB（GVA→GPA）**，
+  `INVLPGA` 同样只管 GVA→GPA；而卡住的是 **NPT 层（GPA→HPA）**。
+  `SVM_TLB_CONTROL_FLUSH_ALL=2`（FLUSH ENTIRE TLB）**在 fake 路径从未使用过**
+  （仅 main.c:1110 的 OS-as-guest 初始化用）。故设计本实验补测。
+- **代码改动（5 文件，已备份 `D:\aaaaaavm\a_prime_backup_20261011_064828`）**：
+  新增 `IOCTL_YGHV_SET_FAKE_TLB`(0x813) + `yghv_protect_fake_tlb_plan/get/set/seen`
+  （protect.c）+ cpp 写/读路径接入 + `control_device.c` 处理 + PS 客户端
+  `config-fake-tlb` 命令；**并补上读路径缺失的 `VmcbClean=0`**（9.285 只补了写路径）。
+  IOCTL/命令 parity 三端同步（C=20 PS=20 Java=20）。构建 206+coexist+GNPT 全绿。
+- **⚠️ 首次测量的重大混淆（已纠正）**：`auto_disarm` 默认 **1**，使 cpl=0 写先走
+  **ALLOW 分支**（reopen 真页）而**根本到不了 FAKE 路径** —— 首轮测的是 ALLOW 不是
+  FAKE。且驱动**拒绝在保护激活时设 auto_disarm=0**（protect.c:1238），故必须
+  **先 config auto-disarm 0 再 start**。
+- **实验结果（auto-disarm=0，强制 FAKE 路径；每模式独立加载以取干净计数器基线）**：
+  ```
+  模式  策略                      耗时       NPF自旋      结果
+  0     TC=1 + INVLPGA            21979 ms   29,697,622   FAILED 0x12B
+  1     TC=2 + INVLPGA            16262 ms   25,876,196   FAILED 0x12B
+  2     TC=2, 无 INVLPGA           9354 ms   15,743,374   FAILED 0x12B
+  3     TC=1 + INVLPGA（重复）      2659 ms      575,544   WROTE 但 readback 失败
+  4     reopen-main + TC=2         2257 ms            0   err=0x5（目标未就绪，无效）
+  ```
+- **决定性证据**：`attempts == consulted`（mode 0 两者均 **29,697,622**）——
+  **每次 NPF 都真的执行了 `plan()` 与 FAKE 分支**，但 NPT 翻译始终不刷新，
+  store 无限重试。**这不是"路径没走到"，是"走到了也不生效"。**
+- **结论：`TlbControl=2`（FLUSH ALL）不能使 NPT 翻译失效 —— 9.290 的结论存活，
+  且证据强度大幅提升。** 至此已排除全部四条架构路径：`TlbControl=1`、`TlbControl=2`、
+  `nCR3` 变更、`INVLPGA`。**Zen3 的 NPT（GPA→HPA）TLB 不受这些机制冲刷。**
+- **设计含义**：**alt-NPT 影子假写方案在本 CPU 上无法做到"立即可见"**。要修需换设计
+  （不依赖即时可见性；或硬件辅助），而非继续调 TLB 控制位。
+- **遗留**：mode 4（reopen main + FLUSH_ALL，直测"主表 W 位翻转 + FLUSH_ALL 是否
+  可见"）因 `OpenProcess err=0x5` 未取到有效数据，**结论待补**（推测同样无效，
+  因为主表翻转与 alt 切换依赖同一冲刷机制）。
+- **方法论教训**：① 计数器在单次驱动加载内**累积**，多模式共享一次加载会互相污染 →
+  **每模式必须独立加载**；② `Start-Job` 的 scriptblock **必须声明全部参数**（首版声明 3
+  传 4，`hex_val` 被丢弃 → wpm-write 报 usage → 假路径从未触发，整轮数据无效）；
+  ③ `Wait-Job` 返回 job 对象而非布尔。
+- 实验脚本：`D:\aaaaaavm\a_prime_run.ps1`（结果落盘 `a_prime_result.txt`）。
+- 提交：本记录（未推送）。
+
+
+### 9.298 2026-10-11 A 线（廉价探针）全部证伪 → 转 C 线（周期同步）
+
+- **A-1（nCR3 变更能否冲刷 NPT）：已被 9.297 数据证否。** mode 0 的
+  `attempts == consulted == 29,697,622` —— 每次 NPF 都真的走了 FAKE 分支（都执行了
+  `NCr3 = altPa` + `VmcbClean = 0`），却仍自旋 2970 万次。**nCR3 变更不冲刷 NPT，
+  实验证据直接闭合，无需再测。**
+- **A-2（INVLPGB 批量失效嵌套翻译）：硬件不支持。**
+  - 写 `D:\aaaaaavm\cpuid_probe.c` / `cpuid_probe2.c`（clang-cl 编译，用户态只读）实测：
+    ```
+    CPUID.1.EAX = 0x00A50F00  ->  family 0x19, model 0x50
+    ```
+  - **项目文档已有权威判定**（`YGHV_SIMPLEVM_LEVERAGE_20260918.md:73`）：
+    「本机 CPUID 实测 AMD64 Family 25 Model 80 = **Family 19h Model 50h = Zen3
+    Cezanne**」。故本机 = **Zen3**。
+  - **INVLPGB / TLBSYNC 是 Zen4+ 指令**，Zen3 不存在。**A-2 死。**
+  - **⚠️ 自查纠错**：我的探针初版把 model 0x50 标为「Zen4 Raphael」——**错误**
+    （Raphael 是 model 61h）。且探针里对 Fn8000_0008_EBX 的 bit 9/18/19
+    按「INVLPGB」解读属**猜测**（APM 中 bit3=WBNOINVD、bit8=MCOMMIT，其余非
+    INVLPGB 指示位）。**权威判据是微架构，不是猜 bit。** 已纠正。
+- **A 线总结：四条架构路径 + 两个廉价探针，全部排除。**
+  ```
+  TlbControl=1        ✗ 9.297 实测（只冲 guest TLB）
+  TlbControl=2        ✗ 9.297 实测（FLUSH ALL 亦无效）
+  nCR3 变更           ✗ 9.297 实测（attempts==consulted）
+  INVLPGA             ✗ 打错层（GVA->GPA，非 NPT）
+  nCR3 二次验证       ✗ A-1（同 9.297 数据）
+  INVLPGB             ✗ A-2（Zen3 无此指令）
+  ```
+  **结论固化：Zen3 的 NPT（GPA→HPA）TLB 无法通过任何已探索的软件机制即时冲刷。**
+- **结构性问题（本轮查证附带发现）**：206 模式下 **`npt_flush_pending` 是死标志** ——
+  设置点 `protect.c:564/593/901/1741`（arm/disarm），**唯一消费点**
+  `svm_core.c:714` 位于 `svm_core_enter_resident_current()`，而 206 模式由
+  `Sv206Entry`（cpp:2818）接管 VMRUN 循环，**该函数不在该路径上**。
+  故 arm/disarm 的 NPT 变更实际只靠 vendored cpp 里那些 `TlbControl=1`
+  （cpp:1469/1591/1605/1633/1645）传递 —— **全是被证伪的机制**。
+  （非新 bug，是「arm/disarm 为何也需要 TLB 生效」的答案：传播路径本不可靠。）
+- **决策：转 C 线（周期同步）** —— 唯一不依赖 NPT 权限翻转的机制，硬件 TLB 行为
+  与之无关。代价：轮询延迟 + 每轮读页比对的 CPU 开销。
+- 探针源码：`D:\aaaaaavm\cpuid_probe.c`、`cpuid_probe2.c`（可复核）。
+- 提交：本记录（未推送）。
+
+
+### 9.299 2026-10-11 C 线（周期同步守卫）+ **蓝屏事故与修复**（镜像 206c14 崩 / 206c15 修）
+
+#### 9.299.1 设计：snapshot + poll，不翻转 NPT
+- **动机**：9.297/9.298 已证 Zen3 的 NPT（GPA→HPA）TLB 无法被任何软件机制即时冲刷。
+  故换设计：**根本不翻转权限** —— 页面在 NPT 里始终 present+WRITABLE，
+  硬件从不需要失效翻译，限制自然不适用。改为后台线程**轮询快照比对**，
+  发现漂移即回滚真页。检测延迟 = 轮询间隔（默认 50ms），代价是页面短暂被改。
+- **实现**（`protect.c` 新增 ~150 行）：
+  - `yghv_sync_slot_t g_sync[16]`（gpa + 4KB 非分页快照 + active + restores）
+  - `yghv_sync_guard_thread`：PASSIVE，`KeWaitForSingleObject(&g_sync_stop, 超时)` 周期唤醒
+  - `yghv_sync_poll_once`：`RtlCompareMemory` 比对 → 不等则 `RtlCopyMemory` 回滚
+  - `yghv_protect_sync_arm/disarm/mode_set/mode_get/diag/set_interval/init/stop`
+  - arm 路径：sync 模式下 `npt_set_page_perm(PRESENT|WRITABLE)`（**不翻转**）+ 登记守卫
+  - disarm 路径：sync 模式下仅清 armed 标志（无权限可恢复）
+  - `yghv_protect_init` → `sync_init()`（起线程）；`cleanup` → `sync_stop()`（先停线程再拆结构）
+  - 新 IOCTL `IOCTL_YGHV_SET_SYNC`(0x814) + PS 命令 `config-sync [0|1] [interval_ms]`
+  - 三端 parity 同步（C=21 PS=21 Java=21）；构建 206+coexist+GNPT 全绿
+- 镜像 `206c14_sync`（md5 `F6055DB4`，100736B）。
+
+#### 9.299.2 ⚠️ 蓝屏事故（**我的 bug**，已定位并修复）
+- **现象**：07:54:13 `protect-page OK` 后，`start` 无输出 → 挂起 **23 分钟**
+  → 08:17:44 系统意外关闭 → 08:38:23 重启。
+- **取证**（`kd !analyze -v`，dump `101126-35031-01.dmp`）：
+  ```
+  BUGCHECK_CODE : e2  (MANUALLY_INITIATED_CRASH)
+  BUGCHECK_P1   : 20601   → svm_simplevm206.cpp:1669 KeBugCheckEx(0xE2,0x20601,VMEXIT_SHUTDOWN,..)
+  BUGCHECK_P2   : 7f      → SVM_EXIT_SHUTDOWN（guest 三重故障）
+  BUGCHECK_P3   : fffff80529c11803 → 符号化 = nt!KiSystemCall64+0x3（guest RIP）
+  SYMBOL_NAME   : yghv_c_line+124bd
+  MODULE_NAME   : yghv_c_line          ← 本次加载的 C 线镜像
+  FAILURE_BUCKET: 0xE2_STACKPTR_ERROR_yghv_c_line!unknown_function
+  ```
+- **根因（确认）**：**`ExAcquireFastMutex` 递归死锁** —— 该锁**不可递归**：
+  ```
+  yghv_protect_start()              ExAcquireFastMutex(&g_protect_lock)  ← 持锁
+    └ yghv_protect_start_locked()
+        └ yghv_protect_arm_page_locked()                                 ← 仍持锁
+            └ yghv_protect_sync_arm()      ← 9.299 新增
+                └ ExAcquireFastMutex(&g_protect_lock)  ← 二次获取 = 永久自旋
+  ```
+  同一线程递归获取 → 挂起 → guest 停摆 → 三重故障 → SHUTDOWN → 驱动主动 bugcheck 留 dump。
+  （`sync_disarm` 是无锁实现，故无此问题；**只有 `sync_arm` 犯了**。）
+- **修复**：拆成 `yghv_protect_sync_arm_locked()`（**假定调用者持锁**）+
+  `yghv_protect_sync_arm()`（加锁后委托）。arm 路径改调 `_locked` 形式。
+  `sync_mode_set` 先收集 gpa、释放锁、再逐个调公开版（不嵌套）。
+- **镜像** `206c15_syncfix`（md5 `D6268091`，100736B）。与 206c14 差异 46061 字节。
+- **教训（写入本机雷区）**：
+  1. **`ExAcquireFastMutex` 不可递归** —— 加锁函数被持锁调用者调用即死锁。
+     新增任何取 `g_protect_lock` 的函数，**必须先查调用链上是否已持锁**。
+  2. **测试脚本必须有超时保护** —— 本次无超时，挂起 23 分钟才由 guest SHUTDOWN
+     触发蓝屏。新版 `c_line_run_safe.ps1` 加了 `Invoke-Guarded`：任一步超时即强杀驱动。
+  3. 取证流程有效：`kd !analyze -v` 一轮就给出 `BUGCHECK_P1=20601` + 模块名，
+     直接指向代码位置，未走弯路。
+- **静态复查**：`D:\aaaaaavm\c_line_audit_notes.c` —— 逐条走锁纪律/IRQL/生命周期/
+  数据竞争/内存/逻辑，确认修复后无其他同类问题（唯一保留的是**设计取舍**：
+  快照后的合法修改也会被回滚，无法区分来源）。
+- 提交：本记录（未推送）。
+
+#### 9.299.3 FIX-2：`MmGetVirtualForPhysical` 用于用户页 → `0x3B` 蓝屏
+- **第二次崩溃**（08:51:09，arm 序列开始后立即崩，**无挂起**）：
+  ```
+  BUGCHECK_CODE : 3b SYSTEM_SERVICE_EXCEPTION
+  BUGCHECK_P1   : c0000005（访问违规）
+  SYMBOL_NAME   : yghv_c_line+12bd2   （与 FIX-1 的 +124bd 不同点）
+  反汇编该处     : 0F 10 04 11  movups xmm0,[rcx+rdx]  ← RtlCopyMemory 的 SSE 展开
+  PROCESS_NAME  : powershell.exe（IOCTL 调用方）
+  ```
+- **根因**：`MmGetVirtualForPhysical` **只映射系统已有直接映射的物理页**（页表、池…）。
+  目标进程的**用户页没有这种映射** → 解引用返回的 VA 即访问违规。
+  对照项目里的正确用法 `protect.c:535`（读页表 PA，系统页，永远有映射）。
+- **为何 FIX-1 之前没暴露**：206c14 在 `start` 就死锁了，**poll 从未执行**。
+  修掉死锁后 poll 首次运行 → 立刻触发。**两个 bug 串联，修一个才见下一个。**
+- **修复（FIX-2）**：读改用 `MmCopyMemory(dst, MM_COPY_ADDRESS{PhysicalAddress},
+  len, MM_COPY_MEMORY_PHYSICAL, &done)`（按物理地址拷贝，**不需要任何映射**）；
+  写改用 `KeStackAttachProcess` + `target_va` + **SEH 保护**。
+  ⚠️ 首次编译报错：`MmCopyMemory` 要 `MM_COPY_ADDRESS` 而非 `PHYSICAL_ADDRESS`。
+
+#### 9.299.4 FIX-3/FIX-4：进程指针生命周期（**静态审查发现，未崩溃**）
+- **FIX-3（悬垂指针）**：slot 存 `PEPROCESS` 裸拷贝，但
+  `yghv_protect_on_process_exit`（watchdog）会 `ObDereferenceObject(t->process)`
+  然后 `RtlZeroMemory(t)` —— **目标进程退出后 slot 指针悬垂**，下次 poll 的
+  `KeStackAttachProcess` 即访问已释放对象。
+  附带：`sync_stop` 原在 `!g_sync_thread` 时**直接 return**，会漏放已持有的引用。
+- **FIX-4（简化，最终方案）**：**slot 不再存进程指针** —— 那把复杂度直接消掉
+  （自己管引用计数 + 独立锁，正是出 bug 的土壤）。改为 poll 在需要写时
+  **用既有的 `g_protect_lock`**（它本就保护 `t->process` 生命周期）**锁内取引用
+  → 锁外 attach**（`KeStackAttachProcess` 要求 PASSIVE，而 `ExAcquireFastMutex`
+  会抬到 APC_LEVEL，故 attach 必须在锁外）。读完全不需要进程（`MmCopyMemory`
+  按物理地址）。**关键认识**：死锁是"持锁时再取锁"造成的，而 poll 是独立线程、
+  不持锁，**正常取锁完全安全**。
+- **教训**：**修掉一个 bug 后必须重审整条路径**（FIX-1 修完才见 FIX-2，
+  FIX-2 修完静态审查才见 FIX-3/4）。三次修复中**只有第三次是靠静态审查抓到的**。
+
+#### 9.299.5 分步验证（用户选 A2→A1）与 **最终 PASS**
+- **A2（最小面，不 arm 任何页）**：M1 加载 / M2 线程存活 / M3 开关翻转 /
+  M4 poll 递增（88→166→276）/ M4b 持续存活 / M5 干净卸载 —— **全部 PASS**，
+  两次运行均无崩溃。基础设施层（线程/IOCTL/生命周期/poll 循环）确认无碍。
+  脚本 `D:\aaaaaavm\a2_minimal.ps1`（带挂起保护）。
+- **A1（完整路径）**：镜像 `206c18_syncfix3`（md5 `3DC1DBF2`，101248B）。
+  ```
+  T1 写入不阻塞  PASS  2267 ms 完成（旧设计 92 秒自旋失败）
+  T2 真页被回滚  PASS  写入 0xDEADBEEFCAFEF00D → 等 1800ms → 读回 0xC4C40000000022
+  T3 guard 轮询  PASS  polls 344 → 387，hits 33 → 39
+  卸载干净      PASS  句柄释放、无残留
+  RESULT: PASS
+  ```
+  **决定性证据**：写入成功（假成功幻觉 ✓）+ 真页无损（被回滚 ✓），
+  **延迟从 92 秒降到 2.3 秒（40 倍改善），且完全不依赖被证伪的 NPT 冲刷机制**。
+- **测试方法教训**：T2 首版用 `wpm-write(0)` 后**立即**读回 —— 既扰动了被测页，
+  又在 50ms 轮询动作之前读。改为**纯读**（新增 `wpm-read` 命令，只读不写）
+  + 等待 36 个轮询周期后读，判据才成立。
+- 脚本：`D:\aaaaaavm\c_line_run_safe.ps1`（挂起保护 + 有界 stop）。
+- **C 线结论**：**换设计成功。** 周期同步守卫绕开了 Zen3 的 NPT TLB 限制，
+  在保持「假成功幻觉 + 真页无损」语义的同时把延迟降入可用范围。
+- 提交：本记录（未推送）。
+
+
+### 9.300 2026-10-11 镜像归档总表 + A' 线正式关闭（本地未提交）
+
+#### 9.300.1 本轮镜像谱系（**避免以后混淆，务必按此表引用**）
+```
+镜像               md5        KB    性质
+206c7e            356C5B6B   92.40  C4/C5/C6(v4) 全 PASS 线（旧稳定基线，历史参考）
+206c8a            267E14EA   92.90  C6 v5 诊断（NCr3 resync）
+206c9             EE32957A   92.90  C6.1 诊断（INVLPGA）；缺陷C 未修
+206c10            B6A60F05   92.90  缺陷C 修复（DriverUnload 补 yghv_trace_close）
+206c11            C73B4ABD   92.90  ★ 新稳定基线（206 主线 + 缺陷C 修复）
+206c12_tlbtest    9C07178B   93.40  A' 插桩（TLB 策略选择器）
+206c13_tlbtest    EA6E6A34   93.40  A' + mode 4（reopen-main）
+206c14_sync       F6055DB4   98.40  C 线首版 —— ⚠️ **会蓝屏（FIX-1 死锁），勿加载**
+206c15_syncfix    D6268091   98.40  C 线 FIX-1（死锁）—— ⚠️ **仍会蓝屏（FIX-2 用户页），勿加载**
+206c16_syncfix2   87DF31F8   98.90  C 线 FIX-2 中间产物（构建两次之一，**已废弃**）
+206c17_syncfix2   3BFCAA69   98.90  C 线 FIX-2 中间产物（**已废弃**，被 206c18 取代）
+206c18_syncfix3   3DC1DBF2   98.90  ★ C 线最终版（FIX-1..4 全部修复）—— **已验证 PASS**
+```
+- **⚠️ 三个已知会蓝屏的镜像（206c14 / 206c15 / 以及任何 FIX-2 中间产物）**：
+  保留仅为事故取证，**禁止再加载**。
+- **当前可用**：`206c11`（稳定基线）、`206c18_syncfix3`（C 线功能版）。
+
+#### 9.300.2 A' 线正式关闭（结论已固化，不再重开）
+- **A' 线（NPT 冲刷策略）已穷尽全部架构路径，结论为负：**
+  ```
+  TlbControl=1        ✗ 只冲 guest TLB（GVA->GPA），不含 NPT
+  TlbControl=2        ✗ 9.297 实测：FLUSH ALL 亦无效（自旋 1570 万次）
+  nCR3 变更           ✗ 9.297 实测：attempts == consulted == 29,697,622
+  INVLPGA             ✗ 打错层（GVA->GPA）
+  INVLPGB             ✗ 9.298 实测：Zen3 无此指令（Family 19h Model 50h = Cezanne）
+  ```
+- **最终定论**：**Zen3 的 NPT（GPA→HPA）TLB 无法通过任何已探索的软件机制即时冲刷。**
+  这是微架构层的事实，不是可绕过的软件缺陷。
+- **A' 线遗产**：`IOCTL_YGHV_SET_FAKE_TLB`(0x813) + `config-fake-tlb` 命令保留
+  （诊断价值：可用于在别的 CPU 上复测），但**默认 mode 0 = 原行为，零影响**。
+- **A' 线实验产物**（归档保留，可复核）：
+  - 脚本 `D:\aaaaaavm\a_prime_run.ps1`，结果 `a_prime_result.txt`
+  - 探针 `cpuid_probe.c` / `cpuid_probe2.c`（+ 编译产物 .exe）
+  - 镜像 `206c12_tlbtest` / `206c13_tlbtest`
+- **B 线（KD 环境）结论同样关闭**（9.296）：单机交互式内核调试**原理上不可行**
+  （内核断点 = 挂起整个 OS，调试器自身也被挂起），且本机 NIC 不支持 KDNET。
+  **唯一可行路径 = 第二台物理机**，需要硬件。
+
+#### 9.300.3 未提交改动汇总（**积累已多，用户定夺是否提交**）
+工作树改动 11 个文件：
+```
+YuanGuardHV/hv/main.c                       缺陷C 修复（+10 行，9.292）
+YuanGuardHV/hv/protect.c                    A' 插桩 + C 线同步守卫（+~400 行）
+YuanGuardHV/hv/svm_simplevm206.cpp          A' 选择器接入 + 读路径 VmcbClean=0
+YuanGuardHV/hv/common/protect.h             新声明
+YuanGuardHV/hv/common/control_ioctl.h       0x813 / 0x814
+YuanGuardHV/hv/control_device.c             两个新 IOCTL 处理
+YuanGuardHV/tools/yghv_ctl.ps1              config-fake-tlb / config-sync / wpm-read
+YuanGuardHV/tools/yghv_client/YghvCtl.java  FN 常量（parity）
+YuanGuardHV/tools/yghv_client/README.md     命令列表
+docs/YUANMOD_HANDOFF_CURRENT.md             9.292-9.300
+docs/YUANMOD_NEXT_WINDOW_PROMPT.md          基线/雷区更新
+```
+**本地领先 origin/main 28 个提交**（未推送，按铁律 6）。
+- 提交：本记录（未推送）。
+
+
+### 9.301 2026-10-11 C 线边界测试（A 阶段）+ FIX-5（镜像 206c19）
+
+#### 9.301.1 A3 边界测试结果（7 项，无蓝屏）
+- 脚本 `D:\aaaaaavm\a3_boundary.ps1`，结果 `a3_result.txt`。
+```
+B1 多页保护       PASS    guard 跟踪 1/1 armed 页
+B2 槽位上限       LIMIT   ★ YGHV_SYNC_MAX=16 vs YGHV_PROTECT_MAX_PAGES=64
+B3 关闭后写入     (测试缺陷，见下)
+B4 间隔极值       (预期行为，见下)
+B5 目标退出       PASS    guard 在目标被杀后存活（与 watchdog 交互正常）
+B6 反复 arm/disarm (测试缺陷，见下)
+B7 长跑 20s       PASS    polls +351, hits +54, 稳定无崩溃
+```
+
+#### 9.301.2 ★ 真实发现：同步槽位容量 < 可 arm 页数（**已知限制，必须记住**）
+- **`YGHV_SYNC_MAX = 16`**，而 **`YGHV_PROTECT_MAX_PAGES = 64`**。
+- **后果**：arm 超过 16 页时，**第 17–64 页会被 arm 但拿不到 guard 槽位**
+  → 写到那些页**永久落地、不回滚**（静默失效，无任何报错）。
+- **处置**：`yghv_protect_sync_arm` 在表满时**返回 0**（不静默成功），
+  但调用方（arm 路径）目前**忽略返回值**。**当前用法 ≤16 页无影响**；
+  若将来需要 >16 页，必须：① 扩容 `YGHV_SYNC_MAX`，或 ② 让 arm 路径
+  检查返回值并对未获保护的页报错。
+
+#### 9.301.3 FIX-5：`sync_mode_set(0)` 未释放槽位（真实语义缺陷）
+- **问题**：关闭 sync 时只翻 `g_sync_mode`，**不清槽位**：
+  ① 槽位保持 active → `pages` 计数虚高；
+  ② **再次开启时会把「陈旧快照」当基线** —— 那是页面上次被写**之前**拍的，
+  于是 guard 会立刻"恢复"目标进程在此期间**合法修改**过的内容。
+- **修复**：`on==0` 时遍历清空全部槽位 active。
+- **镜像** `206c19_syncfix4`（md5 `3EBE42A8`，101248B）。
+- **回归验证**：A2 全 6 项 PASS（无回归）；A1 全 3 项 PASS
+  （T1 2250ms / T2 读回 `0xC4C40000000021` / T3 polls 340→382）。
+
+#### 9.301.4 测试方法教训（两个"FAIL"其实不是驱动问题）
+- **B3（关闭后写入落地）判定无效**：目标 mmf-loop **每 400ms 自己写同一页**，
+  我们写入的值会被**目标的后续写入覆盖**，无法区分「guard 回滚」与
+  「目标自己覆盖」。**要测 B3 需要一个不自写的目标**（如只读的 mmf 映射）。
+- **B4（间隔极值）的 1ms 失败是预期行为**：实测
+  `NtQueryTimerResolution` → `min=15.62ms max=0.50ms current=1.00ms`，
+  且 `Start-Sleep 1ms` 循环实测 **15.6ms/次**。**Windows 定时器粒度下限
+  ≈15.6ms**（未提升分辨率时），请求 1ms 实际得到 ~9.5–15.6ms。
+  **不是驱动 bug** —— 应记为「轮询间隔下限受系统定时器粒度约束，
+  实用下限约 16ms」。2000ms 端正常（实测 ~3 次/4s）。
+- **B6（反复 arm/disarm）判定无效**：对**同一 VA** 重复 `protect-page`
+  是**幂等**的（add_page 有意去重），故"7/10 arms ok"不表示泄漏。
+  有效判据是**最终 guard pages == 0**，实测确实为 0 ✓。
+- **教训**：**测试目标本身的行为会污染判据** —— 用一个持续自写的目标去
+  验证"回滚"或"落地"，两者都不可分。边界测试需要**行为可控的目标**。
+
+
+### 9.302 2026-10-11 D 扩容 + A4 干净验证（镜像 206c20；C 线全部判据闭合）
+
+#### 9.302.1 D：同步槽位 16 → 64（消除静默失效）
+- `YGHV_SYNC_MAX` 从 **16 提升到 64**，与 `YGHV_PROTECT_MAX_PAGES` 对齐。
+- **内存代价**：静态结构 64×32B = 2KB；快照池最多 64×4KB = 256KB
+  （**惰性分配**，只为实际 arm 的页分配）。
+- **附带改进**：新增 `g_sync_refused` 计数（`diag out[5]`）—— arm 因**表满被拒**
+  时递增。**此前该失败是静默的**（页被 arm 却无 guard 槽位 → 写入永久落地且无报错）。
+  现在 `config-sync` 会显示 `refused=N`，条件可观测。
+- **diag 结构 6 → 7 字段**：`{mode, polls, hits, interval_ms, running, refused, pages}`
+  → IOCTL 输出长度 48 → 56，PS 客户端同步更新。
+- 镜像 `206c20_sync64`（md5 `0ACEBF40`，99712B）。
+
+#### 9.302.2 A4：用「不自写目标」干净验证（**全 5 项 PASS**）
+- **新增 `mmf-hold` 命令**：映射 section → 写一次种子 `0xC4C40000000000` → **只睡不写**。
+  解决 9.301.4 的污染问题：目标不写页，则写入后读回值**唯一确定**判据。
+- 脚本 `D:\aaaaaavm\a4_passive.ps1`，结果 `a4_result.txt`：
+```
+P1 sync ON  → 写入被回滚    PASS  写 0x1122334455667788 → 读回 0xC4C40000000000（种子）
+P2 sync OFF → 写入落地      PASS  写 0xAABBCCDDEEFF0011 → 读回 0xAABBCCDDEEFF0011
+P3 再开启   → 快照取当前值  PASS  写 0x9988776655443322 → 回滚到 0xAABBCCDDEEFF0011
+P4 容量     → refused=0     PASS  扩容生效，无 arm 被拒
+P5 关闭     → 槽位归零      PASS  pages 1 → 0
+OVERALL: PASS
+```
+- **P3 是 FIX-5（9.301.3）的决定性证明**：再开启时快照取自**当前**值
+  `0xAABBCCDD…`，而**不是**陈旧种子 `0xC4C4…` —— 正是所修语义缺陷的反面。
+- **P2 是 B3（9.301.4）的干净重测**：关闭 guard 后写入**确实落地**（不再被回滚）。
+
+#### 9.302.3 C 线判据全部闭合
+| 判据 | 状态 |
+|---|---|
+| 写入不阻塞（无自旋） | ✓ PASS（2267ms vs 旧 92s） |
+| 假成功幻觉（写入报成功） | ✓ PASS |
+| 真页被回滚 | ✓ PASS（A1 + A4/P1） |
+| guard 存活/轮询 | ✓ PASS（A1/T3 + A3/B7 长跑） |
+| 关闭后写入落地 | ✓ PASS（A4/P2） |
+| 再开启取新快照 | ✓ PASS（A4/P3） |
+| 目标退出不崩 | ✓ PASS（A3/B5） |
+| 反复 arm/disarm 无泄漏 | ✓ PASS（A3/B6 终态 pages=0） |
+| 容量充足 | ✓ PASS（A4/P4 refused=0） |
+| 干净卸载 | ✓ PASS（各轮 sc stop + 句柄释放） |
+- **测试方法教训（本轮第三次）**：`$Pid` 是 PowerShell **只读自动变量**，
+  用作函数参数名会静默失败（`Cannot overwrite variable Pid`），导致读值全空、
+  误报 FAIL。**辅助函数参数避免用 `$Pid`/`$Host`/`$Args` 等自动变量名。**
+
+
